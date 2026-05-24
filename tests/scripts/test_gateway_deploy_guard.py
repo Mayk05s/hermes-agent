@@ -63,6 +63,7 @@ def cfg(tmp_path: Path, *, apply: bool = False) -> Any:
         service="hermes-gateway.service",
         log_dir=log_dir,
         incident_dir=tmp_path / "incidents",
+        record_dir=tmp_path / "records",
         apply=apply,
         health_timeout=0,
         health_interval=0,
@@ -105,6 +106,63 @@ def test_apply_health_failure_collects_bundle_and_rolls_back(tmp_path):
     assert "abcdefghijklmnop" not in journal
     assert "sk-should-redact" not in gateway_log
     assert "[REDACTED]" in journal
+
+
+def test_redact_authorization_bearer_and_quoted_secrets():
+    raw = "\n".join(
+        [
+            "Authorization: Bearer abc",
+            'TOKEN="secret-token"',
+            'API_KEY: "secret-key"',
+            "PASSWORD='secret-password'",
+            "plain=ok",
+        ]
+    )
+
+    redacted = gateway_deploy_guard.redact(raw)
+
+    assert "abc" not in redacted
+    assert "secret-token" not in redacted
+    assert "secret-key" not in redacted
+    assert "secret-password" not in redacted
+    assert "Authorization: Bearer [REDACTED]" in redacted
+    assert 'TOKEN="[REDACTED]"' in redacted
+    assert 'API_KEY: "[REDACTED]"' in redacted
+    assert "PASSWORD='[REDACTED]'" in redacted
+    assert "plain=ok" in redacted
+
+
+def test_success_writes_deploy_audit_record_with_refs_and_mode(tmp_path):
+    runner = FakeRunner(apply=False, active=True)
+
+    code = gateway_deploy_guard.deploy(cfg(tmp_path, apply=False), runner=runner, sleeper=lambda _: None)
+
+    assert code == 0
+    records = list((tmp_path / "records").glob("gateway-deploy-*.json"))
+    assert len(records) == 1
+    record = gateway_deploy_guard.json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["mode"] == "dry-run"
+    assert record["status"] == "success"
+    assert record["previous"]["commit"] == "prevsha"
+    assert record["current"]["commit"] == "prevsha"
+    assert record["target"]["ref"] == "target-ref"
+    assert record["target"]["commit"] == "targetsha"
+    assert record["restart_mode"] == "restart"
+
+
+def test_rollback_health_result_and_command_results_are_recorded(tmp_path):
+    runner = FakeRunner(apply=True, active=False)
+
+    code = gateway_deploy_guard.deploy(cfg(tmp_path, apply=True), runner=runner, sleeper=lambda _: None)
+
+    assert code == 1
+    bundle = next((tmp_path / "incidents").glob("gateway-deploy-*"))
+    metadata = gateway_deploy_guard.json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+    rollback = metadata["rollback"]
+    assert rollback["checkout"]["returncode"] == 0
+    assert rollback["restart"]["returncode"] == 0
+    assert rollback["post_rollback_health"]["healthy"] is False
+    assert "failed" in rollback["post_rollback_health"]["detail"]
 
 
 def test_argument_parser_defaults_to_dry_run(tmp_path):

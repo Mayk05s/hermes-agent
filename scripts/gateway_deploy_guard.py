@@ -25,13 +25,15 @@ DEFAULT_REPO = Path("/home/hermes/.hermes/hermes-agent")
 DEFAULT_SERVICE = "hermes-gateway.service"
 DEFAULT_LOG_DIR = Path.home() / ".hermes" / "logs"
 DEFAULT_INCIDENT_DIR = Path.home() / ".hermes" / "deploy-incidents"
+DEFAULT_RECORD_DIR = DEFAULT_LOG_DIR / "gateway-deploys"
 MUTATING_LABELS = {"checkout-target", "restart-service", "rollback-checkout", "reload-service"}
 
-SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*)\s*[:=]\s*([^\s'\"]+)"),
-    re.compile(r"(?i)\b(Bearer)\s+([A-Za-z0-9._~+/=-]{12,})"),
-    re.compile(r"\b(sk-[A-Za-z0-9_-]{12,})"),
-)
+SECRET_KEY_RE = r"[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*"
+AUTHORIZATION_BEARER_PATTERN = re.compile(r"(?i)\b(Authorization\s*[:=]\s*)([\"']?)(Bearer\s+)([^\s,}\]\"']+)(\2)")
+QUOTED_SECRET_PATTERN = re.compile(rf"(?i)\b(?!Authorization\b)({SECRET_KEY_RE})(\s*[:=]\s*)([\"'])([^\"']*)(\3)")
+UNQUOTED_SECRET_PATTERN = re.compile(rf"(?i)\b(?!Authorization\b)({SECRET_KEY_RE})(\s*[:=]\s*)([^\s,}}\]\"']+)")
+BEARER_PATTERN = re.compile(r"(?i)\b(Bearer\s+)([^\s,}\]\"']+)")
+OPENAI_KEY_PATTERN = re.compile(r"\b(sk-[A-Za-z0-9_-]{12,})")
 
 
 @dataclass
@@ -89,6 +91,7 @@ class DeployConfig:
     service: str = DEFAULT_SERVICE
     log_dir: Path = DEFAULT_LOG_DIR
     incident_dir: Path = DEFAULT_INCIDENT_DIR
+    record_dir: Path = DEFAULT_RECORD_DIR
     apply: bool = False
     health_timeout: float = 45.0
     health_interval: float = 2.0
@@ -101,18 +104,74 @@ def utc_now() -> str:
 
 
 def redact(text: str) -> str:
+    """Redact credentials from deploy logs while preserving useful context."""
     redacted = text
-    for pattern in SECRET_PATTERNS:
-        if pattern.pattern.startswith("\\b(sk-"):
-            redacted = pattern.sub("[REDACTED_SECRET]", redacted)
-        else:
-            redacted = pattern.sub(lambda m: f"{m.group(1)}=[REDACTED]", redacted)
+    redacted = AUTHORIZATION_BEARER_PATTERN.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]{m.group(5)}", redacted)
+    redacted = QUOTED_SECRET_PATTERN.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]{m.group(5)}", redacted)
+    redacted = UNQUOTED_SECRET_PATTERN.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
+    redacted = BEARER_PATTERN.sub(lambda m: f"{m.group(1)}[REDACTED]", redacted)
+    redacted = OPENAI_KEY_PATTERN.sub("[REDACTED_SECRET]", redacted)
     return redacted
 
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(redact(text), encoding="utf-8")
+
+
+def write_json(path: Path, data: dict[str, object]) -> None:
+    write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def command_result_metadata(result: CommandResult) -> dict[str, object]:
+    return {
+        "args": result.args,
+        "returncode": result.returncode,
+        "stdout": redact(result.stdout),
+        "stderr": redact(result.stderr),
+    }
+
+
+def deploy_record_path(record_dir: Path) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return record_dir / f"gateway-deploy-{stamp}-{os.getpid()}.json"
+
+
+def write_deploy_audit_record(
+    cfg: DeployConfig,
+    *,
+    previous: dict[str, str],
+    current: dict[str, str],
+    target_commit: str,
+    status: str,
+    health: dict[str, object] | None = None,
+    error: str | None = None,
+    incident_bundle: Path | None = None,
+    rollback: dict[str, object] | None = None,
+) -> Path:
+    record: dict[str, object] = {
+        "created_at": utc_now(),
+        "repo": str(cfg.repo),
+        "service": cfg.service,
+        "mode": "apply" if cfg.apply else "dry-run",
+        "apply": cfg.apply,
+        "restart_mode": cfg.restart_mode,
+        "status": status,
+        "previous": previous,
+        "current": current,
+        "target": {"ref": cfg.target, "commit": target_commit},
+    }
+    if health is not None:
+        record["health"] = health
+    if error is not None:
+        record["error"] = redact(error)
+    if incident_bundle is not None:
+        record["incident_bundle"] = str(incident_bundle)
+    if rollback is not None:
+        record["rollback"] = rollback
+    path = deploy_record_path(cfg.record_dir)
+    write_json(path, record)
+    return path
 
 
 def git(runner: Runner, repo: Path, args: Sequence[str], *, label: str, check: bool = True) -> CommandResult:
@@ -188,6 +247,7 @@ def collect_incident_bundle(
     target_commit: str,
     reason: str,
     health_detail: str = "",
+    rollback: dict[str, object] | None = None,
 ) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     bundle = cfg.incident_dir / f"gateway-deploy-{stamp}"
@@ -202,7 +262,9 @@ def collect_incident_bundle(
         "target": cfg.target,
         "target_commit": target_commit,
     }
-    write_text(bundle / "metadata.json", json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    if rollback is not None:
+        metadata["rollback"] = rollback
+    write_json(bundle / "metadata.json", metadata)
     write_text(bundle / "health.txt", health_detail)
 
     refs = git(runner, cfg.repo, ["show-ref", "--head"], label="git-show-ref", check=False)
@@ -238,24 +300,67 @@ def deploy(cfg: DeployConfig, runner: Runner | None = None, sleeper: Callable[[f
         if cfg.settle_seconds > 0:
             sleeper(cfg.settle_seconds)
         healthy, detail = wait_for_health(runner, cfg.service, cfg.health_timeout, cfg.health_interval, baseline_restarts)
+        health = {"healthy": healthy, "detail": redact(detail)}
         if not healthy:
             raise RuntimeError(f"health check failed\n{detail}")
+        current = current_ref(runner, cfg.repo)
+        record = write_deploy_audit_record(
+            cfg,
+            previous=previous,
+            current=current,
+            target_commit=target_commit,
+            status="success",
+            health=health,
+        )
         print("health: ok")
+        print(f"deploy audit record: {record}")
         if not cfg.apply:
             print("dry-run: mutating checkout/restart/rollback commands were not executed")
         return 0
     except Exception as exc:
         detail = str(exc)
-        bundle = collect_incident_bundle(cfg, runner, previous, target_commit, reason=type(exc).__name__, health_detail=detail)
-        print(f"deploy failed: {detail}", file=sys.stderr)
-        print(f"incident bundle: {bundle}", file=sys.stderr)
+        rollback_metadata: dict[str, object] | None = None
         if cfg.apply:
             rollback = previous["rollback_ref"]
             print(f"rolling back checkout to {rollback}", file=sys.stderr)
-            git(runner, cfg.repo, ["checkout", rollback], label="rollback-checkout", check=False)
-            runner.run(["systemctl", "--user", cfg.restart_mode, cfg.service], label="restart-service", check=False)
+            checkout_result = git(runner, cfg.repo, ["checkout", rollback], label="rollback-checkout", check=False)
+            restart_result = runner.run(["systemctl", "--user", cfg.restart_mode, cfg.service], label="restart-service", check=False)
+            post_rollback_healthy, post_rollback_detail = service_is_healthy(runner, cfg.service, baseline_restarts)
+            rollback_metadata = {
+                "ref": rollback,
+                "checkout": command_result_metadata(checkout_result),
+                "restart": command_result_metadata(restart_result),
+                "post_rollback_health": {
+                    "healthy": post_rollback_healthy,
+                    "detail": redact(post_rollback_detail),
+                },
+            }
         else:
             print("dry-run: rollback checkout/restart not executed", file=sys.stderr)
+        bundle = collect_incident_bundle(
+            cfg,
+            runner,
+            previous,
+            target_commit,
+            reason=type(exc).__name__,
+            health_detail=detail,
+            rollback=rollback_metadata,
+        )
+        current = current_ref(runner, cfg.repo)
+        record = write_deploy_audit_record(
+            cfg,
+            previous=previous,
+            current=current,
+            target_commit=target_commit,
+            status="failure",
+            health={"healthy": False, "detail": redact(detail)},
+            error=detail,
+            incident_bundle=bundle,
+            rollback=rollback_metadata,
+        )
+        print(f"deploy failed: {detail}", file=sys.stderr)
+        print(f"incident bundle: {bundle}", file=sys.stderr)
+        print(f"deploy audit record: {record}", file=sys.stderr)
         return 1
 
 
@@ -273,6 +378,7 @@ def parse_args(argv: Sequence[str]) -> DeployConfig:
     parser.add_argument("--service", default=DEFAULT_SERVICE, help=f"systemd user unit (default: {DEFAULT_SERVICE})")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="directory containing gateway.log/errors.log")
     parser.add_argument("--incident-dir", type=Path, default=DEFAULT_INCIDENT_DIR, help="where sanitized incident bundles are written")
+    parser.add_argument("--record-dir", type=Path, default=DEFAULT_RECORD_DIR, help="where sanitized deploy audit JSON records are written")
     parser.add_argument("--apply", action="store_true", help="execute checkout/restart/rollback; without this all destructive actions are skipped")
     parser.add_argument("--health-timeout", type=float, default=45.0, help="seconds to wait for healthy service")
     parser.add_argument("--health-interval", type=float, default=2.0, help="seconds between health probes")
@@ -285,6 +391,7 @@ def parse_args(argv: Sequence[str]) -> DeployConfig:
         service=ns.service,
         log_dir=ns.log_dir,
         incident_dir=ns.incident_dir,
+        record_dir=ns.record_dir,
         apply=ns.apply,
         health_timeout=ns.health_timeout,
         health_interval=ns.health_interval,
