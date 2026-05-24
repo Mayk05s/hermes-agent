@@ -376,6 +376,14 @@ def compress_context(
         try:
             # Propagate title to the new session with auto-numbering
             old_title = agent._session_db.get_session_title(agent.session_id)
+            old_session_row = None
+            try:
+                old_session_row = agent._session_db.get_session(agent.session_id)
+            except Exception:
+                old_session_row = None
+            continuation_access_scope = getattr(agent, "_gateway_session_key", None)
+            if continuation_access_scope is None and old_session_row:
+                continuation_access_scope = old_session_row.get("access_scope")
             # Trigger memory extraction on the old session before it rotates.
             agent.commit_memory_session(messages)
             agent._session_db.end_session(agent.session_id, "compression")
@@ -394,6 +402,7 @@ def compress_context(
                 model=agent.model,
                 model_config=agent._session_init_model_config,
                 parent_session_id=old_session_id,
+                access_scope=continuation_access_scope,
             )
             agent._session_db_created = True
             # Auto-number the title for the continuation session

@@ -515,6 +515,7 @@ class AIAgent:
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
+                access_scope=getattr(self, "_gateway_session_key", None),
             )
             self._session_db_created = True
         except Exception as e:
