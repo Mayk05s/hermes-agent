@@ -107,14 +107,30 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
-    """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    current_access_scope: Optional[str] = None,
+) -> str:
+    """Return metadata for recent sessions, scoped when the DB supports it."""
     try:
-        sessions = db.list_sessions_rich(
-            limit=limit + 5,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            order_by_last_active=True,
-        )  # fetch extra so we can skip current
+        list_kwargs = {
+            "limit": limit + 5,
+            "exclude_sources": list(_HIDDEN_SESSION_SOURCES),
+            "order_by_last_active": True,
+        }
+        if current_access_scope:
+            list_kwargs["scope_filter"] = current_access_scope
+        try:
+            sessions = db.list_sessions_rich(**list_kwargs)
+        except TypeError:
+            # Older SessionDB implementations do not yet understand scope_filter.
+            # Keep the hook point explicit for upgraded stores/fakes without
+            # breaking the current production schema.
+            list_kwargs.pop("scope_filter", None)
+            sessions = db.list_sessions_rich(**list_kwargs)
+        # fetch extra so we can skip current
 
         current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
 
@@ -281,19 +297,31 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    current_access_scope: Optional[str] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
 
     try:
-        raw_results = db.search_messages(
-            query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=50,  # widen so dedup-by-lineage can find distinct sessions
-            offset=0,
-            sort=sort,
-        )
+        search_kwargs = {
+            "query": query,
+            "role_filter": role_list,
+            "exclude_sources": list(_HIDDEN_SESSION_SOURCES),
+            "limit": 50,  # widen so dedup-by-lineage can find distinct sessions
+            "offset": 0,
+            "sort": sort,
+        }
+        if current_access_scope:
+            search_kwargs["scope_filter"] = current_access_scope
+        try:
+            raw_results = db.search_messages(**search_kwargs)
+        except TypeError:
+            # Compatibility until hermes_state.SessionDB grows a native
+            # scope_filter parameter. Tests/future stores can assert the hook;
+            # today's store keeps existing behavior when no scope-aware index is
+            # available rather than failing live calls.
+            search_kwargs.pop("scope_filter", None)
+            raw_results = db.search_messages(**search_kwargs)
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
@@ -381,6 +409,7 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
+    current_access_scope: Optional[str] = None,
     # Scroll shape
     session_id: str = None,
     around_message_id: int = None,
@@ -406,6 +435,13 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
+    if not current_access_scope:
+        try:
+            from tools.approval import get_current_session_key
+            current_access_scope = get_current_session_key(default="") or None
+        except Exception:
+            current_access_scope = None
+
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
         return _scroll(
@@ -426,7 +462,7 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(db, limit, current_session_id, current_access_scope)
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -447,6 +483,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        current_access_scope=current_access_scope,
     )
 
 
@@ -596,6 +633,7 @@ registry.register(
         sort=args.get("sort"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
+        current_access_scope=kw.get("current_access_scope"),
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
