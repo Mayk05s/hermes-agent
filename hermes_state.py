@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    access_scope TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -585,6 +586,14 @@ class SessionDB:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_access_scope "
+                "ON sessions(access_scope)"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("idx_sessions_access_scope create skipped: %s", exc)
+
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
         # version.  No version-gated column additions remain.
@@ -704,13 +713,14 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        access_scope: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, access_scope, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -719,6 +729,7 @@ class SessionDB:
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
+                    access_scope,
                     time.time(),
                 ),
             )
@@ -1182,6 +1193,7 @@ class SessionDB:
         include_children: bool = False,
         project_compression_tips: bool = True,
         order_by_last_active: bool = False,
+        scope_filter: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1234,6 +1246,9 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if scope_filter:
+            where_clauses.append("s.access_scope = ?")
+            params.append(scope_filter)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         if order_by_last_active:
@@ -2119,6 +2134,7 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
         sort: str = None,
+        scope_filter: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -2185,6 +2201,10 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+
+        if scope_filter:
+            where_clauses.append("s.access_scope = ?")
+            params.append(scope_filter)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -2258,6 +2278,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if scope_filter:
+                    tri_where.append("s.access_scope = ?")
+                    tri_params.append(scope_filter)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -2313,6 +2336,9 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if scope_filter:
+                    like_where.append("s.access_scope = ?")
+                    like_params.append(scope_filter)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -2449,6 +2475,44 @@ class SessionDB:
     # =========================================================================
     # Utility
     # =========================================================================
+
+    def session_matches_scope(self, session_id: str, scope_filter: Optional[str]) -> bool:
+        """Return True when *session_id* belongs to *scope_filter*.
+
+        Empty scope filters are treated as unscoped callers and therefore match;
+        scoped callers require an exact ``sessions.access_scope`` match.
+        """
+        if not scope_filter:
+            return True
+        if not session_id:
+            return False
+        with self._lock:
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? AND access_scope = ? LIMIT 1",
+                (session_id, scope_filter),
+            )
+            return cursor.fetchone() is not None
+
+    def message_matches_scope(self, message_id: int, scope_filter: Optional[str]) -> bool:
+        """Return True when *message_id* belongs to a session in *scope_filter*."""
+        if not scope_filter:
+            return True
+        try:
+            msg_id = int(message_id)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                """SELECT 1
+                   FROM messages m
+                   JOIN sessions s ON s.id = m.session_id
+                   WHERE m.id = ? AND s.access_scope = ?
+                   LIMIT 1""",
+                (msg_id, scope_filter),
+            )
+            return cursor.fetchone() is not None
 
     def session_count(self, source: str = None) -> int:
         """Count sessions, optionally filtered by source."""

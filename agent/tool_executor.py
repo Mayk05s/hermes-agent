@@ -627,6 +627,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+        elif function_name == "query_chat_agent":
+            from tools.registry import registry as _tool_registry
+            function_result = _tool_registry.dispatch(
+                function_name,
+                function_args,
+                current_access_scope=getattr(agent, "_gateway_session_key", None),
+            )
+            tool_duration = time.time() - tool_start_time
         elif function_name == "memory":
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool

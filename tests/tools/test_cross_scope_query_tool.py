@@ -1,6 +1,7 @@
 import json
 
 from tools.cross_scope_query_tool import query_chat_agent
+from tools.registry import registry
 
 
 def test_query_chat_agent_requires_grant_and_exposes_no_history():
@@ -44,3 +45,37 @@ def test_query_chat_agent_with_grant_invokes_mediated_runner_only():
         "target_scope": "agent:main:telegram:dm:bob",
         "question": "Summarize the deployment decision",
     }
+
+
+def test_registry_query_chat_agent_uses_trusted_scope_not_model_args(monkeypatch):
+    seen = {}
+
+    def fake_grant(source_scope, target_scope):
+        seen["grant"] = (source_scope, target_scope)
+        return type("Decision", (), {"allowed": True, "grant_key": "k", "reason": "ok"})()
+
+    def fake_runner(*, source_scope, target_scope, question):
+        seen["runner"] = (source_scope, target_scope, question)
+        return "trusted answer"
+
+    monkeypatch.setattr("tools.cross_scope_query_tool.check_scope_query_grant", fake_grant)
+    monkeypatch.setattr("tools.cross_scope_query_tool._default_mediated_runner", fake_runner)
+
+    result = json.loads(registry.dispatch(
+        "query_chat_agent",
+        {
+            "question": "What is the decision?",
+            "target_scope": "agent:main:telegram:dm:bob",
+            "source_scope": "agent:main:telegram:dm:mallory",
+        },
+        current_access_scope="agent:main:telegram:dm:alice",
+    ))
+
+    assert result["success"] is True
+    assert result["source_scope"] == "agent:main:telegram:dm:alice"
+    assert seen["grant"] == ("agent:main:telegram:dm:alice", "agent:main:telegram:dm:bob")
+    assert seen["runner"] == (
+        "agent:main:telegram:dm:alice",
+        "agent:main:telegram:dm:bob",
+        "What is the decision?",
+    )

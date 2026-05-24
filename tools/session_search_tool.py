@@ -125,10 +125,11 @@ def _list_recent_sessions(
         try:
             sessions = db.list_sessions_rich(**list_kwargs)
         except TypeError:
-            # Older SessionDB implementations do not yet understand scope_filter.
-            # Keep the hook point explicit for upgraded stores/fakes without
-            # breaking the current production schema.
-            list_kwargs.pop("scope_filter", None)
+            if current_access_scope:
+                return tool_error(
+                    "Scoped session browse requires DB scope_filter support; refusing unscoped fallback.",
+                    success=False,
+                )
             sessions = db.list_sessions_rich(**list_kwargs)
         # fetch extra so we can skip current
 
@@ -172,6 +173,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    current_access_scope: Optional[str] = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -216,6 +218,39 @@ def _scroll(
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
+    if current_access_scope:
+        try:
+            if not hasattr(db, "session_matches_scope"):
+                return tool_error(
+                    "scroll rejected: DB lacks scoped session ownership checks",
+                    success=False,
+                )
+            in_scope = db.session_matches_scope(session_id, current_access_scope)
+        except Exception as e:
+            logging.debug("session scope ownership check failed: %s", e, exc_info=True)
+            return tool_error("scroll rejected: failed to verify session scope ownership", success=False)
+        if not in_scope:
+            return tool_error(
+                "scroll rejected: session_id is outside the current access scope",
+                success=False,
+            )
+
+        try:
+            if not hasattr(db, "message_matches_scope"):
+                return tool_error(
+                    "scroll rejected: DB lacks scoped message ownership checks",
+                    success=False,
+                )
+            anchor_in_scope = db.message_matches_scope(around_message_id, current_access_scope)
+        except Exception as e:
+            logging.debug("anchor message scope ownership check failed: %s", e, exc_info=True)
+            return tool_error("scroll rejected: failed to verify anchor message scope ownership", success=False)
+        if not anchor_in_scope:
+            return tool_error(
+                "scroll rejected: anchor message is outside the current access scope",
+                success=False,
+            )
+
     # Fetch the window
     try:
         view = db.get_messages_around(session_id, around_message_id, window=window)
@@ -243,6 +278,22 @@ def _scroll(
             logging.debug("owning-session lookup failed: %s", e, exc_info=True)
             owning = None
         if owning and owning != session_id:
+            if current_access_scope:
+                try:
+                    if not hasattr(db, "session_matches_scope"):
+                        return tool_error(
+                            "scroll rejected: DB lacks scoped session ownership checks",
+                            success=False,
+                        )
+                    owning_in_scope = db.session_matches_scope(owning, current_access_scope)
+                except Exception as e:
+                    logging.debug("anchor scope ownership check failed: %s", e, exc_info=True)
+                    return tool_error("scroll rejected: failed to verify anchor message scope ownership", success=False)
+                if not owning_in_scope:
+                    return tool_error(
+                        "scroll rejected: anchor message is outside the current access scope",
+                        success=False,
+                    )
             a_root = _resolve_to_parent(db, session_id)
             o_root = _resolve_to_parent(db, owning)
             if a_root and o_root and a_root == o_root:
@@ -316,11 +367,11 @@ def _discover(
         try:
             raw_results = db.search_messages(**search_kwargs)
         except TypeError:
-            # Compatibility until hermes_state.SessionDB grows a native
-            # scope_filter parameter. Tests/future stores can assert the hook;
-            # today's store keeps existing behavior when no scope-aware index is
-            # available rather than failing live calls.
-            search_kwargs.pop("scope_filter", None)
+            if current_access_scope:
+                return tool_error(
+                    "Scoped session search requires DB scope_filter support; refusing unscoped fallback.",
+                    success=False,
+                )
             raw_results = db.search_messages(**search_kwargs)
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -450,6 +501,7 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            current_access_scope=current_access_scope,
         )
 
     # Limit clamp [1, 10]

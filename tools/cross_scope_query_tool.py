@@ -96,7 +96,6 @@ QUERY_CHAT_AGENT_SCHEMA = {
         "properties": {
             "question": {"type": "string", "description": "Specific question to ask the target chat/topic agent."},
             "target_scope": {"type": "string", "description": "Canonical target access scope key."},
-            "source_scope": {"type": "string", "description": "Canonical current/source access scope key."},
         },
         "required": ["question", "target_scope"],
     },
@@ -112,7 +111,9 @@ registry.register(
     handler=lambda args, **kw: query_chat_agent(
         question=args.get("question", ""),
         target_scope=args.get("target_scope", ""),
-        source_scope=args.get("source_scope") or kw.get("current_access_scope"),
+        # Source scope is trusted runtime context, not model-supplied input.
+        # Ignore any stale/injected args["source_scope"] value.
+        source_scope=kw.get("current_access_scope"),
     ),
     emoji="🔐",
 )

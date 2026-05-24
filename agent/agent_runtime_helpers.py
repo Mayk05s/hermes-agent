@@ -1556,6 +1556,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             except Exception:
                 pass
         return result
+    elif function_name == "query_chat_agent":
+        from tools.registry import registry as _tool_registry
+        return _tool_registry.dispatch(
+            function_name,
+            function_args,
+            current_access_scope=getattr(agent, "_gateway_session_key", None),
+        )
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         return agent._memory_manager.handle_tool_call(function_name, function_args)
     elif function_name == "clarify":
