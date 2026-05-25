@@ -52,6 +52,15 @@ class FakeRunner(gateway_deploy_guard.Runner):
         return gateway_deploy_guard.CommandResult(command, 0, "", "")
 
 
+class RestartTimeoutRunner(FakeRunner):
+    def run(self, args, *, label, check=True, capture=True, timeout=60):  # noqa: ANN001, ANN201
+        command = [str(arg) for arg in args]
+        if label == "restart-service":
+            self.calls.append((label, command))
+            raise gateway_deploy_guard.subprocess.TimeoutExpired(command, timeout or 60)
+        return super().run(args, label=label, check=check, capture=capture, timeout=timeout)
+
+
 def cfg(tmp_path: Path, *, apply: bool = False) -> Any:
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
@@ -163,6 +172,48 @@ def test_rollback_health_result_and_command_results_are_recorded(tmp_path):
     assert rollback["restart"]["returncode"] == 0
     assert rollback["post_rollback_health"]["healthy"] is False
     assert "failed" in rollback["post_rollback_health"]["detail"]
+
+
+def test_restart_timeout_during_deploy_and_rollback_writes_incident_and_audit(tmp_path):
+    runner = RestartTimeoutRunner(apply=True, active=True)
+
+    code = gateway_deploy_guard.deploy(cfg(tmp_path, apply=True), runner=runner, sleeper=lambda _: None)
+
+    assert code == 1
+    restart_calls = [call for call in runner.calls if call[0] == "restart-service"]
+    assert restart_calls == [
+        ("restart-service", ["systemctl", "--user", "restart", "hermes-gateway.service"]),
+        ("restart-service", ["systemctl", "--user", "restart", "hermes-gateway.service"]),
+    ]
+    bundle = next((tmp_path / "incidents").glob("gateway-deploy-*"))
+    metadata = gateway_deploy_guard.json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["reason"] == "TimeoutExpired"
+    assert "rollback" in metadata
+    assert metadata["rollback"]["checkout"]["returncode"] == 0
+    assert metadata["rollback"]["restart"]["returncode"] == 124
+    assert "timed out" in metadata["rollback"]["restart"]["stderr"]
+
+    records = list((tmp_path / "records").glob("gateway-deploy-*.json"))
+    assert len(records) == 1
+    record = gateway_deploy_guard.json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["status"] == "failure"
+    assert record["incident_bundle"] == str(bundle)
+    assert record["rollback"]["restart"]["returncode"] == 124
+
+
+def test_runner_converts_subprocess_timeout_to_command_result(monkeypatch):
+    def fake_run(*args, **kwargs):  # noqa: ANN001, ANN202
+        raise gateway_deploy_guard.subprocess.TimeoutExpired(args[0], kwargs["timeout"], output="out", stderr="err")
+
+    monkeypatch.setattr(gateway_deploy_guard.subprocess, "run", fake_run)
+    runner = gateway_deploy_guard.Runner(apply=True)
+
+    result = runner.run(["systemctl", "--user", "restart", "hermes-gateway.service"], label="restart-service", check=False)
+
+    assert result.returncode == 124
+    assert result.stdout == "out"
+    assert "err" in result.stderr
+    assert "timed out after 60 seconds" in result.stderr
 
 
 def test_argument_parser_defaults_to_dry_run(tmp_path):

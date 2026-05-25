@@ -51,6 +51,26 @@ class CommandError(RuntimeError):
         super().__init__(f"{label} failed with exit code {result.returncode}: {result.stderr.strip()}")
 
 
+def timeout_stream_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def command_timeout_result(exc: subprocess.TimeoutExpired, command: list[str] | None = None) -> CommandResult:
+    args = [str(arg) for arg in (command or exc.cmd)]
+    stdout = timeout_stream_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+    stderr = timeout_stream_text(getattr(exc, "stderr", None))
+    message = f"Command {args!r} timed out after {exc.timeout} seconds"
+    if stderr:
+        stderr = f"{stderr.rstrip()}\n{message}\n"
+    else:
+        stderr = f"{message}\n"
+    return CommandResult(args, 124, stdout, stderr)
+
+
 @dataclass
 class Runner:
     apply: bool = False
@@ -70,14 +90,20 @@ class Runner:
             self.dry_run_log.append(command)
             return CommandResult(command, 0, "DRY-RUN: not executed\n", "")
 
-        completed = subprocess.run(
-            command,
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-            stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
-            timeout=timeout,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            result = command_timeout_result(exc, command)
+            if check:
+                raise CommandError(label, result) from exc
+            return result
         result = CommandResult(command, completed.returncode, completed.stdout or "", completed.stderr or "")
         if check and result.returncode != 0:
             raise CommandError(label, result)
@@ -130,6 +156,23 @@ def command_result_metadata(result: CommandResult) -> dict[str, object]:
         "stdout": redact(result.stdout),
         "stderr": redact(result.stderr),
     }
+
+
+def run_no_raise(
+    runner: Runner,
+    args: Sequence[str],
+    *,
+    label: str,
+    capture: bool = True,
+    timeout: int | None = 60,
+) -> CommandResult:
+    command = [str(arg) for arg in args]
+    try:
+        return runner.run(command, label=label, check=False, capture=capture, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return command_timeout_result(exc, command)
+    except CommandError as exc:
+        return exc.result
 
 
 def deploy_record_path(record_dir: Path) -> Path:
@@ -323,8 +366,8 @@ def deploy(cfg: DeployConfig, runner: Runner | None = None, sleeper: Callable[[f
         if cfg.apply:
             rollback = previous["rollback_ref"]
             print(f"rolling back checkout to {rollback}", file=sys.stderr)
-            checkout_result = git(runner, cfg.repo, ["checkout", rollback], label="rollback-checkout", check=False)
-            restart_result = runner.run(["systemctl", "--user", cfg.restart_mode, cfg.service], label="restart-service", check=False)
+            checkout_result = run_no_raise(runner, ["git", "-C", str(cfg.repo), "checkout", rollback], label="rollback-checkout")
+            restart_result = run_no_raise(runner, ["systemctl", "--user", cfg.restart_mode, cfg.service], label="restart-service")
             post_rollback_healthy, post_rollback_detail = service_is_healthy(runner, cfg.service, baseline_restarts)
             rollback_metadata = {
                 "ref": rollback,
