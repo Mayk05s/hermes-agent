@@ -4901,7 +4901,52 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
         sender = event.source.user_name or user_id
-        return f"[{sender}|{user_id}]\n{event.text or ''}"
+        body = event.text or ""
+        media_urls = getattr(event, "media_urls", None) or []
+        media_types = getattr(event, "media_types", None) or []
+        if media_urls:
+            parts = [body] if body else []
+            for i, path in enumerate(media_urls):
+                mtype = media_types[i] if i < len(media_types) else ""
+                if mtype.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO:
+                    parts.append(f"[User sent an image: {path}]")
+                elif mtype.startswith("audio/"):
+                    parts.append(f"[User sent audio: {path}]")
+                elif mtype.startswith("video/"):
+                    parts.append(f"[User sent video: {path}]")
+                else:
+                    parts.append(f"[User sent a file: {path}]")
+            body = "\n".join(part for part in parts if part)
+        return f"[{sender}|{user_id}]\n{body}"
+
+    def _observe_unmentioned_group_event(self, event: MessageEvent) -> None:
+        """Append a pre-built skipped group event, preserving cached media paths."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            shared_source = self._telegram_group_observe_shared_source(event.source)
+            session_entry = store.get_or_create_session(shared_source)
+            entry = {
+                "role": "user",
+                "content": self._telegram_group_observe_attributed_text(event),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if event.message_id:
+                entry["message_id"] = str(event.message_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+            adapter_name = getattr(self, "name", "telegram")
+            logger.info(
+                "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s media=%d",
+                adapter_name,
+                getattr(event.source, "chat_id", "unknown"),
+                event.source.user_id or "unknown",
+                len(getattr(event, "media_urls", None) or []),
+            )
+        except Exception as exc:
+            adapter_name = getattr(self, "name", "telegram")
+            logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
 
     def _telegram_group_observe_channel_prompt(self) -> str:
         username = getattr(getattr(self, "_bot", None), "username", None) or "unknown"
@@ -5045,27 +5090,34 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         try:
             event = event or self._build_message_event(message, msg_type, update_id=update_id)
-            shared_source = self._telegram_group_observe_shared_source(event.source)
-            session_entry = store.get_or_create_session(shared_source)
-            entry = {
-                "role": "user",
-                "content": self._telegram_group_observe_attributed_text(event),
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                "observed": True,
-            }
-            if event.message_id:
-                entry["message_id"] = str(event.message_id)
-            store.append_to_transcript(session_entry.session_id, entry)
-            adapter_name = getattr(self, "name", "telegram")
-            logger.info(
-                "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s",
-                adapter_name,
-                getattr(getattr(message, "chat", None), "id", "unknown"),
-                event.source.user_id or "unknown",
-            )
+            self._observe_unmentioned_group_event(event)
         except Exception as exc:
             adapter_name = getattr(self, "name", "telegram")
             logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
+
+    def _telegram_voice_transcription_rule_matches_message(self, message: Message) -> bool:
+        """Return True when an opt-in Telegram voice transcription rule covers this message."""
+        if not getattr(message, "voice", None):
+            return False
+        rules = self.config.extra.get("audio_transcription_rules") or []
+        if not isinstance(rules, list):
+            return False
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(chat, "id", ""))
+        thread_id = getattr(message, "message_thread_id", None)
+        thread_id_str = str(thread_id) if thread_id is not None else None
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if rule.get("enabled", True) is False:
+                continue
+            if str(rule.get("chat_id", "")) != chat_id:
+                continue
+            rule_thread = rule.get("thread_id", None)
+            if rule_thread is not None and str(rule_thread) != (thread_id_str or ""):
+                continue
+            return True
+        return False
 
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
@@ -5402,20 +5454,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
-        if not self._should_process_message(update.message):
-            if self._should_observe_unmentioned_group_message(update.message):
-                _m = update.message
-                _observe_type = self._media_message_type(_m)
-                _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
-                if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
-                await self._cache_observed_media(_m, _event)
-                self._observe_unmentioned_group_message(
-                    _m, _event.message_type, update_id=update.update_id, event=_event
-                )
-            return
-
         msg = update.message
+        should_process = self._should_process_message(msg)
+        if not should_process and self._telegram_voice_transcription_rule_matches_message(msg):
+            should_process = True
+        if not should_process and not self._should_observe_unmentioned_group_message(msg):
+            return
 
         msg_type = self._media_message_type(msg)
 
@@ -5428,13 +5472,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
             await self._handle_sticker(msg, event)
-            event = self._apply_telegram_group_observe_attribution(event)
-            await self.handle_message(event)
+            if should_process:
+                event = self._apply_telegram_group_observe_attribution(event)
+                await self.handle_message(event)
+            else:
+                self._observe_unmentioned_group_event(event)
             return
 
-        # Apply observe attribution after caption is set; sticker is handled above
-        # because _handle_sticker overwrites event.text with its vision description.
-        event = self._apply_telegram_group_observe_attribution(event)
+        # Apply observe attribution only for events that will be dispatched to
+        # the agent.  Observed-only media must keep the original sender source;
+        # _observe_unmentioned_group_event adds attribution exactly once and
+        # appends cached media paths without triggering a reply.
+        if should_process:
+            event = self._apply_telegram_group_observe_attribution(event)
 
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).
@@ -5457,6 +5507,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
+                if not should_process:
+                    self._observe_unmentioned_group_event(event)
+                    return
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
                     await self._queue_media_group_event(str(media_group_id), event)
@@ -5531,13 +5584,17 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # Check file size early so image documents cannot bypass the
                 # document size limit by taking the image path.
-                if not doc.file_size or doc.file_size > self._max_doc_bytes:
-                    limit_mb = self._max_doc_bytes // (1024 * 1024)
+                max_doc_bytes = getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)
+                if not doc.file_size or doc.file_size > max_doc_bytes:
+                    limit_mb = max_doc_bytes // (1024 * 1024)
                     event.text = (
                         "The document is too large or its size could not be verified. "
                         f"Maximum: {limit_mb} MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
+                    if not should_process:
+                        self._observe_unmentioned_group_event(event)
+                        return
                     await self.handle_message(event)
                     return
 
@@ -5556,6 +5613,9 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
                             "could not be read as an image."
                         )
+                        if not should_process:
+                            self._observe_unmentioned_group_event(event)
+                            return
                         await self.handle_message(event)
                         return
 
@@ -5564,6 +5624,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
+                    if not should_process:
+                        self._observe_unmentioned_group_event(event)
+                        return
                     media_group_id = getattr(msg, "media_group_id", None)
                     if media_group_id:
                         await self._queue_media_group_event(str(media_group_id), event)
@@ -5592,7 +5655,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    await self.handle_message(event)
+                    if not should_process:
+                        self._observe_unmentioned_group_event(event)
+                    else:
+                        await self.handle_message(event)
                     return
 
                 # NOTE: image-document handling is performed earlier in this
@@ -5609,6 +5675,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Supported types: {supported_list}"
                     )
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
+                    if not should_process:
+                        self._observe_unmentioned_group_event(event)
+                        return
                     await self.handle_message(event)
                     return
 
@@ -5644,6 +5713,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
 
         media_group_id = getattr(msg, "media_group_id", None)
+        if not should_process:
+            self._observe_unmentioned_group_event(event)
+            return
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
             return

@@ -412,6 +412,76 @@ def test_unmentioned_group_observe_respects_chat_allowlist():
     asyncio.run(_run())
 
 
+def test_observed_group_context_preserves_media_paths():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    event = adapter._build_message_event(_group_message("", chat_id=-100), MessageType.PHOTO, update_id=1005)
+    event.media_urls = ["/home/hermes/.hermes/image_cache/img_test.jpg"]
+    event.media_types = ["image/jpeg"]
+
+    content = adapter._telegram_group_observe_attributed_text(event)
+
+    assert content == (
+        "[Alice Example|111]\n"
+        "[User sent an image: /home/hermes/.hermes/image_cache/img_test.jpg]"
+    )
+
+
+def test_unmentioned_group_photo_is_observed_once_without_dispatch(monkeypatch):
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        adapter.handle_message = AsyncMock()
+
+        file_obj = SimpleNamespace(
+            file_path="photo.jpg",
+            download_as_bytearray=AsyncMock(return_value=bytearray(b"fake-image")),
+        )
+        photo = SimpleNamespace(get_file=AsyncMock(return_value=file_obj))
+        msg = _group_message("", chat_id=-100)
+        msg.photo = [photo]
+        msg.video = None
+        msg.audio = None
+        msg.voice = None
+        msg.document = None
+        msg.sticker = None
+        msg.location = None
+        msg.venue = None
+
+        from gateway.platforms import telegram as telegram_mod
+
+        monkeypatch.setattr(
+            telegram_mod,
+            "cache_image_from_bytes",
+            lambda _data, ext=".jpg": "/home/hermes/.hermes/image_cache/img_test.jpg",
+        )
+
+        await adapter._handle_media_message(
+            SimpleNamespace(update_id=1006, message=msg, effective_message=None),
+            SimpleNamespace(),
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert len(store.messages) == 1
+        _session_id, message, _skip_db = store.messages[0]
+        assert message["content"] == (
+            "[Alice Example|111]\n"
+            "[User sent an image: /home/hermes/.hermes/image_cache/img_test.jpg]"
+        )
+
+    asyncio.run(_run())
+
+
 class _FakeSessionEntry:
     session_id = "telegram-group-session"
 
@@ -1057,7 +1127,7 @@ def test_unmentioned_photo_observed_with_cached_path(monkeypatch, tmp_path):
         adapter._session_store = store
         cached_path = tmp_path / "img_abc_observed.png"
         monkeypatch.setattr(
-            "gateway.platforms.base.cache_image_from_bytes",
+            "gateway.platforms.telegram.cache_image_from_bytes",
             lambda _data, ext=".jpg": str(cached_path),
         )
         update = SimpleNamespace(update_id=3003, message=_group_photo_message(), effective_message=None)
@@ -1086,7 +1156,7 @@ def test_unmentioned_document_observed_with_cached_path(monkeypatch, tmp_path):
         adapter._session_store = store
         cached_path = tmp_path / "doc_abc_report.pdf"
         monkeypatch.setattr(
-            "gateway.platforms.base.cache_document_from_bytes",
+            "gateway.platforms.telegram.cache_document_from_bytes",
             lambda _data, _filename: str(cached_path),
         )
         update = SimpleNamespace(update_id=3004, message=_group_document_message(), effective_message=None)
@@ -1113,7 +1183,7 @@ def test_unmentioned_large_document_observed_without_download(monkeypatch):
         store = _FakeSessionStore()
         adapter._session_store = store
         cache_doc = Mock(return_value="/tmp/huge.pdf")
-        monkeypatch.setattr("gateway.platforms.base.cache_document_from_bytes", cache_doc)
+        monkeypatch.setattr("gateway.platforms.telegram.cache_document_from_bytes", cache_doc)
         document = SimpleNamespace(
             file_name="huge.pdf", mime_type="application/pdf",
             file_size=101, get_file=AsyncMock(),
@@ -1142,7 +1212,7 @@ def test_unmentioned_unsupported_document_observed_without_caching(monkeypatch):
         store = _FakeSessionStore()
         adapter._session_store = store
         cache_doc = Mock(return_value="/tmp/malware.exe")
-        monkeypatch.setattr("gateway.platforms.base.cache_document_from_bytes", cache_doc)
+        monkeypatch.setattr("gateway.platforms.telegram.cache_document_from_bytes", cache_doc)
         file_obj = SimpleNamespace(
             file_path="documents/malware.exe",
             download_as_bytearray=AsyncMock(return_value=bytearray(b"MZ")),
@@ -1160,5 +1230,40 @@ def test_unmentioned_unsupported_document_observed_without_caching(monkeypatch):
         cache_doc.assert_not_called()
         _, message, _ = store.messages[0]
         assert "unsupported" in message["content"].lower()
+
+    asyncio.run(_run())
+
+
+def test_unmentioned_voice_with_matching_transcription_rule_dispatches_for_runner_gating():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=False,
+        )
+        adapter.config.extra["audio_transcription_rules"] = [
+            {
+                "chat_id": -100,
+                "enabled": True,
+                "send_transcript": True,
+                "trigger_keywords": ["напомни"],
+                "on_keyword_match": "run_ai",
+                "on_no_match": "transcript_only",
+            }
+        ]
+        adapter.handle_message = AsyncMock()
+        update = SimpleNamespace(
+            update_id=3003,
+            message=_group_voice_message(caption=None),
+            effective_message=None,
+        )
+
+        await adapter._handle_media_message(update, SimpleNamespace())
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert event.source.chat_id == "-100"
 
     asyncio.run(_run())

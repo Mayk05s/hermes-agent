@@ -1948,7 +1948,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                if success:
+                    deliver_content = final_response
+                else:
+                    job_label = job.get('name', job['id'])
+                    deliver_content = f"⚠️ Cron job '{job_label}' failed (job_id: {job['id']}):\n{error}"
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.

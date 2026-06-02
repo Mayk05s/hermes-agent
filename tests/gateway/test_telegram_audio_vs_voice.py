@@ -12,11 +12,11 @@ These tests confirm that:
   3. Mixed media lists (voice + audio) split correctly.
 """
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -33,13 +33,26 @@ def _make_runner(stt_enabled: bool = True) -> "GatewayRunner":  # type: ignore[n
     return runner
 
 
-def _voice_event(path: str = "/tmp/voice.ogg") -> MessageEvent:
+def _voice_event(
+    path: str = "/tmp/voice.ogg",
+    *,
+    chat_id: str = "1",
+    chat_type: str = "dm",
+    thread_id: str | None = None,
+) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
+    )
     return MessageEvent(
         text="",
         message_type=MessageType.VOICE,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+        source=source,
         media_urls=[path],
         media_types=["audio/ogg"],
+        message_id="321",
     )
 
 
@@ -77,6 +90,88 @@ async def test_voice_message_still_transcribed():
     mock_transcribe.assert_called_once_with("/tmp/voice.ogg")
     assert "hello world" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_rule_transcript_only_suppresses_agent_and_preserves_thread():
+    """Matching per-chat voice rules can transcribe/send transcript without invoking AI."""
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_transcription_rules": [
+                {
+                    "chat_id": -1003966683704,
+                    "thread_id": 359,
+                    "enabled": True,
+                    "send_transcript": True,
+                    "trigger_keywords": ["tripioo", "напомни"],
+                    "on_keyword_match": "run_ai",
+                    "on_no_match": "transcript_only",
+                }
+            ]
+        },
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-1003966683704", chat_type="group", thread_id="359")
+    source = event.source
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "Сегодня обсуждали билеты", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert result is None
+    adapter.send.assert_awaited_once_with(
+        "-1003966683704",
+        "🎙 Транскрипция: Сегодня обсуждали билеты",
+        reply_to=None,
+        metadata={"thread_id": "359"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_rule_keyword_runs_ai_with_decision_instruction():
+    """Keyword hits continue into the agent with transcript and a scoped instruction."""
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_transcription_rules": [
+                {
+                    "chat_id": "-1003966683704",
+                    "thread_id": "359",
+                    "enabled": True,
+                    "send_transcript": True,
+                    "trigger_keywords": ["TRIPIOO", "напомни"],
+                    "on_keyword_match": "run_ai",
+                    "on_no_match": "transcript_only",
+                }
+            ]
+        },
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-1003966683704", chat_type="group", thread_id="359")
+    source = event.source
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "Tripioo напомни проверить статус", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert result is not None
+    assert "Tripioo напомни проверить статус" in result
+    assert "voice transcription rule matched" in result
+    assert "decide whether to answer, take action, or stay silent" in result
+    adapter.send.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

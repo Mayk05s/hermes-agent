@@ -1496,6 +1496,137 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _telegram_topic_binding(config: dict, source) -> dict | None:
+    """Return the configured Telegram group-topic binding for *source*.
+
+    ``group_topics`` is the per-chat/topic visibility boundary for Telegram
+    forum topics.  Keep this lookup small and side-effect-free so it can be
+    reused by both toolset scoping and prompt guards.
+    """
+    try:
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not chat_id or not thread_id:
+            return None
+        chat_base = chat_id.split(":", 1)[0]
+        extra = ((config.get("telegram") or {}).get("extra") or {})
+        for group in extra.get("group_topics") or []:
+            if not isinstance(group, dict):
+                continue
+            if str(group.get("chat_id", "")) != chat_base:
+                continue
+            for topic in group.get("topics") or []:
+                if not isinstance(topic, dict):
+                    continue
+                if str(topic.get("thread_id", "")) == thread_id:
+                    return topic
+    except Exception:
+        logger.debug("Could not resolve Telegram topic binding", exc_info=True)
+    return None
+
+
+def _telegram_source_allows_homeassistant(config: dict, source) -> bool:
+    """Return True only for Telegram chats/topics explicitly mapped to HA.
+
+    The Home Assistant toolset is powerful and may be auto-enabled whenever
+    HASS_TOKEN exists. For Telegram, that is too broad for forum chats where
+    different topics are bound to different skills. Treat the HA topic mapping
+    as the allowlist boundary.
+    """
+    try:
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        chat_base = chat_id.split(":", 1)[0]
+
+        extra = ((config.get("telegram") or {}).get("extra") or {})
+        explicit = extra.get("homeassistant_allowed_chats") or extra.get("ha_allowed_chats")
+        if explicit:
+            if isinstance(explicit, str):
+                allowed = {item.strip() for item in explicit.split(",") if item.strip()}
+            elif isinstance(explicit, (list, tuple, set)):
+                allowed = {str(item).strip() for item in explicit if str(item).strip()}
+            else:
+                allowed = set()
+            if chat_id in allowed or (thread_id and f"{chat_base}:{thread_id}" in allowed):
+                return True
+
+        topic = _telegram_topic_binding(config, source)
+        if topic:
+            skill = str(topic.get("skill", ""))
+            name = str(topic.get("name", ""))
+            return "telegram_homeassistant" in skill or name == "homeassistant"
+    except Exception:
+        logger.debug("Could not resolve Telegram HA tool scope", exc_info=True)
+    return False
+
+
+def _telegram_topic_skill_isolation_prompt(config: dict, source) -> str | None:
+    """Return a per-topic guard that prevents cross-topic skill/memory bleed.
+
+    Global/user memory may contain stable behaviours for another Telegram topic.
+    When a topic is explicitly bound to a skill, add a narrow system guard so
+    cross-topic instructions are not applied outside their configured topic.
+    """
+    platform = str(getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))).lower()
+    if platform != "telegram":
+        return None
+    topic = _telegram_topic_binding(config, source)
+    if not topic:
+        return None
+    skill = str(topic.get("skill", "") or "").strip()
+    name = str(topic.get("name", "") or "").strip()
+    if not skill:
+        return None
+    if "telegram_homeassistant" in skill or name == "homeassistant":
+        return None
+    return (
+        "Telegram topic skill isolation is active for this chat/topic. "
+        f"Only the configured topic skill is visible here: {skill}. "
+        "Only this topic's configured instructions, tools, shortcuts, memory, "
+        "and behaviours are in scope. Instructions, shortcuts, tools, memory, "
+        "and behaviours from other Telegram topics are out of scope."
+    )
+
+
+def _gateway_allowed_skills_for_source(config: dict, source) -> list[str]:
+    """Return session skill visibility allowlist for chat/topic-bound skills.
+
+    The allowlist is consumed by ``skill_view``/``skills_list`` as a real
+    visibility boundary. Global skills remain visible; skills under other
+    ``telegram_*`` topic namespaces are hidden unless their configured topic
+    matches the current source.
+    """
+    platform = str(getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))).lower()
+    if platform != "telegram":
+        return []
+    topic = _telegram_topic_binding(config, source)
+    if not topic:
+        return []
+    skill = str(topic.get("skill", "") or "").strip().strip("/")
+    if not skill:
+        return []
+    allowed = [skill]
+    if "/" in skill:
+        allowed.append(skill.rsplit("/", 1)[-1])
+    return allowed
+
+
+def _scope_gateway_toolsets_for_source(
+    enabled_toolsets: list[str],
+    config: dict,
+    platform_key: str,
+    source,
+) -> list[str]:
+    """Apply per-chat/topic tool boundaries before constructing AIAgent."""
+    scoped = set(enabled_toolsets)
+    if platform_key == "telegram":
+        if _telegram_source_allows_homeassistant(config, source):
+            scoped.add("homeassistant")
+        else:
+            scoped.discard("homeassistant")
+    return sorted(scoped)
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -8462,10 +8593,23 @@ class GatewayRunner:
                     )
 
             if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
-                    message_text,
-                    audio_paths,
-                )
+                voice_rule = self._matching_telegram_voice_transcription_rule(event, source)
+                if voice_rule is not None:
+                    voice_rule_result = await self._apply_telegram_voice_transcription_rule(
+                        message_text,
+                        audio_paths,
+                        event,
+                        source,
+                        voice_rule,
+                    )
+                    if voice_rule_result is None:
+                        return None
+                    message_text = voice_rule_result
+                else:
+                    message_text = await self._enrich_message_with_transcription(
+                        message_text,
+                        audio_paths,
+                    )
                 _stt_fail_markers = (
                     "No STT provider",
                     "STT is disabled",
@@ -12401,7 +12545,12 @@ class GatewayRunner:
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _scope_gateway_toolsets_for_source(
+                sorted(_get_platform_tools(user_config, platform_key)),
+                user_config,
+                platform_key,
+                source,
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -15350,6 +15499,12 @@ class GatewayRunner:
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
+            allowed_skills=",".join(
+                _gateway_allowed_skills_for_source(
+                    _load_gateway_config(),
+                    context.source,
+                )
+            ),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -15455,6 +15610,157 @@ class GatewayRunner:
             return prefix
         return user_text
 
+    def _matching_telegram_voice_transcription_rule(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the configured Telegram voice-transcription rule for this event, if any."""
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return None
+        if getattr(event, "message_type", None) != MessageType.VOICE:
+            return None
+
+        platform_cfg = getattr(self.config, "platforms", {}).get(Platform.TELEGRAM)
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        if not isinstance(extra, dict):
+            return None
+        rules = extra.get("audio_transcription_rules") or []
+        if not isinstance(rules, list):
+            return None
+
+        chat_id = str(getattr(source, "chat_id", ""))
+        thread_id = getattr(source, "thread_id", None)
+        thread_id_str = str(thread_id) if thread_id is not None else None
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if rule.get("enabled", True) is False:
+                continue
+            if str(rule.get("chat_id", "")) != chat_id:
+                continue
+            rule_thread = rule.get("thread_id", None)
+            if rule_thread is not None and str(rule_thread) != (thread_id_str or ""):
+                continue
+            return rule
+        return None
+
+    async def _transcribe_audio_paths_for_inbound_voice(
+        self,
+        audio_paths: List[str],
+    ) -> tuple[List[str], List[str]]:
+        """Transcribe voice paths and return (agent-facing notes, successful transcripts)."""
+        from tools.transcription_tools import transcribe_audio
+
+        enriched_parts: List[str] = []
+        transcripts: List[str] = []
+        for path in audio_paths:
+            try:
+                logger.debug("Transcribing user voice: %s", path)
+                result = await asyncio.to_thread(transcribe_audio, path)
+                if result["success"]:
+                    transcript = result["transcript"]
+                    transcripts.append(transcript)
+                    enriched_parts.append(
+                        f'[The user sent a voice message~ '
+                        f'Here\'s what they said: "{transcript}"]'
+                    )
+                else:
+                    error = result.get("error", "unknown error")
+                    if (
+                        "No STT provider" in error
+                        or error.startswith("Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set")
+                    ):
+                        _no_stt_note = (
+                            "[The user sent a voice message but I can't listen "
+                            "to it right now — no STT provider is configured. "
+                            "A direct message has already been sent to the user "
+                            "with setup instructions."
+                        )
+                        if self._has_setup_skill():
+                            _no_stt_note += (
+                                " You have a skill called hermes-agent-setup "
+                                "that can help users configure Hermes features "
+                                "including voice, tools, and more."
+                            )
+                        _no_stt_note += "]"
+                        enriched_parts.append(_no_stt_note)
+                    else:
+                        enriched_parts.append(
+                            "[The user sent a voice message but I had trouble "
+                            f"transcribing it~ ({error})]"
+                        )
+            except Exception as e:
+                logger.error("Transcription error: %s", e)
+                enriched_parts.append(
+                    "[The user sent a voice message but something went wrong "
+                    "when I tried to listen to it~ Let them know!]"
+                )
+        return enriched_parts, transcripts
+
+    async def _apply_telegram_voice_transcription_rule(
+        self,
+        user_text: str,
+        audio_paths: List[str],
+        event: MessageEvent,
+        source: SessionSource,
+        rule: Dict[str, Any],
+    ) -> Optional[str]:
+        """Apply opt-in Telegram voice rules: send transcript and optionally run AI."""
+        if not getattr(self.config, "stt_enabled", True):
+            # Preserve the established disabled-STT behavior (duration/path note
+            # and existing setup/error handling) instead of bypassing config.
+            return await self._enrich_message_with_transcription(user_text, audio_paths)
+
+        enriched_parts, transcripts = await self._transcribe_audio_paths_for_inbound_voice(audio_paths)
+        transcript_text = "\n\n".join(t for t in transcripts if t)
+        if transcript_text and rule.get("send_transcript", False):
+            adapter = self.adapters.get(Platform.TELEGRAM)
+            if adapter:
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        f"🎙 Транскрипция: {transcript_text}",
+                        reply_to=self._reply_anchor_for_event(event),
+                        metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                    )
+                except Exception:
+                    logger.debug("Failed to send Telegram voice transcript", exc_info=True)
+
+        keywords = rule.get("trigger_keywords") or []
+        matched = False
+        if transcript_text and isinstance(keywords, list):
+            transcript_folded = transcript_text.casefold()
+            matched = any(
+                str(keyword).casefold() in transcript_folded
+                for keyword in keywords
+                if str(keyword).strip()
+            )
+
+        prefix = "\n\n".join(enriched_parts)
+        _placeholder = "(The user sent a message with no text content)"
+        if prefix:
+            if user_text and user_text.strip() == _placeholder:
+                message_text = prefix
+            elif user_text:
+                message_text = f"{prefix}\n\n{user_text}"
+            else:
+                message_text = prefix
+        else:
+            message_text = user_text
+
+        if matched and str(rule.get("on_keyword_match", "run_ai")).lower() == "run_ai":
+            instruction = (
+                "[A Telegram voice transcription rule matched a configured keyword. "
+                "Use the transcript as the user's input and decide whether to answer, "
+                "take action, or stay silent if no response/action is appropriate.]"
+            )
+            return f"{instruction}\n\n{message_text}" if message_text else instruction
+
+        if not matched and str(rule.get("on_no_match", "transcript_only")).lower() == "transcript_only":
+            return None
+        return message_text
+
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
@@ -15492,50 +15798,7 @@ class GatewayRunner:
                 return f"{prefix}\n\n{user_text}"
             return prefix
 
-        from tools.transcription_tools import transcribe_audio
-
-        enriched_parts = []
-        for path in audio_paths:
-            try:
-                logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
-                if result["success"]:
-                    transcript = result["transcript"]
-                    enriched_parts.append(
-                        f'[The user sent a voice message~ '
-                        f'Here\'s what they said: "{transcript}"]'
-                    )
-                else:
-                    error = result.get("error", "unknown error")
-                    if (
-                        "No STT provider" in error
-                        or error.startswith("Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set")
-                    ):
-                        _no_stt_note = (
-                            "[The user sent a voice message but I can't listen "
-                            "to it right now — no STT provider is configured. "
-                            "A direct message has already been sent to the user "
-                            "with setup instructions."
-                        )
-                        if self._has_setup_skill():
-                            _no_stt_note += (
-                                " You have a skill called hermes-agent-setup "
-                                "that can help users configure Hermes features "
-                                "including voice, tools, and more."
-                            )
-                        _no_stt_note += "]"
-                        enriched_parts.append(_no_stt_note)
-                    else:
-                        enriched_parts.append(
-                            "[The user sent a voice message but I had trouble "
-                            f"transcribing it~ ({error})]"
-                        )
-            except Exception as e:
-                logger.error("Transcription error: %s", e)
-                enriched_parts.append(
-                    "[The user sent a voice message but something went wrong "
-                    "when I tried to listen to it~ Let them know!]"
-                )
+        enriched_parts, _transcripts = await self._transcribe_audio_paths_for_inbound_voice(audio_paths)
 
         if enriched_parts:
             prefix = "\n\n".join(enriched_parts)
@@ -16717,7 +16980,12 @@ class GatewayRunner:
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = _scope_gateway_toolsets_for_source(
+            sorted(_get_platform_tools(user_config, platform_key)),
+            user_config,
+            platform_key,
+            source,
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -17384,6 +17652,9 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+            topic_isolation_prompt = _telegram_topic_skill_isolation_prompt(user_config, source)
+            if topic_isolation_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + topic_isolation_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 

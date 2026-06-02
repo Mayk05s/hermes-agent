@@ -525,6 +525,109 @@ def _get_session_platform() -> str:
         return ""
 
 
+def _session_allowed_skill_names() -> Set[str]:
+    """Return the current gateway session skill allowlist, if any.
+
+    Empty means unrestricted (CLI/default).  A non-empty set is used only to
+    constrain topic-scoped ``telegram_*`` skill namespaces; global skills stay
+    visible.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        raw = get_session_env("HERMES_SESSION_ALLOWED_SKILLS", "")
+    except Exception:
+        raw = os.getenv("HERMES_SESSION_ALLOWED_SKILLS", "")
+    return {item.strip().strip("/") for item in str(raw or "").split(",") if item.strip()}
+
+
+def _normalized_skill_identifiers(
+    *,
+    name: str | None = None,
+    category: str | None = None,
+    skill_md: Path | None = None,
+    skill_dir: Path | None = None,
+) -> Set[str]:
+    identifiers: Set[str] = set()
+    if name:
+        identifiers.add(str(name).strip().strip("/"))
+    if category and name:
+        identifiers.add(f"{category}/{name}".strip("/"))
+    try:
+        if skill_md is not None:
+            rel = skill_md.relative_to(SKILLS_DIR)
+            if rel.name == "SKILL.md":
+                identifiers.add(str(rel.parent).strip("/"))
+                identifiers.add(rel.parent.name)
+            else:
+                identifiers.add(str(rel.with_suffix("")).strip("/"))
+                identifiers.add(rel.stem)
+    except Exception:
+        pass
+    try:
+        if skill_dir is not None:
+            rel_dir = skill_dir.relative_to(SKILLS_DIR)
+            identifiers.add(str(rel_dir).strip("/"))
+            identifiers.add(rel_dir.name)
+    except Exception:
+        pass
+    return {i for i in identifiers if i}
+
+
+def _is_topic_scoped_telegram_skill(
+    *,
+    category: str | None = None,
+    skill_md: Path | None = None,
+    skill_dir: Path | None = None,
+) -> bool:
+    if category and str(category).startswith("telegram_"):
+        return True
+    for path in (skill_dir, skill_md.parent if skill_md is not None else None):
+        if path is None:
+            continue
+        try:
+            rel = path.relative_to(SKILLS_DIR)
+        except Exception:
+            continue
+        return bool(rel.parts and str(rel.parts[0]).startswith("telegram_"))
+    return False
+
+
+def _is_skill_visible_in_session(
+    *,
+    name: str | None = None,
+    category: str | None = None,
+    skill_md: Path | None = None,
+    skill_dir: Path | None = None,
+) -> bool:
+    allowed = _session_allowed_skill_names()
+    if not allowed:
+        return True
+    if not _is_topic_scoped_telegram_skill(
+        category=category,
+        skill_md=skill_md,
+        skill_dir=skill_dir,
+    ):
+        return True
+    identifiers = _normalized_skill_identifiers(
+        name=name,
+        category=category,
+        skill_md=skill_md,
+        skill_dir=skill_dir,
+    )
+    return bool(identifiers & allowed)
+
+
+def _skill_visibility_error(name: str) -> str:
+    return json.dumps(
+        {
+            "success": False,
+            "error": f"Skill '{name}' is not visible in this chat/topic.",
+            "hint": "Use skills_list to see skills visible in this session.",
+        },
+        ensure_ascii=False,
+    )
+
+
 def _is_skill_disabled(name: str, platform: str = None) -> bool:
     """Check if a skill is disabled in config.
 
@@ -604,6 +707,13 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
                 category = _get_category_from_path(skill_md)
+                if not _is_skill_visible_in_session(
+                    name=name,
+                    category=category,
+                    skill_md=skill_md,
+                    skill_dir=skill_dir,
+                ):
+                    continue
 
                 seen_names.add(name)
                 skills.append({
@@ -965,6 +1075,12 @@ def skill_view(
                 if found_md.name != "SKILL.md":
                     _record(None, found_md)
 
+        candidates = [
+            (sd, smd)
+            for sd, smd in candidates
+            if _is_skill_visible_in_session(name=name, skill_md=smd, skill_dir=sd)
+        ]
+
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -991,6 +1107,13 @@ def skill_view(
 
         if candidates:
             skill_dir, skill_md = candidates[0]
+
+        if skill_md and not _is_skill_visible_in_session(
+            name=name,
+            skill_md=skill_md,
+            skill_dir=skill_dir,
+        ):
+            return _skill_visibility_error(name)
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
