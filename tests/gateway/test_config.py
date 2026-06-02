@@ -447,6 +447,38 @@ class TestLoadGatewayConfig:
         )
         assert telegram.extra["reply_prefix"] == "nested"
 
+    def test_bridges_telegram_audio_transcription_rules_from_top_level_section(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  audio_transcription_rules:\n"
+            "    - chat_id: -1003966683704\n"
+            "      thread_id: 359\n"
+            "      enabled: true\n"
+            "      message_types: [audio]\n"
+            "      send_transcript: true\n"
+            "      on_no_match: transcript_only\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        telegram = config.platforms[Platform.TELEGRAM]
+        assert telegram.extra["audio_transcription_rules"] == [
+            {
+                "chat_id": -1003966683704,
+                "thread_id": 359,
+                "enabled": True,
+                "message_types": ["audio"],
+                "send_transcript": True,
+                "on_no_match": "transcript_only",
+            }
+        ]
+
     def test_top_level_platforms_override_nested_gateway_platforms(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

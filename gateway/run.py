@@ -8557,10 +8557,15 @@ class GatewayRunner:
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
                     image_paths.append(path)
-                # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
-                # MessageType.VOICE = voice message (Opus/OGG) — always STT
+                # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a).
+                # It bypasses STT by default, but can be opted into with a
+                # chat/topic-scoped Telegram audio_transcription_rules entry.
+                # MessageType.VOICE = voice message (Opus/OGG) — STT by default.
                 if event.message_type == MessageType.AUDIO:
-                    audio_file_paths.append(path)
+                    if self._matching_telegram_voice_transcription_rule(event, source) is not None:
+                        audio_paths.append(path)
+                    else:
+                        audio_file_paths.append(path)
                 elif event.message_type == MessageType.VOICE or (
                     mtype.startswith("audio/")
                     and event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
@@ -15615,10 +15620,11 @@ class GatewayRunner:
         event: MessageEvent,
         source: SessionSource,
     ) -> Optional[Dict[str, Any]]:
-        """Return the configured Telegram voice-transcription rule for this event, if any."""
+        """Return the configured Telegram voice/audio transcription rule for this event, if any."""
         if getattr(source, "platform", None) != Platform.TELEGRAM:
             return None
-        if getattr(event, "message_type", None) != MessageType.VOICE:
+        event_type = getattr(event, "message_type", None)
+        if event_type not in {MessageType.VOICE, MessageType.AUDIO}:
             return None
 
         platform_cfg = getattr(self.config, "platforms", {}).get(Platform.TELEGRAM)
@@ -15629,6 +15635,7 @@ class GatewayRunner:
         if not isinstance(rules, list):
             return None
 
+        requested_kind = "audio" if event_type == MessageType.AUDIO else "voice"
         chat_id = str(getattr(source, "chat_id", ""))
         thread_id = getattr(source, "thread_id", None)
         thread_id_str = str(thread_id) if thread_id is not None else None
@@ -15636,6 +15643,23 @@ class GatewayRunner:
             if not isinstance(rule, dict):
                 continue
             if rule.get("enabled", True) is False:
+                continue
+            message_types = rule.get("message_types", rule.get("types"))
+            if message_types is None:
+                # Backwards-compatible default: existing rules continue to
+                # target Telegram voice notes only. Audio file transcription is
+                # explicitly opt-in per chat/topic.
+                message_types = ["voice"]
+            elif isinstance(message_types, str):
+                message_types = [message_types]
+            if not isinstance(message_types, list):
+                continue
+            normalized_types = {
+                str(item).strip().lower()
+                for item in message_types
+                if str(item).strip()
+            }
+            if "all" not in normalized_types and requested_kind not in normalized_types:
                 continue
             if str(rule.get("chat_id", "")) != chat_id:
                 continue

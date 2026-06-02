@@ -56,13 +56,26 @@ def _voice_event(
     )
 
 
-def _audio_event(path: str = "/tmp/song.mp3") -> MessageEvent:
+def _audio_event(
+    path: str = "/tmp/song.mp3",
+    *,
+    chat_id: str = "1",
+    chat_type: str = "dm",
+    thread_id: str | None = None,
+) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
+    )
     return MessageEvent(
         text="",
         message_type=MessageType.AUDIO,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+        source=source,
         media_urls=[path],
         media_types=["audio/mpeg"],
+        message_id="654",
     )
 
 
@@ -172,6 +185,94 @@ async def test_telegram_voice_rule_keyword_runs_ai_with_decision_instruction():
     assert "voice transcription rule matched" in result
     assert "decide whether to answer, take action, or stay silent" in result
     adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_audio_attachment_opt_in_rule_transcribes_and_posts_to_same_topic():
+    """A chat/topic rule with message_types=['audio'] transcribes Telegram audio attachments."""
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_transcription_rules": [
+                {
+                    "chat_id": "-1003966683704",
+                    "thread_id": "359",
+                    "enabled": True,
+                    "message_types": ["audio"],
+                    "send_transcript": True,
+                    "on_no_match": "transcript_only",
+                }
+            ]
+        },
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _audio_event(
+        "/tmp/podcast.mp3",
+        chat_id="-1003966683704",
+        chat_type="group",
+        thread_id="359",
+    )
+    source = event.source
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "Текст аудио", "provider": "whisper"},
+    ) as mock_transcribe:
+        result = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert result is None
+    mock_transcribe.assert_called_once_with("/tmp/podcast.mp3")
+    adapter.send.assert_awaited_once_with(
+        "-1003966683704",
+        "🎙 Транскрипция: Текст аудио",
+        reply_to=None,
+        metadata={"thread_id": "359"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_audio_attachment_rule_without_audio_type_still_skips_stt():
+    """Existing voice-only rules must not accidentally transcribe Telegram audio files."""
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_transcription_rules": [
+                {
+                    "chat_id": "-1003966683704",
+                    "thread_id": "359",
+                    "enabled": True,
+                    "send_transcript": True,
+                    "on_no_match": "transcript_only",
+                }
+            ]
+        },
+    )
+    event = _audio_event(
+        "/tmp/song.mp3",
+        chat_id="-1003966683704",
+        chat_type="group",
+        thread_id="359",
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=AssertionError("audio attachments are opt-in only"),
+    ):
+        with patch("tools.credential_files.to_agent_visible_cache_path", side_effect=lambda p: p):
+            result = await runner._prepare_inbound_message_text(
+                event=event,
+                source=event.source,
+                history=[],
+            )
+
+    assert "audio file attachment" in result.lower()
+    assert "/tmp/song.mp3" in result
 
 
 # ---------------------------------------------------------------------------
