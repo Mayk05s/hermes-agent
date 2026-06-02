@@ -8269,6 +8269,9 @@ class GatewayRunner:
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        if canonical == "transcribe":
+            return await self._handle_transcribe_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -12937,6 +12940,177 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
             return f"{descriptions[new_mode]}\n" + t("gateway.verbose.save_failed", error=e)
+
+    @staticmethod
+    def _telegram_transcribe_yaml_id(value: Any) -> Any:
+        """Store numeric Telegram ids as ints while preserving non-numeric ids."""
+        text = str(value or "").strip()
+        if text.lstrip("-").isdigit():
+            try:
+                return int(text)
+            except ValueError:
+                return text
+        return text
+
+    @staticmethod
+    def _telegram_transcribe_rule_matches_scope(
+        rule: Dict[str, Any],
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> bool:
+        if not isinstance(rule, dict):
+            return False
+        if str(rule.get("chat_id", "")) != str(chat_id):
+            return False
+        rule_thread = rule.get("thread_id", None)
+        if thread_id is None:
+            return rule_thread is None
+        return rule_thread is not None and str(rule_thread) == str(thread_id)
+
+    @staticmethod
+    def _telegram_rule_has_audio(rule: Dict[str, Any]) -> bool:
+        message_types = rule.get("message_types", rule.get("types"))
+        if message_types is None:
+            return False
+        if isinstance(message_types, str):
+            message_types = [message_types]
+        if not isinstance(message_types, list):
+            return False
+        normalized = {str(item).strip().lower() for item in message_types if str(item).strip()}
+        return "audio" in normalized or "all" in normalized
+
+    def _sync_telegram_audio_transcription_rules(self, rules: list[dict]) -> None:
+        """Update the live GatewayConfig so /transcribe takes effect immediately."""
+        try:
+            platform_cfg = getattr(self.config, "platforms", {}).get(Platform.TELEGRAM)
+            if platform_cfg is None:
+                return
+            extra = getattr(platform_cfg, "extra", None)
+            if not isinstance(extra, dict):
+                extra = {}
+                platform_cfg.extra = extra
+            extra["audio_transcription_rules"] = rules
+        except Exception:
+            logger.debug("Could not sync live Telegram audio transcription rules", exc_info=True)
+
+    async def _handle_transcribe_command(self, event: MessageEvent) -> str:
+        """Handle /transcribe [on|off|status] [chat|topic] for Telegram audio files."""
+        source = event.source
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return "Команда /transcribe доступна только в Telegram."
+
+        raw_args = event.get_command_args().strip().lower().split()
+        action = raw_args[0] if raw_args else "status"
+        if action in {"enable", "true", "1"}:
+            action = "on"
+        elif action in {"disable", "false", "0"}:
+            action = "off"
+        if action not in {"on", "off", "status"}:
+            return (
+                "Использование: /transcribe [on|off|status] [chat|topic]\n"
+                "По умолчанию в топике применяется только текущий топик; вне топика — весь чат."
+            )
+
+        scope_hint = next((arg for arg in raw_args[1:] if arg in {"chat", "topic"}), "")
+        current_thread = str(source.thread_id) if getattr(source, "thread_id", None) else None
+        if scope_hint == "chat":
+            target_thread = None
+            scope_label = "чат"
+        elif scope_hint == "topic" or current_thread:
+            if not current_thread:
+                return "Здесь нет Telegram-топика. Используйте /transcribe on chat для всего чата."
+            target_thread = current_thread
+            scope_label = f"топик {current_thread}"
+        else:
+            target_thread = None
+            scope_label = "чат"
+
+        chat_id = str(source.chat_id)
+        config_path = _hermes_home / "config.yaml"
+        try:
+            user_config = _load_gateway_config()
+            if not isinstance(user_config, dict):
+                user_config = {}
+        except Exception as e:
+            return t("gateway.config_read_failed", error=e)
+
+        telegram_cfg = user_config.setdefault("telegram", {})
+        if not isinstance(telegram_cfg, dict):
+            telegram_cfg = {}
+            user_config["telegram"] = telegram_cfg
+        rules = telegram_cfg.setdefault("audio_transcription_rules", [])
+        if not isinstance(rules, list):
+            rules = []
+            telegram_cfg["audio_transcription_rules"] = rules
+
+        matching_rule = None
+        for rule in rules:
+            if self._telegram_transcribe_rule_matches_scope(rule, chat_id, target_thread):
+                matching_rule = rule
+                break
+
+        if action == "status":
+            enabled = bool(
+                matching_rule
+                and matching_rule.get("enabled", True) is not False
+                and self._telegram_rule_has_audio(matching_rule)
+            )
+            state = "включена" if enabled else "выключена"
+            return f"Транскрипция аудиофайлов для {scope_label}: {state}."
+
+        if action == "on":
+            if matching_rule is None:
+                matching_rule = {
+                    "chat_id": self._telegram_transcribe_yaml_id(chat_id),
+                    "enabled": True,
+                    "message_types": ["audio"],
+                    "send_transcript": True,
+                    "on_no_match": "transcript_only",
+                }
+                if target_thread is not None:
+                    matching_rule["thread_id"] = self._telegram_transcribe_yaml_id(target_thread)
+                rules.append(matching_rule)
+            else:
+                matching_rule["enabled"] = True
+                message_types = matching_rule.get("message_types", matching_rule.get("types"))
+                if isinstance(message_types, str):
+                    message_types = [message_types]
+                elif not isinstance(message_types, list):
+                    message_types = []
+                normalized = [str(item).strip().lower() for item in message_types if str(item).strip()]
+                if "all" not in normalized and "audio" not in normalized:
+                    normalized.append("audio")
+                matching_rule["message_types"] = normalized or ["audio"]
+                matching_rule["send_transcript"] = True
+                matching_rule.setdefault("on_no_match", "transcript_only")
+        else:
+            if matching_rule is not None:
+                message_types = matching_rule.get("message_types", matching_rule.get("types"))
+                if isinstance(message_types, str):
+                    message_types = [message_types]
+                if isinstance(message_types, list):
+                    kept = [
+                        str(item).strip().lower()
+                        for item in message_types
+                        if str(item).strip().lower() not in {"audio", "all"}
+                    ]
+                    if kept:
+                        matching_rule["message_types"] = kept
+                    else:
+                        matching_rule["enabled"] = False
+                        matching_rule["message_types"] = ["audio"]
+                else:
+                    matching_rule["enabled"] = False
+
+        try:
+            atomic_yaml_write(config_path, user_config)
+            self._sync_telegram_audio_transcription_rules(rules)
+        except Exception as e:
+            logger.warning("Failed to save Telegram audio transcription rules: %s", e)
+            return f"Не удалось сохранить настройку: {e}"
+
+        state = "включена" if action == "on" else "выключена"
+        return f"Транскрипция аудиофайлов для {scope_label}: {state}."
 
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer.

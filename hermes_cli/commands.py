@@ -156,6 +156,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("kaomoji", "emoji", "unicode", "ascii")),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
+    CommandDef("transcribe", "Toggle Telegram audio-file transcription for this chat/topic", "Configuration",
+               gateway_only=True, args_hint="[on|off|status] [chat|topic]",
+               subcommands=("on", "off", "status", "chat", "topic")),
     CommandDef("busy", "Control what Enter does while Hermes is working", "Configuration",
                cli_only=True, args_hint="[queue|steer|interrupt|status]",
                subcommands=("queue", "steer", "interrupt", "status")),
@@ -524,6 +527,7 @@ _TELEGRAM_MENU_PRIORITY = (
     "debug",
     "restart",
     "update",
+    "transcribe",
     "verbose",
     "commands",
     # Mid-turn session control.
