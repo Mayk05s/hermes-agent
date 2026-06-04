@@ -1,0 +1,14 @@
+{
+  "name": "mempalace",
+  "label": "MemPalace",
+  "description": "Profile-scoped knowledge graph memory viewer, rebuilder, and refresh tool",
+  "icon": "Database",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/mempalace",
+    "position": "after:profiles"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

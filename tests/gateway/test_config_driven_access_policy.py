@@ -48,6 +48,8 @@ def _clear_auth_env(monkeypatch) -> None:
         "QQ_GROUP_ALLOWED_USERS",
         "WHATSAPP_ALLOWED_USERS",
         "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
         "GATEWAY_ALLOWED_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
         "WECOM_ALLOW_ALL_USERS",
@@ -164,6 +166,45 @@ def test_non_owning_platform_still_default_denies(monkeypatch):
     runner, _adapter = _make_runner(Platform.TELEGRAM, config, enforces=False)
 
     assert runner._is_user_authorized(_source(Platform.TELEGRAM)) is False
+
+
+def test_telegram_config_group_allowed_chats_authorizes_group_senders(monkeypatch):
+    """telegram.extra.group_allowed_chats must authorize the whole listed chat.
+
+    The Telegram adapter uses this config key for group trigger/observation
+    gating. The gateway auth layer must honor the same key, otherwise a chat
+    can be configured and still drop every non-owner sender as unauthorized.
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1001")
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="t",
+                extra={"group_allowed_chats": "-1001,-1002"},
+            )
+        }
+    )
+    runner, _adapter = _make_runner(Platform.TELEGRAM, config, enforces=False)
+
+    allowed = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="stranger",
+        chat_id="-1002",
+        user_name="tester",
+        chat_type="group",
+    )
+    denied = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="stranger",
+        chat_id="-9999",
+        user_name="tester",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(allowed) is True
+    assert runner._is_user_authorized(denied) is False
 
 
 def test_env_allowlist_still_takes_precedence_for_own_policy_platform(monkeypatch):

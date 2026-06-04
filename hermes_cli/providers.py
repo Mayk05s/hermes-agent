@@ -135,6 +135,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="DEEPSEEK_BASE_URL",
     ),
+    "groq": HermesOverlay(
+        transport="openai_chat",
+        base_url_override="https://api.groq.com/openai/v1",
+        base_url_env_var="GROQ_BASE_URL",
+    ),
     "alibaba": HermesOverlay(
         transport="openai_chat",
         base_url_env_var="DASHSCOPE_BASE_URL",

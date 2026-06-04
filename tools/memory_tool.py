@@ -53,8 +53,17 @@ logger = logging.getLogger(__name__)
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the profile/scoped memories directory."""
+    base = get_hermes_home() / "memories"
+    try:
+        from gateway.session_context import get_session_env
+
+        scope = (get_session_env("HERMES_SESSION_MEMORY_SCOPE", "") or "").strip()
+    except Exception:
+        scope = ""
+    if scope and scope != "default":
+        return base / "scopes" / scope
+    return base
 
 ENTRY_DELIMITER = "\n§\n"
 

@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -30,6 +31,65 @@ const STORAGE_KEY = "hermes-dashboard-theme";
 /** Tracks fontUrls we've already injected so multiple theme switches don't
  *  pile up <link> tags. Keyed by URL. */
 const INJECTED_FONT_URLS = new Set<string>();
+
+interface ThemeBootstrapPayload {
+  active?: string;
+  definition?: DashboardTheme;
+}
+
+declare global {
+  interface Window {
+    __HERMES_DASHBOARD_THEME_BOOTSTRAP__?: ThemeBootstrapPayload;
+  }
+}
+
+function readThemeBootstrap(): ThemeBootstrapPayload | null {
+  if (typeof window === "undefined") return null;
+  const bootstrap = window.__HERMES_DASHBOARD_THEME_BOOTSTRAP__;
+  if (!bootstrap || typeof bootstrap.active !== "string") return null;
+  return bootstrap;
+}
+
+function builtInThemeEntries(): ThemeListEntry[] {
+  return Object.values(BUILTIN_THEMES).map((t) => ({
+    name: t.name,
+    label: t.label,
+    description: t.description,
+  }));
+}
+
+function initialThemeName(): string {
+  const bootstrap = readThemeBootstrap();
+  if (bootstrap?.active) {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, bootstrap.active);
+    } catch {
+      /* storage unavailable — still use the injected theme for this page */
+    }
+    return bootstrap.active;
+  }
+  if (typeof window === "undefined") return "default";
+  return window.localStorage.getItem(STORAGE_KEY) ?? "default";
+}
+
+function initialAvailableThemes(): ThemeListEntry[] {
+  const entries = builtInThemeEntries();
+  const definition = readThemeBootstrap()?.definition;
+  if (definition && !entries.some((t) => t.name === definition.name)) {
+    entries.push({
+      name: definition.name,
+      label: definition.label,
+      description: definition.description,
+      definition,
+    });
+  }
+  return entries;
+}
+
+function initialUserThemeDefs(): Record<string, DashboardTheme> {
+  const definition = readThemeBootstrap()?.definition;
+  return definition ? { [definition.name]: definition } : {};
+}
 
 // ---------------------------------------------------------------------------
 // CSS variable builders
@@ -311,26 +371,18 @@ function applyTheme(theme: DashboardTheme) {
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   /** Name of the currently active theme (built-in id or user YAML name). */
-  const [themeName, setThemeName] = useState<string>(() => {
-    if (typeof window === "undefined") return "default";
-    return window.localStorage.getItem(STORAGE_KEY) ?? "default";
-  });
+  const [themeName, setThemeName] = useState<string>(initialThemeName);
 
   /** All selectable themes (shown in the picker). Starts with just the
    *  built-ins; the API call below merges in user themes. */
-  const [availableThemes, setAvailableThemes] = useState<ThemeListEntry[]>(() =>
-    Object.values(BUILTIN_THEMES).map((t) => ({
-      name: t.name,
-      label: t.label,
-      description: t.description,
-    })),
-  );
+  const [availableThemes, setAvailableThemes] =
+    useState<ThemeListEntry[]>(initialAvailableThemes);
 
   /** Full definitions for user themes keyed by name — the API provides
    *  these so custom YAMLs apply without a client-side stub. */
   const [userThemeDefs, setUserThemeDefs] = useState<
     Record<string, DashboardTheme>
-  >({});
+  >(initialUserThemeDefs);
 
   // Resolve a theme name to a full DashboardTheme, falling back to default
   // only when neither a built-in nor a user theme is found.
@@ -348,7 +400,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // Re-apply on every themeName change, or when user themes arrive from
   // the API (since the active theme might be a user theme whose definition
   // hadn't loaded yet on first render).
-  useEffect(() => {
+  useLayoutEffect(() => {
     applyTheme(resolveTheme(themeName));
   }, [themeName, resolveTheme]);
 
@@ -427,11 +479,7 @@ export function useTheme(): ThemeContextValue {
 const ThemeContext = createContext<ThemeContextValue>({
   theme: defaultTheme,
   themeName: "default",
-  availableThemes: Object.values(BUILTIN_THEMES).map((t) => ({
-    name: t.name,
-    label: t.label,
-    description: t.description,
-  })),
+  availableThemes: builtInThemeEntries(),
   setTheme: () => {},
 });
 

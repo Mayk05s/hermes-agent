@@ -151,6 +151,51 @@ class TestWebServerEndpoints:
         assert "hermes_home" in data
         assert "active_sessions" in data
 
+    def test_get_model_options_uses_full_dashboard_catalog(self, monkeypatch):
+        """Dashboard picker must show configurable providers, not only
+        providers that already have credentials on this machine."""
+        captured = {}
+        marker_ctx = object()
+
+        monkeypatch.setattr(
+            "hermes_cli.inventory.load_picker_context",
+            lambda: marker_ctx,
+        )
+
+        def _fake_build_models_payload(ctx, **kwargs):
+            captured["ctx"] = ctx
+            captured.update(kwargs)
+            return {
+                "providers": [
+                    {
+                        "slug": "anthropic",
+                        "name": "Anthropic",
+                        "models": [],
+                        "total_models": 0,
+                        "authenticated": False,
+                        "warning": "paste ANTHROPIC_API_KEY to activate",
+                    }
+                ],
+                "model": "",
+                "provider": "",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.inventory.build_models_payload",
+            _fake_build_models_payload,
+        )
+
+        resp = self.client.get("/api/model/options")
+
+        assert resp.status_code == 200
+        assert captured["ctx"] is marker_ctx
+        assert captured["include_unconfigured"] is True
+        assert captured["picker_hints"] is True
+        assert captured["canonical_order"] is True
+        assert captured["max_models"] == 50
+        assert captured["pricing"] is True
+        assert resp.json()["providers"][0]["slug"] == "anthropic"
+
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
 
@@ -3190,4 +3235,3 @@ class TestValidateProviderCredential:
     def test_empty_value_rejected(self):
         data = self._post("OPENAI_API_KEY", "   ").json()
         assert data["ok"] is False
-

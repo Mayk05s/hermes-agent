@@ -2454,6 +2454,138 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _profile_route_config(self):
+        from gateway.profile_routing import normalize_profile_routes_config
+
+        return normalize_profile_routes_config((_load_gateway_config() or {}).get("profile_routes"))
+
+    def _profile_name_for_source(self, source: SessionSource) -> str:
+        from gateway.profile_routing import resolve_profile_for_source
+
+        return resolve_profile_for_source(self._profile_route_config(), source)
+
+    def _profile_home_for_name(self, profile_name: str) -> Path:
+        from hermes_cli import profiles as profiles_mod
+
+        name = (profile_name or "default").strip() or "default"
+        if name == "default":
+            return profiles_mod._get_default_hermes_home()
+        return profiles_mod.get_profile_dir(name)
+
+    def _load_profile_config_for_name(self, profile_name: str) -> dict:
+        profile_home = self._profile_home_for_name(profile_name)
+        config_path = profile_home / "config.yaml"
+        if not config_path.exists():
+            return {}
+        try:
+            import yaml as _yaml
+
+            data = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.warning("Failed to read profile config for %s: %s", profile_name, exc)
+            return {}
+
+    def _profile_scope_for_source(self, source: SessionSource, profile_name: str):
+        from gateway.profile_scopes import normalize_profile_scopes_config, resolve_scope_for_source
+
+        profile_config = self._load_profile_config_for_name(profile_name)
+        scopes_cfg = normalize_profile_scopes_config(profile_config.get("profile_scopes"))
+        return resolve_scope_for_source(scopes_cfg, source)
+
+    def _source_with_profile_scope(self, source: SessionSource) -> SessionSource:
+        profile_name = self._profile_name_for_source(source)
+        scope = self._profile_scope_for_source(source, profile_name)
+        memory_scope = getattr(scope, "memory_scope", "") or getattr(scope, "scope", "") or "default"
+        routed = dataclasses.replace(
+            source,
+            profile_name=profile_name,
+            scope_name=getattr(scope, "scope", "") or "default",
+            memory_scope=memory_scope,
+        )
+        logger.info(
+            "profile route: platform=%s chat=%s thread=%s -> profile=%s scope=%s memory_scope=%s",
+            getattr(getattr(source, "platform", None), "value", source.platform),
+            source.chat_id,
+            source.thread_id or "",
+            routed.profile_name,
+            routed.scope_name,
+            routed.memory_scope,
+        )
+        return routed
+
+    def _profile_allowed_skills_for_source(self, source: SessionSource) -> list[str]:
+        profile_name = str(getattr(source, "profile_name", "") or "default")
+        try:
+            scope = self._profile_scope_for_source(source, profile_name)
+        except Exception:
+            return []
+        skill_sets = getattr(scope, "skill_sets", None) or {}
+        if not isinstance(skill_sets, dict):
+            return []
+        if str(skill_sets.get("mode") or "allow").lower() != "allow":
+            return []
+        names = skill_sets.get("names") or []
+        if isinstance(names, str):
+            names = [names]
+        return [str(name).strip() for name in names if str(name).strip()]
+
+    def _gateway_chat_settings_raw(self) -> Any:
+        try:
+            cfg = _load_gateway_config() or {}
+        except Exception:
+            return {}
+        return cfg.get("chat_settings") if isinstance(cfg, dict) else {}
+
+    def _chat_settings_for_source(self, source: SessionSource) -> dict[str, Any]:
+        from gateway.chat_settings import resolve_chat_settings_for_source
+
+        try:
+            return resolve_chat_settings_for_source(self._gateway_chat_settings_raw(), source)
+        except Exception as exc:
+            logger.debug("Failed to resolve chat settings for %s:%s: %s", source.platform, source.chat_id, exc)
+            return {}
+
+    def _chat_setting_for_target(
+        self,
+        platform: Optional[Platform],
+        chat_id: Optional[str],
+        key: str,
+    ) -> Any:
+        from gateway.chat_settings import normalize_chat_settings_config, resolve_chat_settings
+
+        if platform is None or chat_id is None:
+            return None
+        try:
+            platform_value = getattr(platform, "value", platform)
+            cfg = normalize_chat_settings_config(self._gateway_chat_settings_raw())
+            settings = resolve_chat_settings(
+                cfg,
+                platform=str(platform_value).lower(),
+                chat_id=str(chat_id),
+            )
+            return settings.get(key)
+        except Exception as exc:
+            logger.debug("Failed to resolve chat setting %s for %s:%s: %s", key, platform, chat_id, exc)
+            return None
+
+    def _profile_config_with_chat_settings(self, user_config: dict, source: SessionSource) -> dict:
+        from gateway.chat_settings import apply_chat_settings_to_config
+
+        try:
+            return apply_chat_settings_to_config(
+                user_config,
+                source,
+                chat_settings_raw=self._gateway_chat_settings_raw(),
+            )
+        except Exception as exc:
+            logger.debug("Failed to apply chat settings overlay: %s", exc)
+            return user_config
+
+    def _transcribe_audio_for_source(self, source: SessionSource) -> str:
+        value = str(self._chat_settings_for_source(source).get("transcribe_audio") or "default").lower()
+        return value if value in {"default", "on", "off"} else "default"
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -7033,6 +7165,31 @@ class GatewayRunner:
             }.get(source.platform, "")
             if chat_allowlist_env:
                 raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                # Telegram also exposes the same chat-scoped allowlist in
+                # config.yaml as telegram.extra.group_allowed_chats.  The
+                # Telegram adapter uses that config for trigger gating, so the
+                # gateway auth layer must honor it too; otherwise a configured
+                # group can be observed but every non-owner sender is rejected
+                # here as "Unauthorized user".
+                if source.platform == Platform.TELEGRAM:
+                    platform_cfg = None
+                    try:
+                        platform_cfg = self.config.platforms.get(Platform.TELEGRAM) if self.config else None
+                    except Exception:
+                        platform_cfg = None
+                    extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
+                    if isinstance(extra, dict):
+                        raw_cfg_allowlist = extra.get("group_allowed_chats") or extra.get("allowed_chats")
+                        if isinstance(raw_cfg_allowlist, (list, tuple, set)):
+                            raw_cfg_allowlist = ",".join(str(item) for item in raw_cfg_allowlist)
+                        elif raw_cfg_allowlist is not None:
+                            raw_cfg_allowlist = str(raw_cfg_allowlist).strip()
+                        else:
+                            raw_cfg_allowlist = ""
+                        if raw_cfg_allowlist:
+                            raw_chat_allowlist = ",".join(
+                                part for part in (raw_chat_allowlist, raw_cfg_allowlist) if part
+                            )
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -7041,6 +7198,18 @@ class GatewayRunner:
                     }
                     if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
                         return True
+
+        # Pairing can also approve an entire group/channel chat. This must run
+        # before the no-user-id guard because some platform events in groups do
+        # not carry a stable sender but still have a stable chat_id.
+        if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
+            platform_name = source.platform.value if source.platform else ""
+            if self.pairing_store.is_chat_approved(
+                platform_name,
+                source.chat_id,
+                source.thread_id or "",
+            ):
+                return True
 
         if not user_id:
             return False
@@ -7304,6 +7473,55 @@ class GatewayRunner:
 
         return "pair"
 
+    def _is_group_pairing_start_event(self, event: MessageEvent) -> bool:
+        """Return True when an unauthorized group/channel /start should request pairing."""
+        source = event.source
+        if not source or source.chat_type not in {"group", "forum", "channel"}:
+            return False
+        if not source.chat_id:
+            return False
+        return event.get_command() == "start"
+
+    async def _handle_group_pairing_request(self, event: MessageEvent) -> Optional[str]:
+        """Create a pending pairing request for an unauthorized group/channel."""
+        source = event.source
+        platform_name = source.platform.value if source.platform else "unknown"
+        if self.pairing_store.is_chat_approved(
+            platform_name,
+            source.chat_id,
+            source.thread_id or "",
+        ):
+            return ""
+
+        entry_id = self.pairing_store.generate_chat_request(
+            platform_name,
+            source.chat_id,
+            source.chat_name or "",
+            chat_type=source.chat_type or "group",
+            thread_id=source.thread_id or "",
+            requester_user_id=source.user_id or "",
+            requester_user_name=source.user_name or "",
+        )
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return None
+
+        if entry_id:
+            await adapter.send(
+                source.chat_id,
+                "Pairing request sent to the Hermes admin. "
+                "I will stay quiet here until this group is approved.",
+                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+            )
+        else:
+            await adapter.send(
+                source.chat_id,
+                "Pairing request is already pending or temporarily rate-limited. "
+                "Ask the Hermes admin to check the Pairing page.",
+                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+            )
+        return None
+
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
         adapter = self.adapters.get(source.platform)
@@ -7405,11 +7623,15 @@ class GatewayRunner:
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized(source):
+                if self._is_group_pairing_start_event(event):
+                    return await self._handle_group_pairing_request(event)
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
+            if self._is_group_pairing_start_event(event):
+                return await self._handle_group_pairing_request(event)
+            # In DMs: offer pairing code. Other group messages stay silent.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
@@ -8556,6 +8778,7 @@ class GatewayRunner:
         if event.media_urls:
             image_paths = []
             audio_paths = []
+            transcribe_audio_mode = self._transcribe_audio_for_source(source)
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
@@ -8565,7 +8788,9 @@ class GatewayRunner:
                 # chat/topic-scoped Telegram audio_transcription_rules entry.
                 # MessageType.VOICE = voice message (Opus/OGG) — STT by default.
                 if event.message_type == MessageType.AUDIO:
-                    if self._matching_telegram_voice_transcription_rule(event, source) is not None:
+                    if transcribe_audio_mode == "off":
+                        audio_file_paths.append(path)
+                    elif transcribe_audio_mode == "on" or self._matching_telegram_voice_transcription_rule(event, source) is not None:
                         audio_paths.append(path)
                     else:
                         audio_file_paths.append(path)
@@ -8573,7 +8798,10 @@ class GatewayRunner:
                     mtype.startswith("audio/")
                     and event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
                 ):
-                    audio_paths.append(path)
+                    if transcribe_audio_mode == "off":
+                        audio_file_paths.append(path)
+                    else:
+                        audio_paths.append(path)
 
             if image_paths:
                 # Decide routing: native (attach pixels) vs text (vision_analyze
@@ -8602,6 +8830,14 @@ class GatewayRunner:
 
             if audio_paths:
                 voice_rule = self._matching_telegram_voice_transcription_rule(event, source)
+                if voice_rule is None and getattr(event, "telegram_passive_audio_transcription", False):
+                    voice_rule = {
+                        "send_transcript": True,
+                        "trigger_keywords": self._telegram_voice_trigger_keywords(),
+                        "trigger_aliases": self._telegram_voice_trigger_aliases(),
+                        "on_keyword_match": "run_ai",
+                        "on_no_match": "transcript_only",
+                    }
                 if voice_rule is not None:
                     voice_rule_result = await self._apply_telegram_voice_transcription_rule(
                         message_text,
@@ -8826,6 +9062,12 @@ class GatewayRunner:
                 event.source = source
             except Exception:
                 pass
+
+        source = self._source_with_profile_scope(source)
+        try:
+            event.source = source
+        except Exception:
+            pass
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
@@ -12979,6 +13221,123 @@ class GatewayRunner:
         normalized = {str(item).strip().lower() for item in message_types if str(item).strip()}
         return "audio" in normalized or "all" in normalized
 
+    def _telegram_show_transcription_enabled(self, rule: Optional[Dict[str, Any]] = None) -> bool:
+        """Return whether Telegram should echo STT text into chat."""
+        if isinstance(rule, dict):
+            for key in ("show_transcription", "telegram.show_transcription"):
+                if key in rule:
+                    return is_truthy_value(rule.get(key), default=False)
+            if "send_transcript" in rule:
+                return is_truthy_value(rule.get("send_transcript"), default=False)
+
+        platform_cfg = getattr(self.config, "platforms", {}).get(Platform.TELEGRAM)
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        if isinstance(extra, dict):
+            for key in ("show_transcription", "telegram.show_transcription"):
+                if key in extra:
+                    return is_truthy_value(extra.get(key), default=False)
+
+        env_value = os.getenv("TELEGRAM_SHOW_TRANSCRIPTION")
+        if env_value is not None:
+            return is_truthy_value(env_value, default=False)
+
+        try:
+            user_config = _load_gateway_config()
+            value = cfg_get(user_config, "telegram", "show_transcription")
+        except Exception:
+            value = None
+        return is_truthy_value(value, default=False)
+
+    @staticmethod
+    def _coerce_telegram_trigger_values(raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, dict):
+            values: List[str] = []
+            for item in raw.values():
+                values.extend(GatewayRunner._coerce_telegram_trigger_values(item))
+            return values
+        if isinstance(raw, str):
+            parts = [part.strip() for part in re.split(r"[\n,]+", raw) if part.strip()]
+            return parts or ([raw.strip()] if raw.strip() else [])
+        if isinstance(raw, (list, tuple, set)):
+            values: List[str] = []
+            for item in raw:
+                values.extend(GatewayRunner._coerce_telegram_trigger_values(item))
+            return values
+        text = str(raw).strip()
+        return [text] if text else []
+
+    def _telegram_extra_value(self, *keys: str) -> Any:
+        platform_cfg = getattr(self.config, "platforms", {}).get(Platform.TELEGRAM)
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        if isinstance(extra, dict):
+            for key in keys:
+                if key in extra:
+                    return extra.get(key)
+        try:
+            user_config = _load_gateway_config()
+        except Exception:
+            user_config = {}
+        for key in keys:
+            value = cfg_get(user_config, "telegram", key)
+            if value is not None:
+                return value
+        return None
+
+    def _telegram_voice_trigger_keywords(self) -> List[str]:
+        raw = self._telegram_extra_value(
+            "voice_trigger_keywords",
+            "transcription_trigger_keywords",
+            "trigger_keywords",
+        )
+        return self._coerce_telegram_trigger_values(raw)
+
+    def _telegram_voice_trigger_aliases(self) -> List[str]:
+        raw = self._telegram_extra_value(
+            "voice_trigger_aliases",
+            "transcription_trigger_aliases",
+            "trigger_aliases",
+            "trigger_keyword_aliases",
+        )
+        return self._coerce_telegram_trigger_values(raw)
+
+    @staticmethod
+    def _normalize_telegram_trigger_text(value: Any) -> str:
+        text = str(value or "").casefold().replace("ё", "е")
+        text = re.sub(r"(?iu)[^\w]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _telegram_transcript_matches_trigger(self, transcript_text: str, rule: Dict[str, Any]) -> bool:
+        triggers = []
+        triggers.extend(self._coerce_telegram_trigger_values(rule.get("trigger_keywords")))
+        triggers.extend(self._coerce_telegram_trigger_values(rule.get("trigger_aliases")))
+        triggers.extend(self._coerce_telegram_trigger_values(rule.get("trigger_keyword_aliases")))
+        triggers.extend(self._telegram_voice_trigger_keywords())
+        triggers.extend(self._telegram_voice_trigger_aliases())
+        if not triggers:
+            return False
+
+        transcript_folded = str(transcript_text or "").casefold()
+        transcript_normalized = f" {self._normalize_telegram_trigger_text(transcript_text)} "
+        for trigger in triggers:
+            trigger_text = str(trigger or "").strip()
+            if not trigger_text:
+                continue
+            if trigger_text.startswith("re:"):
+                try:
+                    if re.search(trigger_text[3:], transcript_text, re.IGNORECASE):
+                        return True
+                except re.error:
+                    logger.debug("Ignoring invalid Telegram voice trigger regex: %r", trigger_text)
+                continue
+            normalized_trigger = self._normalize_telegram_trigger_text(trigger_text)
+            if normalized_trigger and f" {normalized_trigger} " in transcript_normalized:
+                return True
+            if len(normalized_trigger) >= 4 and trigger_text.casefold() in transcript_folded:
+                return True
+        return False
+
     def _sync_telegram_audio_transcription_rules(self, rules: list[dict]) -> None:
         """Update the live GatewayConfig so /transcribe takes effect immediately."""
         try:
@@ -14824,9 +15183,13 @@ class GatewayRunner:
         adapter: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build thread metadata for synthetic sends that only have routing state."""
+        metadata: Dict[str, Any] = {}
+        reply_to_mode = self._chat_setting_for_target(platform, chat_id, "reply_to_mode")
+        if reply_to_mode in {"off", "first", "all"}:
+            metadata["telegram_reply_to_mode"] = str(reply_to_mode)
         if thread_id is None:
-            return None
-        metadata: Dict[str, Any] = {"thread_id": thread_id}
+            return metadata or None
+        metadata["thread_id"] = thread_id
         if self._is_telegram_dm_topic_target(
             platform,
             chat_id,
@@ -15546,7 +15909,23 @@ class GatewayRunner:
                 return None
 
             platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            chat_notification = self._chat_setting_for_target(
+                platform,
+                str(chat_id),
+                "gateway_restart_notification",
+            )
+            if chat_notification == "off":
+                logger.info(
+                    "Restart notification suppressed: %s:%s has chat gateway_restart_notification=off",
+                    platform_str,
+                    chat_id,
+                )
+                return None
+            if (
+                platform_cfg is not None
+                and not platform_cfg.gateway_restart_notification
+                and chat_notification != "on"
+            ):
                 logger.info(
                     "Restart notification suppressed: %s has gateway_restart_notification=false",
                     platform_str,
@@ -15612,7 +15991,23 @@ class GatewayRunner:
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            chat_notification = self._chat_setting_for_target(
+                platform,
+                str(home.chat_id),
+                "gateway_restart_notification",
+            )
+            if chat_notification == "off":
+                logger.info(
+                    "Home-channel startup notification suppressed: %s:%s has chat gateway_restart_notification=off",
+                    platform.value,
+                    home.chat_id,
+                )
+                continue
+            if (
+                platform_cfg is not None
+                and not platform_cfg.gateway_restart_notification
+                and chat_notification != "on"
+            ):
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
                     platform.value,
@@ -15679,11 +16074,15 @@ class GatewayRunner:
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             allowed_skills=",".join(
-                _gateway_allowed_skills_for_source(
+                self._profile_allowed_skills_for_source(context.source)
+                or _gateway_allowed_skills_for_source(
                     _load_gateway_config(),
                     context.source,
                 )
             ),
+            profile_name=str(getattr(context.source, "profile_name", "") or "default"),
+            scope_name=str(getattr(context.source, "scope_name", "") or "default"),
+            memory_scope=str(getattr(context.source, "memory_scope", "") or "default"),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -15908,32 +16307,27 @@ class GatewayRunner:
         if not getattr(self.config, "stt_enabled", True):
             # Preserve the established disabled-STT behavior (duration/path note
             # and existing setup/error handling) instead of bypassing config.
-            return await self._enrich_message_with_transcription(user_text, audio_paths)
+            enriched = await self._enrich_message_with_transcription(user_text, audio_paths)
+            if str(rule.get("on_no_match", "transcript_only")).lower() == "transcript_only":
+                return None
+            return enriched
 
         enriched_parts, transcripts = await self._transcribe_audio_paths_for_inbound_voice(audio_paths)
         transcript_text = "\n\n".join(t for t in transcripts if t)
-        if transcript_text and rule.get("send_transcript", False):
+        if transcript_text and self._telegram_show_transcription_enabled(rule):
             adapter = self.adapters.get(Platform.TELEGRAM)
             if adapter:
                 try:
                     await adapter.send(
                         source.chat_id,
-                        f"🎙 Транскрипция: {transcript_text}",
+                        transcript_text,
                         reply_to=self._reply_anchor_for_event(event),
                         metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
                     )
                 except Exception:
                     logger.debug("Failed to send Telegram voice transcript", exc_info=True)
 
-        keywords = rule.get("trigger_keywords") or []
-        matched = False
-        if transcript_text and isinstance(keywords, list):
-            transcript_folded = transcript_text.casefold()
-            matched = any(
-                str(keyword).casefold() in transcript_folded
-                for keyword in keywords
-                if str(keyword).strip()
-            )
+        matched = bool(transcript_text and self._telegram_transcript_matches_trigger(transcript_text, rule))
 
         prefix = "\n\n".join(enriched_parts)
         _placeholder = "(The user sent a message with no text content)"
@@ -16352,7 +16746,62 @@ class GatewayRunner:
             return cls._empty_honcho_cache_busting_config()
 
     @classmethod
-    def _extract_cache_busting_config(cls, user_config: dict | None) -> dict:
+    def _communication_style_cache_busting_config(
+        cls,
+        user_config: dict | None,
+        *,
+        profile_home: Path | str | None = None,
+    ) -> dict[str, Any]:
+        """Return communication-style values that affect the system prompt.
+
+        ``communication_style`` stores a reference to a shared markdown file.
+        The resolved file content is injected into the frozen system prompt, so
+        edits to that file must invalidate cached AIAgent instances even when
+        config.yaml still says ``style: default``.
+        """
+        import hashlib
+
+        cfg = user_config if isinstance(user_config, dict) else {}
+        raw = cfg.get("communication_style")
+        out: dict[str, Any] = {
+            "communication_style": raw,
+            "communication_style.file": None,
+            "communication_style.file_exists": False,
+            "communication_style.file_hash": None,
+            "communication_style.file_mtime_ns": None,
+            "communication_style.file_size": None,
+        }
+        try:
+            from agent.prompt_builder import _resolve_communication_style_path
+            from hermes_constants import get_hermes_home as _get_hermes_home
+
+            hermes_home = Path(profile_home) if profile_home is not None else _get_hermes_home()
+            style_path = _resolve_communication_style_path(raw, hermes_home)
+        except Exception:
+            style_path = None
+        if style_path is None:
+            return out
+
+        out["communication_style.file"] = str(style_path)
+        try:
+            stat = style_path.stat()
+            content = style_path.read_bytes()
+        except OSError:
+            return out
+
+        out["communication_style.file_exists"] = True
+        out["communication_style.file_mtime_ns"] = stat.st_mtime_ns
+        out["communication_style.file_size"] = stat.st_size
+        out["communication_style.file_hash"] = hashlib.sha256(content).hexdigest()
+        return out
+
+    @classmethod
+    def _extract_cache_busting_config(
+        cls,
+        user_config: dict | None,
+        *,
+        profile_home: Path | str | None = None,
+    ) -> dict:
         """Pull values that must bust the cached agent.
 
         Returns a flat dict keyed by 'section.key'.  Missing config keys and
@@ -16373,6 +16822,7 @@ class GatewayRunner:
                 out[f"{section}.{key}"] = section_val.get(key)
             else:
                 out[f"{section}.{key}"] = None
+        out.update(cls._communication_style_cache_busting_config(cfg, profile_home=profile_home))
         try:
             from tools.registry import registry
 
@@ -16936,7 +17386,7 @@ class GatewayRunner:
             _scfg = StreamingConfig()
 
         platform_key = _platform_config_key(source.platform)
-        user_config = _load_gateway_config()
+        user_config = self._profile_config_with_chat_settings(_load_gateway_config(), source)
         from gateway.display_config import resolve_display_setting
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
@@ -17174,7 +17624,10 @@ class GatewayRunner:
                 return True
             return self._is_session_run_current(session_key, run_generation)
         
-        user_config = _load_gateway_config()
+        profile_name = str(getattr(source, "profile_name", "") or "default")
+        profile_home = self._profile_home_for_name(profile_name)
+        user_config = self._load_profile_config_for_name(profile_name) if profile_name != "default" else _load_gateway_config()
+        user_config = self._profile_config_with_chat_settings(user_config, source)
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
@@ -18000,7 +18453,16 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys={
+                    **self._extract_cache_busting_config(user_config, profile_home=profile_home),
+                    "profile.name": profile_name,
+                    "profile.home": str(profile_home),
+                    "profile.scope": str(getattr(source, "scope_name", "") or "default"),
+                    "profile.memory_scope": str(getattr(source, "memory_scope", "") or "default"),
+                    "source.platform": getattr(getattr(source, "platform", None), "value", source.platform),
+                    "source.chat_id": str(getattr(source, "chat_id", "") or ""),
+                    "source.thread_id": str(getattr(source, "thread_id", "") or ""),
+                },
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
@@ -18053,6 +18515,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    system_prompt_signature=_sig,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -18881,8 +19344,17 @@ class GatewayRunner:
             _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
+            def run_sync_with_profile_context():
+                from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+                token = set_hermes_home_override(profile_home)
+                try:
+                    return run_sync()
+                finally:
+                    reset_hermes_home_override(token)
+
             _executor_task = asyncio.ensure_future(
-                self._run_in_executor_with_context(run_sync)
+                self._run_in_executor_with_context(run_sync_with_profile_context)
             )
 
             _inactivity_timeout = False
@@ -19554,6 +20026,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    MEMPALACE_EVERY = 5      # ticks — poll every 5 minutes (inner gate handles rebuild cadence)
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
@@ -19622,6 +20095,16 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 )
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
+
+        if tick_count % MEMPALACE_EVERY == 0:
+            try:
+                from hermes_cli import mempalace
+                result = mempalace.refresh_all_profiles_if_due()
+                refreshed = int(result.get("refreshed") or 0)
+                if refreshed:
+                    logger.info("MemPalace refresh: rebuilt %d profile(s)", refreshed)
+            except Exception as e:
+                logger.debug("MemPalace refresh tick error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")

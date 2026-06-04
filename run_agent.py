@@ -123,6 +123,7 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     build_context_files_prompt,
     build_environment_hints,
     build_nous_subscription_prompt,
+    load_communication_style_md,
     load_soul_md,
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
@@ -368,6 +369,7 @@ class AIAgent:
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        system_prompt_signature: str = None,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
@@ -438,6 +440,7 @@ class AIAgent:
             chat_type=chat_type,
             thread_id=thread_id,
             gateway_session_key=gateway_session_key,
+            system_prompt_signature=system_prompt_signature,
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
@@ -483,6 +486,7 @@ class AIAgent:
                 model=self.model,
                 model_config=self._session_init_model_config,
                 system_prompt=self._cached_system_prompt,
+                system_prompt_signature=getattr(self, "_system_prompt_signature", None),
                 user_id=None,
                 parent_session_id=self._parent_session_id,
             )

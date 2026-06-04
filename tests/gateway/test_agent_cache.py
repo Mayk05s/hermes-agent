@@ -276,6 +276,27 @@ class TestExtractCacheBustingConfig:
 
         assert out["tools.registry_generation"] == 12345
 
+    def test_communication_style_file_edit_busts_cache(self, monkeypatch, tmp_path):
+        from gateway.run import GatewayRunner
+        from hermes_cli import profiles as profiles_mod
+
+        styles_dir = tmp_path / "communication-styles"
+        styles_dir.mkdir()
+        style_file = styles_dir / "default.md"
+        style_file.write_text("# Default\n\nSay sir.", encoding="utf-8")
+        monkeypatch.setattr(profiles_mod, "_get_default_hermes_home", lambda: tmp_path)
+
+        cfg = {"communication_style": {"style": "default"}}
+        before = GatewayRunner._extract_cache_busting_config(cfg, profile_home=tmp_path / "profiles" / "family")
+
+        style_file.write_text("# Default\n\nSay sir more clearly.", encoding="utf-8")
+        after = GatewayRunner._extract_cache_busting_config(cfg, profile_home=tmp_path / "profiles" / "family")
+
+        assert before["communication_style"] == after["communication_style"]
+        assert before["communication_style.file"] == str(style_file)
+        assert after["communication_style.file"] == str(style_file)
+        assert before["communication_style.file_hash"] != after["communication_style.file_hash"]
+
 
     def test_skips_honcho_config_read_when_provider_is_not_honcho(self, monkeypatch):
         """Non-Honcho gateways must not read/parse honcho.json on every message."""
@@ -342,6 +363,7 @@ class TestExtractCacheBustingConfig:
 
     def test_honcho_cache_busting_config_memoized_by_mtime(self, monkeypatch, tmp_path):
         """Repeated Honcho extraction for unchanged honcho.json should reuse parse result."""
+        import os
         from types import SimpleNamespace
         from gateway.run import GatewayRunner
 
@@ -376,6 +398,8 @@ class TestExtractCacheBustingConfig:
         assert parse_calls == [config_path]
 
         config_path.write_text("{\n  \"changed\": true\n}")
+        stat = config_path.stat()
+        os.utime(config_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
         third = GatewayRunner._extract_honcho_cache_busting_config()
 
         assert third == first

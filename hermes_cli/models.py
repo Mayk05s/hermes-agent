@@ -267,6 +267,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "z-ai/glm5",
         "openai/gpt-oss-120b",
     ],
+    "groq": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "deepseek-r1-distill-llama-70b",
+        "moonshotai/kimi-k2-instruct-0905",
+    ],
     "kimi-coding": [
         "kimi-k2.6",
         "kimi-k2.5",
@@ -915,6 +924,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("google-gemini-cli", "Google Gemini (OAuth)",   "Google Gemini via OAuth + Code Assist (Code Assist OAuth flow)"),
     ProviderEntry("deepseek",       "DeepSeek",                 "DeepSeek (V3, R1, coder, direct API)"),
     ProviderEntry("xai",            "xAI",                      "xAI Grok (Direct API)"),
+    ProviderEntry("groq",           "Groq",                     "Groq Cloud (fast Llama, Qwen, DeepSeek, Kimi, and OSS models)"),
     ProviderEntry("zai",            "Z.AI / GLM",               "Z.AI / GLM (Zhipu direct API)"),
     ProviderEntry("kimi-coding",    "Kimi / Kimi Coding Plan",  "Kimi Coding Plan (api.kimi.com & Moonshot API)"),
     ProviderEntry("kimi-coding-cn", "Kimi / Moonshot (China)",  "Kimi / Moonshot China (Domestic direct API)"),

@@ -1,12 +1,13 @@
 """Gateway STT config tests — honor stt.enabled: false from config.yaml."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
 
-from gateway.config import GatewayConfig, Platform, load_gateway_config
+from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -140,3 +141,107 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     assert result is not None
     assert "queued voice transcript" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_message_text_passive_audio_sends_plain_transcript():
+    from gateway.run import GatewayRunner
+
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+    runner._gateway_chat_settings_raw = lambda: {}
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="group",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/passive-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+    event.telegram_passive_audio_transcription = True
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "passive voice transcript",
+            "provider": "local_command",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is None
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[1] == "passive voice transcript"
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_message_text_passive_audio_runs_ai_on_asr_trigger_alias():
+    from gateway.run import GatewayRunner
+
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "show_transcription": True,
+            "voice_trigger_keywords": ["трипио", "tripio"],
+            "voice_trigger_aliases": ["3p", "3p си", "3p вот"],
+        },
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+    runner._gateway_chat_settings_raw = lambda: {}
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="group",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/passive-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+    event.telegram_passive_audio_transcription = True
+
+    transcript = "3p си проверь, как быстро ты отвечаешь"
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": transcript,
+            "provider": "groq",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is not None
+    assert "voice transcription rule matched" in result
+    assert transcript in result
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[1] == transcript

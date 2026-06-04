@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Activity,
   Brain,
@@ -38,6 +39,7 @@ import type {
   StatusResponse,
   MemoryStatus,
   CredentialPoolProvider,
+  CredentialProviderInfo,
   CheckpointsResponse,
   HooksResponse,
   HookEntry,
@@ -143,6 +145,9 @@ export default function SystemPage() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [memory, setMemory] = useState<MemoryStatus | null>(null);
   const [pool, setPool] = useState<CredentialPoolProvider[]>([]);
+  const [credentialProviders, setCredentialProviders] = useState<
+    CredentialProviderInfo[]
+  >([]);
   const [checkpoints, setCheckpoints] = useState<CheckpointsResponse | null>(
     null,
   );
@@ -180,16 +185,18 @@ export default function SystemPage() {
       api.getStatus(),
       api.getSystemStats(),
       api.getMemory(),
+      api.getCredentialProviderCatalog(),
       api.getCredentialPool(),
       api.getCheckpoints(),
       api.getHooks(),
       api.getCurator(),
       api.getPortal(),
     ])
-      .then(([s, st, m, p, c, h, cur, prt]) => {
+      .then(([s, st, m, cp, p, c, h, cur, prt]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
+        if (cp.status === "fulfilled") setCredentialProviders(cp.value.providers);
         if (p.status === "fulfilled") setPool(p.value.providers);
         if (c.status === "fulfilled") setCheckpoints(c.value);
         if (h.status === "fulfilled") setHooks(h.value);
@@ -202,6 +209,15 @@ export default function SystemPage() {
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  const selectedCredentialProvider = useMemo(
+    () => credentialProviders.find((p) => p.slug === credProvider) ?? null,
+    [credentialProviders, credProvider],
+  );
+  const selectedMemoryProvider = useMemo(
+    () => (memory?.providers ?? []).find((p) => p.name === memory?.active) ?? null,
+    [memory],
+  );
 
   // ── Gateway lifecycle ──────────────────────────────────────────────
   const runGateway = async (verb: "start" | "stop" | "restart") => {
@@ -748,8 +764,18 @@ export default function SystemPage() {
         </H2>
         <Card>
           <CardContent className="flex flex-col gap-4 py-4">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Badge tone="secondary">
+                Profile: {memory?.profile_name || "default"}
+              </Badge>
+              {memory?.hermes_home ? (
+                <span className="min-w-0 truncate font-mono">
+                  {memory.hermes_home}
+                </span>
+              ) : null}
+            </div>
             <div className="grid gap-2 max-w-sm">
-              <Label htmlFor="mem-provider">External provider</Label>
+              <Label htmlFor="mem-provider">External provider, one active per profile</Label>
               <Select
                 id="mem-provider"
                 value={memory?.active || ""}
@@ -764,13 +790,28 @@ export default function SystemPage() {
                 ))}
               </Select>
               <p className="text-xs text-muted-foreground">
-                Set up a new provider's credentials with{" "}
-                <span className="font-mono">hermes memory setup</span>.
+                Built-in MEMORY.md and USER.md stay separate; this selector adds
+                one external provider for this profile.
               </p>
+              {selectedMemoryProvider?.description ? (
+                <p className="text-xs text-muted-foreground">
+                  {selectedMemoryProvider.description}
+                </p>
+              ) : null}
+              {memory?.active === "mempalace" ? (
+                <Link className="text-xs underline underline-offset-4" to="/mempalace">
+                  Open MemPalace viewer
+                </Link>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Set up a new provider's credentials with{" "}
+                  <span className="font-mono">hermes memory setup</span>.
+                </p>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-3 border-t border-border pt-3">
               <span className="text-xs text-muted-foreground">
-                Built-in files — MEMORY.md:{" "}
+                Built-in files, independent — MEMORY.md:{" "}
                 {formatBytes(memory?.builtin_files.memory ?? 0)} · USER.md:{" "}
                 {formatBytes(memory?.builtin_files.user ?? 0)}
               </span>
@@ -800,7 +841,26 @@ export default function SystemPage() {
             <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
               <div className="grid gap-2">
                 <Label htmlFor="cred-provider">Provider</Label>
-                <Input id="cred-provider" value={credProvider} onChange={(e) => setCredProvider(e.target.value)} placeholder="openrouter" />
+                <Select
+                  id="cred-provider"
+                  value={credProvider}
+                  onValueChange={setCredProvider}
+                >
+                  {credentialProviders.length === 0 ? (
+                    <SelectOption value={credProvider}>{credProvider}</SelectOption>
+                  ) : (
+                    credentialProviders.map((provider) => (
+                      <SelectOption key={provider.slug} value={provider.slug}>
+                        {provider.name} · {provider.slug}
+                      </SelectOption>
+                    ))
+                  )}
+                </Select>
+                {selectedCredentialProvider?.key_env ? (
+                  <span className="text-xs font-mono text-muted-foreground">
+                    {selectedCredentialProvider.key_env}
+                  </span>
+                ) : null}
               </div>
               <div className="grid gap-2 sm:col-span-2">
                 <Label htmlFor="cred-key">API key</Label>

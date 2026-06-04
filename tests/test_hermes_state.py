@@ -123,10 +123,11 @@ class TestSessionLifecycle:
 
     def test_update_system_prompt(self, db):
         db.create_session(session_id="s1", source="cli")
-        db.update_system_prompt("s1", "You are a helpful assistant.")
+        db.update_system_prompt("s1", "You are a helpful assistant.", signature="sig-1")
 
         session = db.get_session("s1")
         assert session["system_prompt"] == "You are a helpful assistant."
+        assert session["system_prompt_signature"] == "sig-1"
 
     def test_update_token_counts(self, db):
         db.create_session(session_id="s1", source="cli")

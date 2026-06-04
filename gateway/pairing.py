@@ -50,6 +50,7 @@ MAX_PENDING_PER_PLATFORM = 3        # Max pending codes per platform
 MAX_FAILED_ATTEMPTS = 5             # Failed approvals before lockout
 
 PAIRING_DIR = get_hermes_dir("platforms/pairing", "pairing")
+_INITIAL_PAIRING_DIR = PAIRING_DIR
 
 
 def _secure_write(path: Path, data: str) -> None:
@@ -89,19 +90,22 @@ class PairingStore:
     """
 
     def __init__(self):
-        PAIRING_DIR.mkdir(parents=True, exist_ok=True)
+        self._pairing_dir = Path(PAIRING_DIR)
+        if self._pairing_dir == _INITIAL_PAIRING_DIR:
+            self._pairing_dir = get_hermes_dir("platforms/pairing", "pairing")
+        self._pairing_dir.mkdir(parents=True, exist_ok=True)
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()
 
     def _pending_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-pending.json"
+        return self._pairing_dir / f"{platform}-pending.json"
 
     def _approved_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-approved.json"
+        return self._pairing_dir / f"{platform}-approved.json"
 
     def _rate_limit_path(self) -> Path:
-        return PAIRING_DIR / "_rate_limits.json"
+        return self._pairing_dir / "_rate_limits.json"
 
     def _load_json(self, path: Path) -> dict:
         if path.exists():
@@ -139,6 +143,26 @@ class PairingStore:
         right_aliases = self._user_id_aliases(platform, right)
         return bool(left_aliases and right_aliases and (left_aliases & right_aliases))
 
+    def _chat_approval_id(self, chat_id: str, thread_id: str = "") -> str:
+        """Return the approved-list key for a chat or topic pairing."""
+        clean_chat_id = str(chat_id or "").strip()
+        clean_thread_id = str(thread_id or "").strip()
+        if clean_thread_id:
+            return f"chat:{clean_chat_id}:thread:{clean_thread_id}"
+        return f"chat:{clean_chat_id}"
+
+    def _chat_rate_limit_id(self, chat_id: str, thread_id: str = "") -> str:
+        """Return a rate-limit key for chat pairing requests."""
+        return self._chat_approval_id(chat_id, thread_id)
+
+    def _is_chat_pending_entry(self, info: dict, chat_id: str, thread_id: str = "") -> bool:
+        if not isinstance(info, dict) or info.get("subject_type") != "chat":
+            return False
+        return (
+            str(info.get("chat_id") or "").strip() == str(chat_id or "").strip()
+            and str(info.get("thread_id") or "").strip() == str(thread_id or "").strip()
+        )
+
     # ----- Approved users -----
 
     def is_approved(self, platform: str, user_id: str) -> bool:
@@ -148,6 +172,15 @@ class PairingStore:
             if self._user_ids_match(platform, approved_user_id, user_id):
                 return True
         return False
+
+    def is_chat_approved(self, platform: str, chat_id: str, thread_id: str = "") -> bool:
+        """Check if a chat or topic is approved (paired) on a platform."""
+        if not str(chat_id or "").strip():
+            return False
+        approved = self._load_json(self._approved_path(platform))
+        chat_key = self._chat_approval_id(chat_id)
+        topic_key = self._chat_approval_id(chat_id, thread_id)
+        return chat_key in approved or (bool(thread_id) and topic_key in approved)
 
     def list_approved(self, platform: str = None) -> list:
         """List approved users, optionally filtered by platform."""
@@ -159,7 +192,13 @@ class PairingStore:
                 results.append({"platform": p, "user_id": uid, **info})
         return results
 
-    def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> None:
+    def _approve_user(
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str = "",
+        extra: Optional[dict] = None,
+    ) -> None:
         """Add a user to the approved list. Must be called under self._lock."""
         approved = self._load_json(self._approved_path(platform))
         normalized_user_id = self._normalize_user_id(platform, user_id)
@@ -171,10 +210,13 @@ class PairingStore:
         for approved_user_id in duplicate_ids:
             del approved[approved_user_id]
 
-        approved[normalized_user_id] = {
+        approved_entry = {
             "user_name": user_name,
             "approved_at": time.time(),
         }
+        if extra:
+            approved_entry.update(extra)
+        approved[normalized_user_id] = approved_entry
         self._save_json(self._approved_path(platform), approved)
 
     def revoke(self, platform: str, user_id: str) -> bool:
@@ -257,6 +299,129 @@ class PairingStore:
 
             return code
 
+    def generate_chat_request(
+        self,
+        platform: str,
+        chat_id: str,
+        chat_name: str = "",
+        *,
+        chat_type: str = "group",
+        thread_id: str = "",
+        requester_user_id: str = "",
+        requester_user_name: str = "",
+    ) -> Optional[str]:
+        """
+        Create a pending pairing request for a group/channel chat.
+
+        Unlike DM pairing, this does not need to reveal a code in the chat.
+        The dashboard can approve the pending entry by its opaque entry_id.
+        """
+        with self._lock:
+            self._cleanup_expired(platform)
+            clean_chat_id = str(chat_id or "").strip()
+            clean_thread_id = str(thread_id or "").strip()
+            if not clean_chat_id:
+                return None
+
+            rate_limit_id = self._chat_rate_limit_id(clean_chat_id, clean_thread_id)
+            pending = self._load_json(self._pending_path(platform))
+            for entry_id, info in pending.items():
+                if self._is_chat_pending_entry(info, clean_chat_id, clean_thread_id):
+                    self._record_rate_limit(platform, rate_limit_id)
+                    return entry_id
+
+            if self._is_locked_out(platform):
+                return None
+
+            if self._is_rate_limited(platform, rate_limit_id):
+                return None
+
+            if len(pending) >= MAX_PENDING_PER_PLATFORM:
+                return None
+
+            entry_id = secrets.token_hex(8)
+            approval_id = self._chat_approval_id(clean_chat_id, clean_thread_id)
+            pending[entry_id] = {
+                "subject_type": "chat",
+                "user_id": approval_id,
+                "user_name": chat_name,
+                "chat_id": clean_chat_id,
+                "chat_name": chat_name,
+                "chat_type": chat_type or "group",
+                "thread_id": clean_thread_id,
+                "requester_user_id": self._normalize_user_id(platform, requester_user_id),
+                "requester_user_name": requester_user_name,
+                "created_at": time.time(),
+            }
+            self._save_json(self._pending_path(platform), pending)
+            self._record_rate_limit(platform, rate_limit_id)
+            return entry_id
+
+    def approve_entry(self, platform: str, entry_id: str) -> Optional[dict]:
+        """
+        Approve a pending pairing entry by dashboard-visible entry_id.
+
+        This is intended for authenticated admin surfaces. CLI approval should
+        continue to use approve_code() for user-facing DM codes.
+        """
+        with self._lock:
+            self._cleanup_expired(platform)
+            entry_id = str(entry_id or "").strip()
+            if self._is_locked_out(platform):
+                return None
+
+            pending = self._load_json(self._pending_path(platform))
+            entry = pending.get(entry_id)
+            if not isinstance(entry, dict):
+                return None
+
+            del pending[entry_id]
+            self._save_json(self._pending_path(platform), pending)
+            return self._approve_pending_entry(platform, entry)
+
+    def reject_entry(self, platform: str, entry_id: str) -> bool:
+        """Remove one pending pairing entry without approving it."""
+        with self._lock:
+            self._cleanup_expired(platform)
+            entry_id = str(entry_id or "").strip()
+            if not entry_id:
+                return False
+
+            pending = self._load_json(self._pending_path(platform))
+            if entry_id not in pending:
+                return False
+
+            del pending[entry_id]
+            self._save_json(self._pending_path(platform), pending)
+            return True
+
+    def _approve_pending_entry(self, platform: str, entry: dict) -> dict:
+        """Approve a pending entry already removed from pending storage."""
+        subject_type = str(entry.get("subject_type") or "user").strip().lower() or "user"
+        user_id = entry.get("user_id", "")
+        user_name = entry.get("user_name", "")
+        extra = {"subject_type": subject_type}
+        if subject_type == "chat":
+            extra.update({
+                "chat_id": entry.get("chat_id", ""),
+                "chat_name": entry.get("chat_name", ""),
+                "chat_type": entry.get("chat_type", "group"),
+                "thread_id": entry.get("thread_id", ""),
+                "requester_user_id": entry.get("requester_user_id", ""),
+                "requester_user_name": entry.get("requester_user_name", ""),
+            })
+
+        self._approve_user(platform, user_id, user_name, extra=extra)
+
+        result = {
+            "platform": platform,
+            "user_id": user_id,
+            "user_name": user_name,
+            "subject_type": subject_type,
+        }
+        result.update(extra)
+        return result
+
     def approve_code(self, platform: str, code: str) -> Optional[dict]:
         """
         Approve a pairing code. Adds the user to the approved list.
@@ -316,14 +481,7 @@ class PairingStore:
             del pending[matched_key]
             self._save_json(self._pending_path(platform), pending)
 
-            # Add to approved list
-            self._approve_user(platform, matched_entry["user_id"],
-                               matched_entry.get("user_name", ""))
-
-            return {
-                "user_id": matched_entry["user_id"],
-                "user_name": matched_entry.get("user_name", ""),
-            }
+            return self._approve_pending_entry(platform, matched_entry)
 
     def list_pending(self, platform: str = None) -> list:
         """List pending pairing requests, optionally filtered by platform.
@@ -348,12 +506,25 @@ class PairingStore:
                         continue
                     age_min = int((time.time() - created_at) / 60)
                     hash_val = info.get("hash")
-                    code_display = hash_val[:8] if isinstance(hash_val, str) else "legacy"
+                    if isinstance(hash_val, str):
+                        code_display = hash_val[:8]
+                    elif info.get("subject_type") == "chat":
+                        code_display = entry_id[:8]
+                    else:
+                        code_display = "legacy"
                     results.append({
                         "platform": p,
+                        "entry_id": entry_id,
                         "code": code_display,
                         "user_id": info.get("user_id", ""),
                         "user_name": info.get("user_name", ""),
+                        "subject_type": info.get("subject_type", "user"),
+                        "chat_id": info.get("chat_id", ""),
+                        "chat_name": info.get("chat_name", ""),
+                        "chat_type": info.get("chat_type", ""),
+                        "thread_id": info.get("thread_id", ""),
+                        "requester_user_id": info.get("requester_user_id", ""),
+                        "requester_user_name": info.get("requester_user_name", ""),
                         "age_minutes": age_min,
                     })
         return results
@@ -442,7 +613,7 @@ class PairingStore:
     def _all_platforms(self, suffix: str) -> list:
         """List all platforms that have data files of a given suffix."""
         platforms = []
-        for f in PAIRING_DIR.iterdir():
+        for f in self._pairing_dir.iterdir():
             if f.name.endswith(f"-{suffix}.json"):
                 platform = f.name.replace(f"-{suffix}.json", "")
                 if not platform.startswith("_"):

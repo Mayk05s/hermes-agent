@@ -109,6 +109,19 @@ class TestCredentialPoolEndpoints:
     def _setup(self, _isolate_hermes_home):
         self.client, _ = _client()
 
+    def test_provider_catalog_includes_groq_api_key_provider(self):
+        r = self.client.get("/api/credentials/providers")
+
+        assert r.status_code == 200
+        providers = r.json()["providers"]
+        by_slug = {p["slug"]: p for p in providers}
+
+        assert by_slug["groq"]["name"] == "Groq"
+        assert by_slug["groq"]["auth_type"] == "api_key"
+        assert by_slug["groq"]["key_env"] == "GROQ_API_KEY"
+        assert by_slug["groq"]["base_url_env"] == "GROQ_BASE_URL"
+        assert "openai-codex" not in by_slug
+
     def test_add_list_remove_and_cli_parity(self):
         assert self.client.get("/api/credentials/pool").json()["providers"] == []
 
@@ -188,6 +201,51 @@ class TestPairingEndpoints:
             "/api/pairing/approve", json={"platform": "telegram", "code": "NOPE99"}
         )
         assert r.status_code == 404
+
+    def test_approve_chat_pairing_creates_profile_route(self):
+        from gateway.pairing import PairingStore
+        from hermes_cli.config import load_config
+
+        store = PairingStore()
+        entry_id = store.generate_chat_request(
+            "telegram",
+            "-100123",
+            "Research Group",
+            requester_user_id="111",
+            requester_user_name="Alice",
+        )
+
+        r = self.client.post(
+            "/api/pairing/approve",
+            json={"platform": "telegram", "entry_id": entry_id, "profile": "default"},
+        )
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["user"]["subject_type"] == "chat"
+        assert data["route"]["chat_id"] == "-100123"
+        assert data["route"]["profile"] == "default"
+
+        cfg = load_config()
+        routes = cfg["profile_routes"]["routes"]
+        assert routes[0]["platform"] == "telegram"
+        assert routes[0]["chat_id"] == "-100123"
+        assert routes[0]["profile"] == "default"
+
+    def test_reject_chat_pairing_removes_pending_request(self):
+        from gateway.pairing import PairingStore
+
+        store = PairingStore()
+        entry_id = store.generate_chat_request("telegram", "-100321", "Quiet Group")
+
+        r = self.client.post(
+            "/api/pairing/reject",
+            json={"platform": "telegram", "entry_id": entry_id},
+        )
+
+        assert r.status_code == 200
+        assert store.list_pending("telegram") == []
+        assert store.is_chat_approved("telegram", "-100321") is False
 
 
 class TestWebhookEndpoints:

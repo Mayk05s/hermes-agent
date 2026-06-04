@@ -589,6 +589,59 @@ class TestCodeExpiry:
 # ---------------------------------------------------------------------------
 
 
+class TestChatPairing:
+    def test_generate_chat_request_and_approve_entry(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            entry_id = store.generate_chat_request(
+                "telegram",
+                "-100123",
+                "Research Group",
+                requester_user_id="111",
+                requester_user_name="Alice",
+            )
+            pending = store.list_pending("telegram")
+
+            assert entry_id
+            assert len(pending) == 1
+            assert pending[0]["entry_id"] == entry_id
+            assert pending[0]["subject_type"] == "chat"
+            assert pending[0]["chat_id"] == "-100123"
+            assert pending[0]["requester_user_name"] == "Alice"
+
+            result = store.approve_entry("telegram", entry_id)
+            assert result is not None
+            assert result["subject_type"] == "chat"
+            assert result["chat_id"] == "-100123"
+            assert store.is_chat_approved("telegram", "-100123") is True
+            assert store.list_pending("telegram") == []
+
+            approved = store.list_approved("telegram")
+            assert len(approved) == 1
+            assert approved[0]["subject_type"] == "chat"
+            assert approved[0]["user_id"] == "chat:-100123"
+
+    def test_chat_level_approval_allows_topic_messages(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            entry_id = store.generate_chat_request("telegram", "-100123", "Forum")
+            assert entry_id
+            store.approve_entry("telegram", entry_id)
+
+            assert store.is_chat_approved("telegram", "-100123", "44") is True
+
+    def test_reject_chat_request_removes_pending_entry(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            entry_id = store.generate_chat_request("telegram", "-100123", "Research Group")
+            assert entry_id
+
+            assert store.reject_entry("telegram", entry_id) is True
+            assert store.reject_entry("telegram", entry_id) is False
+            assert store.is_chat_approved("telegram", "-100123") is False
+            assert store.list_pending("telegram") == []
+
+
 class TestRevoke:
     def test_revoke_approved_user(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):

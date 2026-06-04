@@ -61,6 +61,7 @@ import { SidebarFooter } from "@/components/SidebarFooter";
 import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip";
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
 import { useSidebarStatus } from "@/hooks/useSidebarStatus";
+import { AdminProxyProfile } from "@/components/AdminProxyProfile";
 import { AuthWidget } from "@/components/AuthWidget";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
 import { useSystemActions } from "@/contexts/useSystemActions";
@@ -694,6 +695,7 @@ export default function App() {
                 isDesktopCollapsed && "lg:hidden",
               )}
             >
+              <AdminProxyProfile />
               <AuthWidget />
               <SidebarFooter status={sidebarStatus} />
             </div>

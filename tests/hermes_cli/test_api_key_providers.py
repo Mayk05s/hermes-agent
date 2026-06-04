@@ -34,6 +34,7 @@ class TestProviderRegistry:
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
         ("xai", "xAI", "api_key"),
+        ("groq", "Groq", "api_key"),
         ("nvidia", "NVIDIA NIM", "api_key"),
         ("kimi-coding", "Kimi / Moonshot", "api_key"),
         ("stepfun", "StepFun Step Plan", "api_key"),
@@ -65,6 +66,26 @@ class TestProviderRegistry:
         assert pconfig.api_key_env_vars == ("NVIDIA_API_KEY",)
         assert pconfig.base_url_env_var == "NVIDIA_BASE_URL"
         assert pconfig.inference_base_url == "https://integrate.api.nvidia.com/v1"
+
+    def test_groq_env_vars(self):
+        pconfig = PROVIDER_REGISTRY["groq"]
+        assert pconfig.api_key_env_vars == ("GROQ_API_KEY",)
+        assert pconfig.base_url_env_var == "GROQ_BASE_URL"
+        assert pconfig.inference_base_url == "https://api.groq.com/openai/v1"
+
+    def test_groq_in_canonical_model_catalog(self):
+        from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_MODELS
+
+        assert "groq" in {provider.slug for provider in CANONICAL_PROVIDERS}
+        assert _PROVIDER_MODELS["groq"] == [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "qwen/qwen3-32b",
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "deepseek-r1-distill-llama-70b",
+            "moonshotai/kimi-k2-instruct-0905",
+        ]
 
     def test_copilot_env_vars(self):
         pconfig = PROVIDER_REGISTRY["copilot"]
@@ -140,7 +161,7 @@ PROVIDER_ENV_VARS = (
     "LM_API_KEY", "LM_BASE_URL",
     "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY",
     "KIMI_API_KEY", "KIMI_BASE_URL", "STEPFUN_API_KEY", "STEPFUN_BASE_URL",
-    "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY",
+    "GROQ_API_KEY", "GROQ_BASE_URL", "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY",
     "KILOCODE_API_KEY", "KILOCODE_BASE_URL",
     "GMI_API_KEY", "GMI_BASE_URL",
     "DASHSCOPE_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENCODE_GO_API_KEY",

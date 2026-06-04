@@ -1071,6 +1071,8 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+    _allowed_raw = get_session_env("HERMES_SESSION_ALLOWED_SKILLS", "") or ""
+    allowed_skill_names = {item.strip() for item in _allowed_raw.split(",") if item.strip()}
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1078,6 +1080,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        tuple(sorted(allowed_skill_names)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1104,6 +1107,8 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if allowed_skill_names and frontmatter_name not in allowed_skill_names and skill_name not in allowed_skill_names:
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1128,6 +1133,8 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if allowed_skill_names and entry["frontmatter_name"] not in allowed_skill_names and skill_name not in allowed_skill_names:
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -1183,6 +1190,8 @@ def build_skills_system_prompt(
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if allowed_skill_names and frontmatter_name not in allowed_skill_names and skill_name not in allowed_skill_names:
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),
@@ -1379,6 +1388,86 @@ def load_soul_md() -> Optional[str]:
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
         return None
+
+
+def _resolve_communication_style_path(raw: object, hermes_home: Path) -> Optional[Path]:
+    if raw is None:
+        return None
+    style_name = ""
+    if isinstance(raw, str):
+        value = raw.strip()
+    elif isinstance(raw, dict):
+        style_name = str(raw.get("style") or raw.get("name") or raw.get("id") or "").strip()
+        value = str(
+            raw.get("file")
+            or raw.get("path")
+            or raw.get("ref")
+            or raw.get("href")
+            or ""
+        ).strip()
+    else:
+        return None
+    if style_name:
+        try:
+            from hermes_cli.profiles import _get_default_hermes_home
+
+            return _get_default_hermes_home() / "communication-styles" / f"{style_name}.md"
+        except Exception:
+            return Path.home() / ".hermes" / "communication-styles" / f"{style_name}.md"
+    if not value:
+        return None
+    if "/" not in value and "\\" not in value and not value.endswith(".md"):
+        try:
+            from hermes_cli.profiles import _get_default_hermes_home
+
+            return _get_default_hermes_home() / "communication-styles" / f"{value}.md"
+        except Exception:
+            return Path.home() / ".hermes" / "communication-styles" / f"{value}.md"
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = hermes_home / path
+    return path
+
+
+def load_communication_style_md() -> Optional[str]:
+    """Load the profile's referenced communication style file.
+
+    ``communication_style`` in config.yaml stores only a reference, for example:
+
+        communication_style:
+          file: /home/hermes/.hermes/communication-styles/default.md
+
+    Profiles can point at the same shared file or swap the reference to a
+    profile-specific style without duplicating the style text into SOUL.md.
+    """
+    hermes_home = get_hermes_home()
+    config_path = hermes_home / "config.yaml"
+    if not config_path.exists():
+        return None
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        logger.debug("Could not read communication style config from %s: %s", config_path, e)
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    style_path = _resolve_communication_style_path(data.get("communication_style"), hermes_home)
+    if style_path is None:
+        return None
+    try:
+        content = style_path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.debug("Could not read communication style file %s: %s", style_path, e)
+        return None
+    if not content:
+        return None
+    content = _scan_context_content(content, style_path.name)
+    content = _truncate_content(content, style_path.name)
+    return f"# Communication Style\n\n{content}"
 
 
 def _load_hermes_md(cwd_path: Path) -> str:

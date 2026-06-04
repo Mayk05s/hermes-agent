@@ -1000,6 +1000,17 @@ def load_gateway_config() -> GatewayConfig:
                         "disable_topic_auto_rename",
                         telegram_cfg["disable_topic_auto_rename"],
                     )
+                if "show_transcription" in telegram_cfg:
+                    _tg_plat = platforms_data.setdefault(Platform.TELEGRAM.value, {})
+                    _tg_extra = _tg_plat.setdefault("extra", {})
+                    _tg_extra.setdefault(
+                        "show_transcription",
+                        telegram_cfg["show_transcription"],
+                    )
+                    if not os.getenv("TELEGRAM_SHOW_TRANSCRIPTION"):
+                        os.environ["TELEGRAM_SHOW_TRANSCRIPTION"] = str(
+                            telegram_cfg["show_transcription"]
+                        ).lower()
                 # Prefer telegram.require_mention; fall back to the top-level shorthand.
                 _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
                 if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
@@ -1013,10 +1024,21 @@ def load_gateway_config() -> GatewayConfig:
                 if "observe_unmentioned_group_messages" in telegram_cfg and not os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
                     os.environ["TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] = str(telegram_cfg["observe_unmentioned_group_messages"]).lower()
                 frc = telegram_cfg.get("free_response_chats")
-                if frc is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
+                if frc is not None:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
-                    os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                    env_frc = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
+                    if env_frc:
+                        merged_frc = []
+                        seen_frc = set()
+                        for part in f"{env_frc},{frc}".split(","):
+                            value = part.strip()
+                            if value and value not in seen_frc:
+                                merged_frc.append(value)
+                                seen_frc.add(value)
+                        os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = ",".join(merged_frc)
+                    else:
+                        os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
                 # allowed_chats: if set, bot ONLY responds in these group chats (whitelist)
                 ac = telegram_cfg.get("allowed_chats")
                 if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):
@@ -1058,11 +1080,22 @@ def load_gateway_config() -> GatewayConfig:
                         group_allowed_users = ",".join(str(v) for v in group_allowed_users)
                     os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
                 group_allowed_chats = telegram_cfg.get("group_allowed_chats")
-                if group_allowed_chats is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS"):
+                if group_allowed_chats is not None:
                     if isinstance(group_allowed_chats, list):
                         group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
-                    os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
-                for _telegram_extra_key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages"):
+                    env_group_allowed_chats = os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "")
+                    if env_group_allowed_chats:
+                        merged_group_allowed_chats = []
+                        seen_group_allowed_chats = set()
+                        for part in f"{env_group_allowed_chats},{group_allowed_chats}".split(","):
+                            value = part.strip()
+                            if value and value not in seen_group_allowed_chats:
+                                merged_group_allowed_chats.append(value)
+                                seen_group_allowed_chats.add(value)
+                        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = ",".join(merged_group_allowed_chats)
+                    else:
+                        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
+                for _telegram_extra_key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "show_transcription"):
                     if _telegram_extra_key in telegram_cfg:
                         plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
                         if not isinstance(plat_data, dict):

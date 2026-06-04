@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Brain,
   ChevronDown,
   Cpu,
   DollarSign,
   Eye,
+  KeyRound,
   RefreshCw,
   Settings2,
   Star,
@@ -678,6 +680,13 @@ function ModelSettingsPanel({
           <span className="max-w-full min-w-0 text-xs text-text-secondary [overflow-wrap:anywhere]">
             applies to new sessions
           </span>
+          <Link
+            to="/env#section-providers"
+            className="ml-auto inline-flex shrink-0 items-center gap-1 border border-border/60 px-2 py-1 text-xs text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
+          >
+            <KeyRound className="h-3 w-3" />
+            Available providers
+          </Link>
         </div>
       </CardHeader>
 

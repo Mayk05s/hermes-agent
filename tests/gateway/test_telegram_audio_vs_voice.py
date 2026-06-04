@@ -30,6 +30,7 @@ def _make_runner(stt_enabled: bool = True) -> "GatewayRunner":  # type: ignore[n
     runner._model = "test-model"
     runner._base_url = ""
     runner._has_setup_skill = lambda: False
+    runner._gateway_chat_settings_raw = lambda: {}
     return runner
 
 
@@ -106,8 +107,8 @@ async def test_voice_message_still_transcribed():
 
 
 @pytest.mark.asyncio
-async def test_telegram_voice_rule_transcript_only_suppresses_agent_and_preserves_thread():
-    """Matching per-chat voice rules can transcribe/send transcript without invoking AI."""
+async def test_telegram_voice_rule_transcript_only_posts_plain_text_and_preserves_thread():
+    """Matching per-chat voice rules can send the transcript without a label."""
     runner = _make_runner(stt_enabled=True)
     runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
         enabled=True,
@@ -141,7 +142,49 @@ async def test_telegram_voice_rule_transcript_only_suppresses_agent_and_preserve
     assert result is None
     adapter.send.assert_awaited_once_with(
         "-1003966683704",
-        "🎙 Транскрипция: Сегодня обсуждали билеты",
+        "Сегодня обсуждали билеты",
+        reply_to=None,
+        metadata={"thread_id": "359"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_rule_can_show_transcript_bubble_when_opted_in():
+    """telegram.show_transcription-style opt-in echoes the transcript to the topic."""
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_transcription_rules": [
+                {
+                    "chat_id": -1003966683704,
+                    "thread_id": 359,
+                    "enabled": True,
+                    "show_transcription": True,
+                    "trigger_keywords": ["tripioo", "напомни"],
+                    "on_keyword_match": "run_ai",
+                    "on_no_match": "transcript_only",
+                }
+            ]
+        },
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-1003966683704", chat_type="group", thread_id="359")
+    source = event.source
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "Сегодня обсуждали билеты", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert result is None
+    adapter.send.assert_awaited_once_with(
+        "-1003966683704",
+        "Сегодня обсуждали билеты",
         reply_to=None,
         metadata={"thread_id": "359"},
     )
@@ -161,6 +204,7 @@ async def test_telegram_voice_rule_keyword_runs_ai_with_decision_instruction():
                     "thread_id": "359",
                     "enabled": True,
                     "send_transcript": True,
+                    "show_transcription": True,
                     "trigger_keywords": ["TRIPIOO", "напомни"],
                     "on_keyword_match": "run_ai",
                     "on_no_match": "transcript_only",
@@ -228,7 +272,7 @@ async def test_audio_attachment_opt_in_rule_transcribes_and_posts_to_same_topic(
     mock_transcribe.assert_called_once_with("/tmp/podcast.mp3")
     adapter.send.assert_awaited_once_with(
         "-1003966683704",
-        "🎙 Транскрипция: Текст аудио",
+        "Текст аудио",
         reply_to=None,
         metadata={"thread_id": "359"},
     )

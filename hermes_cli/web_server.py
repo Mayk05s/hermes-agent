@@ -17,6 +17,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -1615,7 +1616,14 @@ def get_model_options():
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        return build_models_payload(load_picker_context(), max_models=50, pricing=True)
+        return build_models_payload(
+            load_picker_context(),
+            include_unconfigured=True,
+            picker_hints=True,
+            canonical_order=True,
+            max_models=50,
+            pricing=True,
+        )
     except Exception:
         _log.exception("GET /api/model/options failed")
         raise HTTPException(status_code=500, detail="Failed to list model options")
@@ -4603,7 +4611,12 @@ _ACTION_LOG_FILES.setdefault("mcp-install", "action-mcp-install.log")
 
 class PairingApprove(BaseModel):
     platform: str
-    code: str
+    code: Optional[str] = None
+    entry_id: Optional[str] = None
+    profile: str = "default"
+    create_profile: bool = False
+    new_profile_name: str = ""
+    clone_from_default: bool = True
 
 
 class PairingRevoke(BaseModel):
@@ -4611,10 +4624,109 @@ class PairingRevoke(BaseModel):
     user_id: str
 
 
+class PairingReject(BaseModel):
+    platform: str
+    entry_id: str
+
+
 def _pairing_store():
     from gateway.pairing import PairingStore
 
     return PairingStore()
+
+
+def _pairing_route_id(platform: str, chat_id: str, thread_id: str = "") -> str:
+    import re
+
+    raw = f"pairing-{platform}-{chat_id}-{thread_id or 'chat'}"
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", raw).strip("-") or "pairing-route"
+
+
+def _ensure_pairing_profile(body: PairingApprove) -> str:
+    """Return a valid profile name, creating it when requested."""
+    from hermes_cli import profiles as profiles_mod
+
+    requested = (body.new_profile_name if body.create_profile else body.profile) or "default"
+    profile = profiles_mod.normalize_profile_name(requested)
+    profiles_mod.validate_profile_name(profile)
+    if profile == "default":
+        return profile
+
+    if profiles_mod.profile_exists(profile):
+        return profile
+
+    if not body.create_profile:
+        raise HTTPException(status_code=400, detail=f"Profile '{profile}' does not exist.")
+
+    clone = bool(body.clone_from_default)
+    path = profiles_mod.create_profile(
+        name=profile,
+        clone_from="default" if clone else None,
+        clone_config=clone,
+        no_skills=False,
+    )
+    if not clone:
+        profiles_mod.seed_profile_skills(path, quiet=True)
+    if not profiles_mod.check_alias_collision(profile):
+        profiles_mod.create_wrapper_script(profile)
+    return profile
+
+
+def _upsert_pairing_profile_route(pairing_result: Dict[str, Any], profile: str) -> Optional[Dict[str, Any]]:
+    """Map an approved chat pairing to a Hermes profile route."""
+    if (pairing_result.get("subject_type") or "user") != "chat":
+        return None
+
+    from gateway.profile_routing import normalize_profile_routes_config, profile_routes_to_dict
+
+    platform = str(pairing_result.get("platform") or "").lower().strip()
+    chat_id = str(pairing_result.get("chat_id") or "").strip()
+    thread_id = str(pairing_result.get("thread_id") or "").strip()
+    if not platform or not chat_id:
+        return None
+
+    cfg = load_config() or {}
+    routes_cfg = normalize_profile_routes_config(
+        cfg.get("profile_routes"),
+        require_profile_exists=True,
+    )
+    routes_data = profile_routes_to_dict(routes_cfg)
+    routes = list(routes_data.get("routes") or [])
+    label = (
+        str(pairing_result.get("chat_name") or "").strip()
+        or str(pairing_result.get("user_name") or "").strip()
+        or chat_id
+    )
+    next_route = {
+        "id": _pairing_route_id(platform, chat_id, thread_id),
+        "enabled": True,
+        "platform": platform,
+        "chat_id": chat_id,
+        "profile": profile,
+        "label": label,
+    }
+    if thread_id:
+        next_route["thread_id"] = thread_id
+
+    replaced = False
+    for index, route in enumerate(routes):
+        if (
+            str(route.get("platform") or "").lower().strip() == platform
+            and str(route.get("chat_id") or "").strip() == chat_id
+            and str(route.get("thread_id") or "").strip() == thread_id
+        ):
+            routes[index] = {**route, **next_route}
+            replaced = True
+            break
+    if not replaced:
+        routes.append(next_route)
+
+    cfg["profile_routes"] = {
+        "default_profile": routes_data.get("default_profile") or "default",
+        "routes": routes,
+    }
+    save_config(cfg)
+    return next_route
 
 
 @app.get("/api/pairing")
@@ -4631,20 +4743,47 @@ async def approve_pairing(body: PairingApprove):
     store = _pairing_store()
     platform = (body.platform or "").lower().strip()
     code = (body.code or "").upper().strip()
-    if not platform or not code:
-        raise HTTPException(status_code=400, detail="platform and code are required")
+    entry_id = (body.entry_id or "").strip()
+    if not platform or not (code or entry_id):
+        raise HTTPException(status_code=400, detail="platform and code or entry_id are required")
 
-    result = store.approve_code(platform, code)
+    try:
+        profile = _ensure_pairing_profile(body)
+    except (ValueError, FileExistsError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = store.approve_entry(platform, entry_id) if entry_id else store.approve_code(platform, code)
     if result:
-        return {"ok": True, "user": result}
+        route = _upsert_pairing_profile_route(result, profile)
+        return {"ok": True, "user": result, "route": route}
     if store._is_locked_out(platform):
         raise HTTPException(
             status_code=429,
             detail=f"Platform '{platform}' is locked out after too many failed approvals.",
         )
+    if entry_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pairing request '{entry_id}' not found or expired for platform '{platform}'.",
+        )
     raise HTTPException(
         status_code=404,
         detail=f"Code '{code}' not found or expired for platform '{platform}'.",
+    )
+
+
+@app.post("/api/pairing/reject")
+async def reject_pairing(body: PairingReject):
+    store = _pairing_store()
+    platform = (body.platform or "").lower().strip()
+    entry_id = (body.entry_id or "").strip()
+    if not platform or not entry_id:
+        raise HTTPException(status_code=400, detail="platform and entry_id are required")
+    if store.reject_entry(platform, entry_id):
+        return {"ok": True}
+    raise HTTPException(
+        status_code=404,
+        detail=f"Pairing request '{entry_id}' not found or expired for platform '{platform}'.",
     )
 
 
@@ -4881,6 +5020,83 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
     }
 
 
+def _credential_provider_catalog() -> List[Dict[str, Any]]:
+    """Providers the dashboard can accept as manually pasted API keys."""
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.models import CANONICAL_PROVIDERS
+
+    special_api_key_providers: Dict[str, Dict[str, str]] = {
+        "openrouter": {
+            "name": "OpenRouter",
+            "key_env": "OPENROUTER_API_KEY",
+            "base_url_env": "OPENROUTER_BASE_URL",
+        },
+    }
+
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_row(
+        *,
+        slug: str,
+        name: str,
+        key_env: str = "",
+        base_url_env: str = "",
+    ) -> None:
+        if not slug or slug in seen:
+            return
+        seen.add(slug)
+        rows.append(
+            {
+                "slug": slug,
+                "name": name or slug,
+                "auth_type": "api_key",
+                "key_env": key_env,
+                "base_url_env": base_url_env,
+                "warning": (
+                    f"paste {key_env} to activate"
+                    if key_env
+                    else "paste an API key to activate"
+                ),
+            }
+        )
+
+    for entry in CANONICAL_PROVIDERS:
+        special = special_api_key_providers.get(entry.slug)
+        if special:
+            add_row(slug=entry.slug, **special)
+            continue
+
+        cfg = PROVIDER_REGISTRY.get(entry.slug)
+        if cfg is None or cfg.auth_type != "api_key":
+            continue
+        add_row(
+            slug=entry.slug,
+            name=cfg.name or entry.label,
+            key_env=cfg.api_key_env_vars[0] if cfg.api_key_env_vars else "",
+            base_url_env=cfg.base_url_env_var or "",
+        )
+
+    # Include any API-key providers registered outside CANONICAL_PROVIDERS.
+    for slug in sorted(PROVIDER_REGISTRY):
+        cfg = PROVIDER_REGISTRY[slug]
+        if cfg.auth_type != "api_key":
+            continue
+        add_row(
+            slug=slug,
+            name=cfg.name or slug,
+            key_env=cfg.api_key_env_vars[0] if cfg.api_key_env_vars else "",
+            base_url_env=cfg.base_url_env_var or "",
+        )
+
+    return rows
+
+
+@app.get("/api/credentials/providers")
+async def list_credential_provider_catalog():
+    return {"providers": _credential_provider_catalog()}
+
+
 @app.get("/api/credentials/pool")
 async def list_credential_pool():
     from agent.credential_pool import load_pool
@@ -5008,10 +5224,26 @@ async def get_memory_status():
         path = mem_dir / fname
         files[key] = path.stat().st_size if path.exists() else 0
 
+    hermes_home = get_hermes_home()
+    profile_name = "default"
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        home_resolved = hermes_home.resolve()
+        for info in profiles_mod.list_profiles():
+            path = Path(getattr(info, "path", "")).resolve()
+            if path == home_resolved:
+                profile_name = str(getattr(info, "name", "") or "default")
+                break
+    except Exception:
+        _log.debug("Could not resolve active memory profile", exc_info=True)
+
     return {
         "active": active,
         "providers": providers,
         "builtin_files": files,
+        "profile_name": profile_name,
+        "hermes_home": str(hermes_home),
     }
 
 
@@ -5446,6 +5678,334 @@ class ProfileSoulUpdate(BaseModel):
     content: str
 
 
+class ProfileCommunicationStyleUpdate(BaseModel):
+    style: str = ""
+    file: str = ""
+
+
+class CommunicationStyleContentUpdate(BaseModel):
+    content: str
+
+
+class CommunicationStyleCreate(BaseModel):
+    style: str
+    content: str = ""
+
+
+class ProfileSkillToggle(BaseModel):
+    name: str
+    enabled: bool
+
+
+class ProfileRouteBody(BaseModel):
+    default_profile: str = "default"
+    routes: List[Dict[str, Any]] = []
+
+
+class ProfileScopeBody(BaseModel):
+    default_scope: str = "default"
+    scopes: List[Dict[str, Any]] = []
+
+
+class ProfileChatSettingsBody(BaseModel):
+    defaults: Dict[str, Any] = {}
+    settings: List[Dict[str, Any]] = []
+
+
+def _pydantic_dump(body) -> Dict[str, Any]:
+    return body.model_dump() if hasattr(body, "model_dump") else body.dict()
+
+
+def _profile_routes_response() -> Dict[str, Any]:
+    from gateway.profile_routing import normalize_profile_routes_config, profile_routes_to_dict
+
+    cfg = load_config() or {}
+    routes_cfg = normalize_profile_routes_config(
+        cfg.get("profile_routes"),
+        require_profile_exists=True,
+    )
+    return profile_routes_to_dict(routes_cfg)
+
+
+def _profile_route_clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _profile_route_row_key(platform: str, chat_id: str, thread_id: str = "") -> str:
+    return f"{platform}:{chat_id}:{thread_id or ''}"
+
+
+def _profile_route_display_label(row: Dict[str, Any]) -> str:
+    label = _profile_route_clean(row.get("label"))
+    if label:
+        return label
+    chat_name = _profile_route_clean(row.get("chat_name"))
+    chat_id = _profile_route_clean(row.get("chat_id"))
+    base = chat_name or chat_id or "Unknown chat"
+    thread_id = _profile_route_clean(row.get("thread_id"))
+    if not thread_id:
+        return base
+    topic_label = _profile_route_clean(row.get("chat_topic"))
+    return f"{base} / {topic_label or f'topic {thread_id}'}"
+
+
+def _profile_route_effective_profile(routes_cfg, platform: str, chat_id: str, thread_id: str = ""):
+    chat_match = None
+    for route in routes_cfg.routes:
+        if not route.enabled:
+            continue
+        if route.platform != platform or route.chat_id != chat_id:
+            continue
+        if route.thread_id and route.thread_id == thread_id:
+            return route.profile, "topic", route
+        if not route.thread_id:
+            chat_match = route
+
+    if chat_match:
+        return chat_match.profile, "chat", chat_match
+    return routes_cfg.default_profile or "default", "default", None
+
+
+def _profile_route_direct_route(routes_cfg, platform: str, chat_id: str, thread_id: str = ""):
+    direct = None
+    for route in routes_cfg.routes:
+        if route.platform != platform or route.chat_id != chat_id:
+            continue
+        if (route.thread_id or "") == (thread_id or ""):
+            direct = route
+    return direct
+
+
+def _profile_route_discovered_response() -> Dict[str, Any]:
+    from gateway.profile_routing import normalize_profile_routes_config
+
+    cfg = load_config() or {}
+    routes_cfg = normalize_profile_routes_config(cfg.get("profile_routes"))
+    rows: Dict[str, Dict[str, Any]] = {}
+
+    def upsert(row: Dict[str, Any]) -> None:
+        platform = _profile_route_clean(row.get("platform")).lower()
+        chat_id = _profile_route_clean(row.get("chat_id"))
+        thread_id = _profile_route_clean(row.get("thread_id"))
+        if not platform or not chat_id:
+            return
+        key = _profile_route_row_key(platform, chat_id, thread_id)
+        row = {
+            **row,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+        current = rows.get(key)
+        if not current:
+            rows[key] = row
+            return
+        for name, value in row.items():
+            if value not in (None, ""):
+                current[name] = value
+
+    sessions_file = get_hermes_home() / "sessions" / "sessions.json"
+    if sessions_file.exists():
+        try:
+            raw_sessions = json.loads(sessions_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=500, detail=f"Could not read session origins: {e}")
+        if isinstance(raw_sessions, dict):
+            for entry in raw_sessions.values():
+                if not isinstance(entry, dict):
+                    continue
+                origin = entry.get("origin")
+                if not isinstance(origin, dict):
+                    continue
+                platform = _profile_route_clean(origin.get("platform") or entry.get("platform")).lower()
+                chat_id = _profile_route_clean(origin.get("chat_id"))
+                if not platform or not chat_id:
+                    continue
+                chat_name = _profile_route_clean(origin.get("chat_name") or entry.get("display_name"))
+                base_row = {
+                    "source": "session",
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "chat_name": chat_name,
+                    "chat_type": _profile_route_clean(origin.get("chat_type") or entry.get("chat_type")),
+                    "updated_at": _profile_route_clean(entry.get("updated_at")),
+                }
+                upsert({**base_row, "thread_id": ""})
+                thread_id = _profile_route_clean(origin.get("thread_id"))
+                if thread_id:
+                    upsert({
+                        **base_row,
+                        "thread_id": thread_id,
+                        "chat_topic": _profile_route_clean(origin.get("chat_topic")),
+                    })
+
+    for route in routes_cfg.routes:
+        upsert({
+            "source": "configured",
+            "platform": route.platform,
+            "chat_id": route.chat_id,
+            "thread_id": route.thread_id,
+            "label": route.label,
+            "direct_profile": route.profile,
+            "route_id": route.id,
+            "enabled": route.enabled,
+        })
+
+    items: List[Dict[str, Any]] = []
+    for row in rows.values():
+        platform = _profile_route_clean(row.get("platform")).lower()
+        chat_id = _profile_route_clean(row.get("chat_id"))
+        thread_id = _profile_route_clean(row.get("thread_id"))
+        effective_profile, match_type, matched = _profile_route_effective_profile(
+            routes_cfg,
+            platform,
+            chat_id,
+            thread_id,
+        )
+        direct = _profile_route_direct_route(routes_cfg, platform, chat_id, thread_id)
+        item = {
+            "id": _profile_route_row_key(platform, chat_id, thread_id),
+            "source": row.get("source") or "session",
+            "label": _profile_route_display_label(row),
+            "platform": platform,
+            "chat_id": chat_id,
+            "chat_name": row.get("chat_name") or "",
+            "chat_type": row.get("chat_type") or "",
+            "thread_id": thread_id,
+            "chat_topic": row.get("chat_topic") or "",
+            "effective_profile": effective_profile,
+            "match_type": match_type,
+            "route_id": direct.id if direct else (matched.id if matched else ""),
+            "direct_profile": direct.profile if direct else "",
+            "enabled": direct.enabled if direct else True,
+            "updated_at": row.get("updated_at") or "",
+        }
+        items.append(item)
+
+    items.sort(key=lambda item: (
+        item["platform"],
+        (item.get("label") or "").lower(),
+        item["chat_id"],
+        0 if not item.get("thread_id") else 1,
+        item.get("thread_id") or "",
+    ))
+    return {"items": items}
+
+
+def _profile_chat_settings_response() -> Dict[str, Any]:
+    from gateway.chat_settings import chat_settings_to_dict, normalize_chat_settings_config
+
+    cfg = load_config() or {}
+    return chat_settings_to_dict(normalize_chat_settings_config(cfg.get("chat_settings")))
+
+
+@app.get("/api/profile-routes")
+async def get_profile_routes_endpoint():
+    try:
+        return _profile_routes_response()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/profile-routes/discovered")
+async def get_profile_route_discovered_endpoint():
+    try:
+        return _profile_route_discovered_response()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/profile-routes/chat-settings")
+async def get_profile_route_chat_settings_endpoint():
+    try:
+        return _profile_chat_settings_response()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/profile-routes/chat-settings")
+async def put_profile_route_chat_settings_endpoint(body: ProfileChatSettingsBody):
+    from gateway.chat_settings import chat_settings_to_dict, normalize_chat_settings_config
+
+    try:
+        normalized = normalize_chat_settings_config(_pydantic_dump(body))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    payload = chat_settings_to_dict(normalized)
+    cfg = load_config() or {}
+    cfg["chat_settings"] = payload
+    save_config(cfg)
+    return {"ok": True, **payload}
+
+
+@app.put("/api/profile-routes")
+async def put_profile_routes_endpoint(body: ProfileRouteBody):
+    from gateway.profile_routing import normalize_profile_routes_config, profile_routes_to_dict
+
+    try:
+        normalized = normalize_profile_routes_config(
+            _pydantic_dump(body),
+            require_profile_exists=True,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    cfg = load_config() or {}
+    cfg["profile_routes"] = profile_routes_to_dict(normalized)
+    save_config(cfg)
+    return {"ok": True, **cfg["profile_routes"]}
+
+
+def _profile_scopes_response(name: str) -> Dict[str, Any]:
+    from gateway.profile_scopes import normalize_profile_scopes_config, profile_scopes_to_dict
+
+    profile_dir = _resolve_profile_dir(name)
+    config_path = profile_dir / "config.yaml"
+    data: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid profile config.yaml: {e}")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Could not read profile config.yaml: {e}")
+    scopes_cfg = normalize_profile_scopes_config(data.get("profile_scopes"))
+    return profile_scopes_to_dict(scopes_cfg)
+
+
+@app.get("/api/profiles/{name}/profile-scopes")
+async def get_profile_scopes_endpoint(name: str):
+    try:
+        return _profile_scopes_response(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/profiles/{name}/profile-scopes")
+async def put_profile_scopes_endpoint(name: str, body: ProfileScopeBody):
+    from gateway.profile_scopes import normalize_profile_scopes_config, profile_scopes_to_dict
+
+    profile_dir = _resolve_profile_dir(name)
+    config_path = profile_dir / "config.yaml"
+    try:
+        normalized = normalize_profile_scopes_config(_pydantic_dump(body))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+        data["profile_scopes"] = profile_scopes_to_dict(normalized)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid profile config.yaml: {e}")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not write profile config.yaml: {e}")
+    return {"ok": True, **data["profile_scopes"]}
+
+
 def _profile_attr(info, name: str, default: Any = None) -> Any:
     try:
         return getattr(info, name)
@@ -5676,6 +6236,360 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
     return {"ok": True}
+
+
+def _profile_config_path(name: str) -> Path:
+    return _resolve_profile_dir(name) / "config.yaml"
+
+
+_COMMUNICATION_STYLE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _communication_styles_root() -> Path:
+    try:
+        from hermes_cli import profiles as profiles_mod
+        return profiles_mod._get_default_hermes_home() / "communication-styles"
+    except Exception:
+        return get_hermes_home() / "communication-styles"
+
+
+def _communication_style_path(style: str) -> Path:
+    return _communication_styles_root() / f"{style}.md"
+
+
+def _communication_style_label(path: Path, fallback: str) -> str:
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                return stripped.lstrip("#").strip() or fallback
+            if stripped:
+                break
+    except OSError:
+        pass
+    return fallback.replace("-", " ").replace("_", " ").title()
+
+
+def _communication_style_options() -> List[Dict[str, Any]]:
+    root = _communication_styles_root()
+    options: List[Dict[str, Any]] = []
+    if root.is_dir():
+        for path in sorted(root.glob("*.md")):
+            style = path.stem
+            if not _COMMUNICATION_STYLE_ID_RE.match(style):
+                continue
+            options.append({
+                "style": style,
+                "label": _communication_style_label(path, style),
+                "file": str(path),
+                "exists": path.exists(),
+            })
+    options.sort(key=lambda item: (item["style"] != "default", item["label"].lower()))
+    return options
+
+
+def _communication_style_from_config(data: Dict[str, Any]) -> Tuple[str, str]:
+    raw = data.get("communication_style")
+    if isinstance(raw, str):
+        value = raw.strip()
+        if value and "/" not in value and "\\" not in value and not value.endswith(".md"):
+            return value, ""
+        return "", value
+    if isinstance(raw, dict):
+        style = str(raw.get("style") or raw.get("name") or raw.get("id") or "").strip()
+        file_ref = str(raw.get("file") or raw.get("path") or raw.get("ref") or "").strip()
+        return style, file_ref
+    return "", ""
+
+
+def _communication_style_file_ref(profile_dir: Path, style: str, file_ref: str) -> str:
+    if style:
+        return str(_communication_style_path(style))
+    return file_ref
+
+
+def _communication_style_preview(profile_dir: Path, file_ref: str) -> Dict[str, Any]:
+    if not file_ref:
+        return {"exists": False, "content": ""}
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(file_ref))
+        path = Path(expanded)
+        if not path.is_absolute():
+            path = profile_dir / path
+        if not path.exists():
+            return {"exists": False, "content": ""}
+        return {
+            "exists": True,
+            "content": path.read_text(encoding="utf-8"),
+        }
+    except Exception:
+        return {"exists": False, "content": ""}
+
+
+def _communication_style_response(profile_dir: Path, data: Dict[str, Any]) -> Dict[str, Any]:
+    style, file_ref = _communication_style_from_config(data)
+    options = _communication_style_options()
+    known_by_file = {str(Path(item["file"]).resolve()): item for item in options}
+    if not style and file_ref:
+        try:
+            expanded = os.path.expandvars(os.path.expanduser(file_ref))
+            path = Path(expanded)
+            if not path.is_absolute():
+                path = profile_dir / path
+            matched = known_by_file.get(str(path.resolve()))
+            if matched:
+                style = matched["style"]
+        except Exception:
+            pass
+    file_value = _communication_style_file_ref(profile_dir, style, file_ref)
+    preview = _communication_style_preview(profile_dir, file_value)
+    label = style
+    for item in options:
+        if item["style"] == style:
+            label = item["label"]
+            break
+    if not label and file_ref:
+        label = Path(file_ref).stem or file_ref
+    return {"style": style, "label": label, "file": file_value, **preview}
+
+
+def _validate_communication_style(style: str) -> Path:
+    style = str(style or "").strip()
+    if not _COMMUNICATION_STYLE_ID_RE.match(style):
+        raise HTTPException(status_code=400, detail="Invalid communication style name")
+    path = _communication_style_path(style)
+    try:
+        path.resolve().relative_to(_communication_styles_root().resolve())
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid communication style path")
+    return path
+
+
+@app.get("/api/communication-styles")
+async def list_communication_styles_endpoint():
+    return {"styles": _communication_style_options()}
+
+
+@app.post("/api/communication-styles")
+async def create_communication_style_endpoint(body: CommunicationStyleCreate):
+    style = str(body.style or "").strip()
+    path = _validate_communication_style(style)
+    if path.exists():
+        raise HTTPException(status_code=409, detail=f"Communication style '{style}' already exists")
+    content = body.content
+    if not content.strip():
+        title = style.replace("-", " ").replace("_", " ").title()
+        content = f"# {title}\n\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except OSError as e:
+        _log.exception("POST /api/communication-styles failed")
+        raise HTTPException(status_code=500, detail=f"Could not create communication style: {e}")
+    return {
+        "ok": True,
+        "style": style,
+        "label": _communication_style_label(path, style),
+        "file": str(path),
+        "exists": True,
+        "content": content,
+    }
+
+
+@app.get("/api/communication-styles/{style}")
+async def get_communication_style_endpoint(style: str):
+    path = _validate_communication_style(style)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Communication style '{style}' does not exist")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not read communication style: {e}")
+    return {
+        "style": style,
+        "label": _communication_style_label(path, style),
+        "file": str(path),
+        "exists": True,
+        "content": content,
+    }
+
+
+@app.put("/api/communication-styles/{style}")
+async def update_communication_style_endpoint(style: str, body: CommunicationStyleContentUpdate):
+    path = _validate_communication_style(style)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Communication style '{style}' does not exist")
+    try:
+        path.write_text(body.content, encoding="utf-8")
+    except OSError as e:
+        _log.exception("PUT /api/communication-styles/%s failed", style)
+        raise HTTPException(status_code=500, detail=f"Could not write communication style: {e}")
+    return {
+        "ok": True,
+        "style": style,
+        "label": _communication_style_label(path, style),
+        "file": str(path),
+        "exists": True,
+        "content": body.content,
+    }
+
+
+@app.get("/api/profiles/{name}/communication-style")
+async def get_profile_communication_style(name: str):
+    profile_dir = _resolve_profile_dir(name)
+    config_path = profile_dir / "config.yaml"
+    data: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            data = loaded if isinstance(loaded, dict) else {}
+        except yaml.YAMLError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid profile config.yaml: {e}")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Could not read profile config.yaml: {e}")
+    return _communication_style_response(profile_dir, data)
+
+
+@app.put("/api/profiles/{name}/communication-style")
+async def update_profile_communication_style(name: str, body: ProfileCommunicationStyleUpdate):
+    config_path = _profile_config_path(name)
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+        style = str(body.style or "").strip()
+        file_ref = str(body.file or "").strip()
+        if style:
+            if not _COMMUNICATION_STYLE_ID_RE.match(style):
+                raise HTTPException(status_code=400, detail="Invalid communication style name")
+            known_styles = {item["style"] for item in _communication_style_options()}
+            if style not in known_styles:
+                raise HTTPException(status_code=400, detail=f"Communication style '{style}' does not exist")
+            data["communication_style"] = {"style": style}
+        elif file_ref:
+            data["communication_style"] = {"file": file_ref}
+        else:
+            data.pop("communication_style", None)
+        config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid profile config.yaml: {e}")
+    except OSError as e:
+        _log.exception("PUT /api/profiles/%s/communication-style failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not write profile config.yaml: {e}")
+    return {"ok": True, **_communication_style_response(config_path.parent, data)}
+
+
+def _profile_skill_category(skill_md: Path, skills_root: Path) -> str:
+    try:
+        rel = skill_md.relative_to(skills_root)
+    except ValueError:
+        return "uncategorized"
+    if len(rel.parts) >= 3:
+        return rel.parts[0] or "uncategorized"
+    return "uncategorized"
+
+
+def _profile_skill_entries(profile_dir: Path, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    from agent.skill_utils import (
+        EXCLUDED_SKILL_DIRS,
+        iter_skill_index_files,
+        parse_frontmatter,
+        skill_matches_platform,
+    )
+    from hermes_cli.skills_config import get_disabled_skills
+
+    skills_root = profile_dir / "skills"
+    if not skills_root.is_dir():
+        return []
+
+    disabled = get_disabled_skills(config)
+    entries: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for skill_md in iter_skill_index_files(skills_root, "SKILL.md"):
+        if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+            continue
+        try:
+            content = skill_md.read_text(encoding="utf-8")[:4000]
+            frontmatter, body = parse_frontmatter(content)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if not skill_matches_platform(frontmatter):
+            continue
+
+        name = str(frontmatter.get("name") or skill_md.parent.name).strip()[:64]
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        description = str(frontmatter.get("description") or "").strip()
+        if not description:
+            for line in body.strip().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    description = line
+                    break
+        if len(description) > 1024:
+            description = description[:1021] + "..."
+
+        entries.append({
+            "name": name,
+            "description": description,
+            "category": _profile_skill_category(skill_md, skills_root),
+            "enabled": name not in disabled,
+        })
+
+    return sorted(entries, key=lambda item: (item.get("category") or "", item["name"]))
+
+
+def _read_profile_config_for_edit(name: str) -> Tuple[Path, Dict[str, Any]]:
+    config_path = _profile_config_path(name)
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid profile config.yaml: {e}")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not read profile config.yaml: {e}")
+    if not isinstance(data, dict):
+        data = {}
+    return config_path, data
+
+
+@app.get("/api/profiles/{name}/skills")
+async def get_profile_skills_endpoint(name: str):
+    config_path, data = _read_profile_config_for_edit(name)
+    return {
+        "profile": name,
+        "skills": _profile_skill_entries(config_path.parent, data),
+    }
+
+
+@app.put("/api/profiles/{name}/skills/toggle")
+async def toggle_profile_skill_endpoint(name: str, body: ProfileSkillToggle):
+    from hermes_cli.skills_config import get_disabled_skills
+
+    config_path, data = _read_profile_config_for_edit(name)
+    known = {entry["name"] for entry in _profile_skill_entries(config_path.parent, data)}
+    if body.name not in known:
+        raise HTTPException(status_code=404, detail=f"Skill '{body.name}' does not exist in profile '{name}'")
+
+    disabled = get_disabled_skills(data)
+    if body.enabled:
+        disabled.discard(body.name)
+    else:
+        disabled.add(body.name)
+
+    skills_cfg = data.setdefault("skills", {})
+    if not isinstance(skills_cfg, dict):
+        skills_cfg = {}
+        data["skills"] = skills_cfg
+    skills_cfg["disabled"] = sorted(disabled)
+
+    try:
+        config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    except OSError as e:
+        _log.exception("PUT /api/profiles/%s/skills/toggle failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not write profile config.yaml: {e}")
+    return {"ok": True, "name": body.name, "enabled": body.enabled}
 
 
 # ---------------------------------------------------------------------------
@@ -6631,9 +7545,21 @@ def mount_spa(application: FastAPI):
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        theme_bootstrap = _dashboard_theme_bootstrap_payload()
+        theme_bootstrap_js = json.dumps(theme_bootstrap, ensure_ascii=False).replace("</", "<\\/")
+        theme_style = _dashboard_theme_bootstrap_style(theme_bootstrap.get("definition"))
+        theme_script = (
+            f"window.__HERMES_DASHBOARD_THEME_BOOTSTRAP__={theme_bootstrap_js};"
+            f"try{{"
+            f"var __hermesTheme=window.__HERMES_DASHBOARD_THEME_BOOTSTRAP__;"
+            f"if(__hermesTheme&&__hermesTheme.active)"
+            f"localStorage.setItem('hermes-dashboard-theme',__hermesTheme.active);"
+            f"}}catch(e){{}}"
+        )
         if gated:
             bootstrap_script = (
-                f"<script>"
+                f"{theme_style}<script>"
+                f"{theme_script}"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
@@ -6641,7 +7567,8 @@ def mount_spa(application: FastAPI):
             )
         else:
             bootstrap_script = (
-                f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
+                f'{theme_style}<script>{theme_script}'
+                f'window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
@@ -6773,6 +7700,28 @@ _THEME_OVERRIDE_KEYS = {
     "muted", "mutedForeground", "accent", "accentForeground",
     "destructive", "destructiveForeground", "success", "warning",
     "border", "input", "ring",
+}
+
+_THEME_OVERRIDE_KEY_TO_CSS_VAR = {
+    "card": "--color-card",
+    "cardForeground": "--color-card-foreground",
+    "popover": "--color-popover",
+    "popoverForeground": "--color-popover-foreground",
+    "primary": "--color-primary",
+    "primaryForeground": "--color-primary-foreground",
+    "secondary": "--color-secondary",
+    "secondaryForeground": "--color-secondary-foreground",
+    "muted": "--color-muted",
+    "mutedForeground": "--color-muted-foreground",
+    "accent": "--color-accent",
+    "accentForeground": "--color-accent-foreground",
+    "destructive": "--color-destructive",
+    "destructiveForeground": "--color-destructive-foreground",
+    "success": "--color-success",
+    "warning": "--color-warning",
+    "border": "--color-border",
+    "input": "--color-input",
+    "ring": "--color-ring",
 }
 
 # Well-known named asset slots themes can populate.  Any other keys under
@@ -6941,6 +7890,9 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
         result["customCSS"] = custom_css
     if component_styles:
         result["componentStyles"] = component_styles
+    terminal_background = data.get("terminalBackground")
+    if isinstance(terminal_background, str) and terminal_background.strip():
+        result["terminalBackground"] = terminal_background
     return result
 
 
@@ -6964,6 +7916,143 @@ def _discover_user_themes() -> list:
         if normalised is not None:
             result.append(normalised)
     return result
+
+
+def _dashboard_theme_bootstrap_payload() -> Dict[str, Any]:
+    """Return the active dashboard theme for injection into index.html."""
+    try:
+        config = load_config()
+        active = cfg_get(config, "dashboard", "theme", default="default")
+        payload: Dict[str, Any] = {"active": active}
+        for theme in _discover_user_themes():
+            if theme.get("name") == active:
+                payload["definition"] = theme
+                break
+        return payload
+    except Exception:
+        _log.debug("dashboard theme bootstrap failed", exc_info=True)
+        return {"active": "default"}
+
+
+def _dashboard_theme_bootstrap_style(definition: Any) -> str:
+    """Build an inline style block so custom themes paint before React mounts."""
+    if not isinstance(definition, dict):
+        return ""
+
+    def _layer_vars(name: str, layer: Any) -> List[Tuple[str, str]]:
+        if not isinstance(layer, dict):
+            return []
+        hex_value = layer.get("hex")
+        if not isinstance(hex_value, str) or not hex_value.strip():
+            return []
+        try:
+            alpha = float(layer.get("alpha", 1.0))
+        except (TypeError, ValueError):
+            alpha = 1.0
+        alpha = max(0.0, min(1.0, alpha))
+        pct = round(alpha * 100)
+        return [
+            (f"--{name}", f"color-mix(in srgb, {hex_value} {pct}%, transparent)"),
+            (f"--{name}-base", hex_value),
+            (f"--{name}-alpha", str(alpha)),
+        ]
+
+    def _to_kebab(value: str) -> str:
+        return "".join(f"-{ch.lower()}" if ch.isupper() else ch for ch in value)
+
+    def _asset_value(raw: str) -> str:
+        trimmed = raw.strip()
+        lower = trimmed.lower()
+        if (
+            lower.startswith("url(")
+            or lower.startswith("linear-gradient")
+            or lower.startswith("radial-gradient")
+            or lower.startswith("conic-gradient")
+            or lower == "none"
+        ):
+            return trimmed
+        return f"url({json.dumps(trimmed)})"
+
+    declarations: List[Tuple[str, str]] = []
+
+    palette = definition.get("palette") if isinstance(definition.get("palette"), dict) else {}
+    declarations.extend(_layer_vars("background", palette.get("background")))
+    declarations.extend(_layer_vars("midground", palette.get("midground")))
+    declarations.extend(_layer_vars("foreground", palette.get("foreground")))
+    warm_glow = palette.get("warmGlow")
+    if isinstance(warm_glow, str) and warm_glow.strip():
+        declarations.append(("--warm-glow", warm_glow))
+    noise_opacity = palette.get("noiseOpacity")
+    if noise_opacity is not None:
+        declarations.append(("--noise-opacity-mul", str(noise_opacity)))
+
+    typography = definition.get("typography") if isinstance(definition.get("typography"), dict) else {}
+    for key, css_var in (
+        ("fontSans", "--theme-font-sans"),
+        ("fontMono", "--theme-font-mono"),
+        ("fontDisplay", "--theme-font-display"),
+        ("baseSize", "--theme-base-size"),
+        ("lineHeight", "--theme-line-height"),
+        ("letterSpacing", "--theme-letter-spacing"),
+    ):
+        value = typography.get(key)
+        if isinstance(value, str) and value.strip():
+            declarations.append((css_var, value))
+
+    layout = definition.get("layout") if isinstance(definition.get("layout"), dict) else {}
+    radius = layout.get("radius")
+    if isinstance(radius, str) and radius.strip():
+        declarations.extend([("--radius", radius), ("--theme-radius", radius)])
+    density = layout.get("density")
+    density_mul = {"compact": "0.85", "comfortable": "1", "spacious": "1.2"}.get(density)
+    if density_mul:
+        declarations.extend([("--theme-spacing-mul", density_mul), ("--theme-density", str(density))])
+
+    overrides = definition.get("colorOverrides")
+    if isinstance(overrides, dict):
+        for key, css_var in _THEME_OVERRIDE_KEY_TO_CSS_VAR.items():
+            value = overrides.get(key)
+            if isinstance(value, str) and value.strip():
+                declarations.append((css_var, value))
+
+    assets = definition.get("assets")
+    if isinstance(assets, dict):
+        for key in _THEME_NAMED_ASSET_KEYS:
+            value = assets.get(key)
+            if isinstance(value, str) and value.strip():
+                declarations.append((f"--theme-asset-{key}", _asset_value(value)))
+                declarations.append((f"--theme-asset-{key}-raw", value))
+
+    component_styles = definition.get("componentStyles")
+    if isinstance(component_styles, dict):
+        for bucket in _THEME_COMPONENT_BUCKETS:
+            props = component_styles.get(bucket)
+            if not isinstance(props, dict):
+                continue
+            for prop, value in props.items():
+                if (
+                    isinstance(prop, str)
+                    and prop.replace("-", "").replace("_", "").isalnum()
+                    and isinstance(value, (str, int, float))
+                    and str(value).strip()
+                ):
+                    declarations.append((f"--component-{bucket}-{_to_kebab(prop)}", str(value)))
+
+    layout_variant = definition.get("layoutVariant")
+    if isinstance(layout_variant, str) and layout_variant.strip():
+        declarations.append(("--theme-layout-variant", layout_variant))
+    terminal_background = definition.get("terminalBackground")
+    if isinstance(terminal_background, str) and terminal_background.strip():
+        declarations.append(("--theme-terminal-background", terminal_background))
+
+    if not declarations and not definition.get("customCSS"):
+        return ""
+    root_css = ":root{" + "".join(f"{name}:{value};" for name, value in declarations) + "}"
+    custom_css = definition.get("customCSS")
+    if isinstance(custom_css, str) and custom_css.strip():
+        root_css += "\n" + custom_css
+    root_css = root_css.replace("</style", "<\\/style")
+    return f'<style id="hermes-theme-bootstrap">{root_css}</style>'
 
 
 @app.get("/api/dashboard/themes")

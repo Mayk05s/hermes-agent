@@ -65,6 +65,9 @@ _SESSION_ALLOWED_SKILLS: ContextVar = ContextVar("HERMES_SESSION_ALLOWED_SKILLS"
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+_SESSION_PROFILE_NAME: ContextVar = ContextVar("HERMES_SESSION_PROFILE_NAME", default=_UNSET)
+_SESSION_SCOPE_NAME: ContextVar = ContextVar("HERMES_SESSION_SCOPE_NAME", default=_UNSET)
+_SESSION_MEMORY_SCOPE: ContextVar = ContextVar("HERMES_SESSION_MEMORY_SCOPE", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -83,6 +86,9 @@ _VAR_MAP = {
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_ALLOWED_SKILLS": _SESSION_ALLOWED_SKILLS,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
+    "HERMES_SESSION_PROFILE_NAME": _SESSION_PROFILE_NAME,
+    "HERMES_SESSION_SCOPE_NAME": _SESSION_SCOPE_NAME,
+    "HERMES_SESSION_MEMORY_SCOPE": _SESSION_MEMORY_SCOPE,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -114,6 +120,9 @@ def set_session_vars(
     session_key: str = "",
     message_id: str = "",
     allowed_skills: str = "",
+    profile_name: str = "",
+    scope_name: str = "",
+    memory_scope: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -133,6 +142,9 @@ def set_session_vars(
         _SESSION_KEY.set(session_key),
         _SESSION_ALLOWED_SKILLS.set(allowed_skills),
         _SESSION_MESSAGE_ID.set(message_id),
+        _SESSION_PROFILE_NAME.set(profile_name),
+        _SESSION_SCOPE_NAME.set(scope_name),
+        _SESSION_MEMORY_SCOPE.set(memory_scope),
     ]
     return tokens
 
@@ -158,6 +170,9 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_KEY,
         _SESSION_ALLOWED_SKILLS,
         _SESSION_MESSAGE_ID,
+        _SESSION_PROFILE_NAME,
+        _SESSION_SCOPE_NAME,
+        _SESSION_MEMORY_SCOPE,
     ):
         var.set("")
 

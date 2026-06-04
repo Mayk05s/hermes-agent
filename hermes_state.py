@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
+    system_prompt_signature TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
@@ -917,6 +918,7 @@ class SessionDB:
         model: str = None,
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
+        system_prompt_signature: str = None,
         user_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
@@ -925,8 +927,8 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, cwd, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, system_prompt_signature, parent_session_id, cwd, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -934,6 +936,7 @@ class SessionDB:
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
+                    system_prompt_signature,
                     parent_session_id,
                     cwd,
                     time.time(),
@@ -1108,12 +1111,18 @@ class SessionDB:
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
 
 
-    def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+    def update_system_prompt(
+        self,
+        session_id: str,
+        system_prompt: str,
+        *,
+        signature: str = None,
+    ) -> None:
         """Store the full assembled system prompt snapshot."""
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET system_prompt = ? WHERE id = ?",
-                (system_prompt, session_id),
+                "UPDATE sessions SET system_prompt = ?, system_prompt_signature = ? WHERE id = ?",
+                (system_prompt, signature, session_id),
             )
         self._execute_write(_do)
 

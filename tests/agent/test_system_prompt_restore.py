@@ -31,6 +31,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.model = "test-model"
     agent.platform = "cli"
     agent._session_db = session_db
+    agent._system_prompt_signature = None
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -66,6 +67,65 @@ class TestStoredPromptReuse:
 
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
+
+    def test_matching_signature_reuses_stored_prompt(self):
+        """Stored prompt is reusable when its dependency signature matches."""
+        stored = "Stored prompt with current profile/style signature"
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": stored,
+            "system_prompt_signature": "sig-current",
+        }
+        agent = _make_agent(session_db=db)
+        agent._system_prompt_signature = "sig-current"
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+
+    def test_missing_signature_rebuilds_when_signature_required(self, caplog):
+        """Legacy stored prompts without a signature are rebuilt once."""
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "Stored prompt before profile styles existed",
+            "system_prompt_signature": None,
+        }
+        agent = _make_agent(session_db=db)
+        agent._system_prompt_signature = "sig-current"
+
+        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        agent._build_system_prompt.assert_called_once()
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id,
+            "BUILT_PROMPT",
+            signature="sig-current",
+        )
+
+    def test_mismatched_signature_rebuilds_stored_prompt(self, caplog):
+        """Profile/style changes must invalidate the persisted system prompt."""
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "Stored prompt for old style",
+            "system_prompt_signature": "sig-old",
+        }
+        agent = _make_agent(session_db=db)
+        agent._system_prompt_signature = "sig-new"
+
+        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        agent._build_system_prompt.assert_called_once()
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id,
+            "BUILT_PROMPT",
+            signature="sig-new",
+        )
 
 
 # ---------------------------------------------------------------------------

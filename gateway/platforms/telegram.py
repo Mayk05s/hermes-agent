@@ -580,6 +580,13 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to = metadata.get("telegram_reply_to_message_id")
         return int(reply_to) if reply_to is not None else None
 
+    def _metadata_reply_to_mode(self, metadata: Optional[Dict[str, Any]]) -> str:
+        if metadata:
+            mode = str(metadata.get("telegram_reply_to_mode") or "").strip().lower()
+            if mode in {"off", "first", "all"}:
+                return mode
+        return self._reply_to_mode
+
     @staticmethod
     def _looks_like_private_chat_id(chat_id: str) -> bool:
         try:
@@ -1820,7 +1827,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._bot = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
-    def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
+    def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int, *, reply_to_mode: Optional[str] = None) -> bool:
         """Determine if this message chunk should thread to the original message.
 
         Args:
@@ -1832,7 +1839,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not reply_to:
             return False
-        mode = self._reply_to_mode
+        mode = reply_to_mode or self._reply_to_mode
         if mode == "off":
             return False
         elif mode == "all":
@@ -1876,6 +1883,7 @@ class TelegramAdapter(BasePlatformAdapter):
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
+            reply_to_mode = self._metadata_reply_to_mode(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
             
@@ -1905,7 +1913,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # didn't ask for the anchor to be dropped.
                 dm_topic_reply_to_off = (
                     private_dm_topic_send
-                    and self._reply_to_mode == "off"
+                    and reply_to_mode == "off"
                     and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
                 )
                 reply_to_source = reply_to or (
@@ -1914,10 +1922,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if private_dm_topic_send:
                     should_thread = (
                         reply_to_source is not None
-                        and self._reply_to_mode != "off"
+                        and reply_to_mode != "off"
                     )
                 else:
-                    should_thread = self._should_thread_reply(reply_to_source, i)
+                    should_thread = self._should_thread_reply(reply_to_source, i, reply_to_mode=reply_to_mode)
                 reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
                 if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
                     return SendResult(
@@ -1930,7 +1938,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_id,
                     metadata,
                     reply_to_message_id=reply_to_id,
-                    reply_to_mode=self._reply_to_mode,
+                    reply_to_mode=reply_to_mode,
                 )
                 if used_thread_fallback and thread_kwargs.get("message_thread_id") is not None:
                     thread_kwargs = dict(thread_kwargs)
@@ -2031,7 +2039,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                         thread_id,
                                         metadata,
                                         reply_to_message_id=reply_to_id,
-                                        reply_to_mode=self._reply_to_mode,
+                                        reply_to_mode=reply_to_mode,
                                     )
                                     effective_thread_id = thread_kwargs.get("message_thread_id")
                                 continue
@@ -4516,6 +4524,36 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_response_mode_for_chat(self, chat_id: str) -> str:
+        mode = str(self._telegram_chat_setting_for_chat(chat_id, "response_mode") or "default").lower()
+        return mode if mode in {"default", "all", "mentions"} else "default"
+
+    def _telegram_chat_setting_for_chat(self, chat_id: str, key: str):
+        try:
+            from hermes_cli.config import load_config
+            from gateway.chat_settings import normalize_chat_settings_config, resolve_chat_settings
+
+            cfg = load_config() or {}
+            settings_cfg = normalize_chat_settings_config(cfg.get("chat_settings"))
+            settings = resolve_chat_settings(settings_cfg, platform="telegram", chat_id=str(chat_id))
+            return settings.get(key)
+        except Exception as exc:
+            logger.debug("[%s] Failed to resolve Telegram chat setting %s: %s", self.name, key, exc)
+            return None
+
+    def _telegram_transcribe_audio_for_chat(self, chat_id: str) -> str:
+        value = str(self._telegram_chat_setting_for_chat(chat_id, "transcribe_audio") or "default").lower()
+        return value if value in {"default", "on", "off"} else "default"
+
+    def _telegram_require_mention_for_message(self, message: Message) -> bool:
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        response_mode = self._telegram_response_mode_for_chat(chat_id)
+        if response_mode == "all":
+            return False
+        if response_mode == "mentions":
+            return True
+        return self._telegram_require_mention()
+
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
 
@@ -4882,9 +4920,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Only observe messages skipped by the require_mention gate.  If the
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
-        if chat_id_str in self._telegram_free_response_chats():
+        response_mode = self._telegram_response_mode_for_chat(chat_id_str)
+        if chat_id_str in self._telegram_free_response_chats() and response_mode != "mentions":
             return False
-        if not self._telegram_require_mention():
+        if not self._telegram_require_mention_for_message(message):
             return False
         if self._is_reply_to_bot(message):
             return False
@@ -5095,9 +5134,11 @@ class TelegramAdapter(BasePlatformAdapter):
             adapter_name = getattr(self, "name", "telegram")
             logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
 
-    def _telegram_voice_transcription_rule_matches_message(self, message: Message) -> bool:
-        """Return True when an opt-in Telegram voice transcription rule covers this message."""
-        if not getattr(message, "voice", None):
+    def _telegram_audio_transcription_rule_matches_message(self, message: Message) -> bool:
+        """Return True when an opt-in Telegram voice/audio transcription rule covers this message."""
+        is_voice = bool(getattr(message, "voice", None))
+        is_audio = bool(getattr(message, "audio", None))
+        if not is_voice and not is_audio:
             return False
         rules = self.config.extra.get("audio_transcription_rules") or []
         if not isinstance(rules, list):
@@ -5106,10 +5147,25 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = str(getattr(chat, "id", ""))
         thread_id = getattr(message, "message_thread_id", None)
         thread_id_str = str(thread_id) if thread_id is not None else None
+        requested_kind = "voice" if is_voice else "audio"
         for rule in rules:
             if not isinstance(rule, dict):
                 continue
             if rule.get("enabled", True) is False:
+                continue
+            message_types = rule.get("message_types", rule.get("types"))
+            if message_types is None:
+                message_types = ["voice"]
+            elif isinstance(message_types, str):
+                message_types = [message_types]
+            if not isinstance(message_types, list):
+                continue
+            normalized_types = {
+                str(item).strip().lower()
+                for item in message_types
+                if str(item).strip()
+            }
+            if "all" not in normalized_types and requested_kind not in normalized_types:
                 continue
             if str(rule.get("chat_id", "")) != chat_id:
                 continue
@@ -5118,6 +5174,39 @@ class TelegramAdapter(BasePlatformAdapter):
                 continue
             return True
         return False
+
+    def _telegram_passive_audio_transcription_enabled(self, message: Message) -> bool:
+        """Allow configured unmentioned voice/audio to reach runner for transcript-only handling."""
+        if not (getattr(message, "voice", None) or getattr(message, "audio", None)):
+            return False
+
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(chat, "id", ""))
+        if self._telegram_transcribe_audio_for_chat(chat_id) != "on":
+            return False
+
+        thread_id = getattr(message, "message_thread_id", None)
+        allowed_topics = self._telegram_allowed_topics()
+        if allowed_topics:
+            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+            if topic_id not in allowed_topics:
+                return False
+
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        if self._is_group_chat(message):
+            if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+                return False
+            allowed = self._telegram_allowed_chats()
+            if allowed and chat_id not in allowed:
+                return False
+
+        return True
 
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
@@ -5183,11 +5272,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if allowed and chat_id_str not in allowed:
             return guest_mention
 
+        response_mode = self._telegram_response_mode_for_chat(chat_id_str)
         if guest_mention:
             return True
-        if chat_id_str in self._telegram_free_response_chats():
+        if response_mode == "all":
             return True
-        if not self._telegram_require_mention():
+        if chat_id_str in self._telegram_free_response_chats() and response_mode != "mentions":
+            return True
+        if not self._telegram_require_mention_for_message(message):
             return True
         if self._is_reply_to_bot(message):
             return True
@@ -5196,6 +5288,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
             return True
         return self._message_matches_mention_patterns(message)
+
+    def _is_group_pairing_start_command(self, message: Message) -> bool:
+        """Allow /start in unknown groups to reach gateway pairing."""
+        if not self._is_group_chat(message):
+            return False
+        text = (getattr(message, "text", None) or "").strip()
+        if not text:
+            return False
+        command = text.split(maxsplit=1)[0].lower()
+        return command == "/start" or command.startswith("/start@")
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
@@ -5259,6 +5361,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg, is_command=True):
+            if self._is_group_pairing_start_command(msg):
+                event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+                event.text = self._clean_bot_trigger_text(event.text)
+                event = self._apply_telegram_group_observe_attribution(event)
+                await self.handle_message(event)
             return
         await self._ensure_forum_commands(msg)
 
@@ -5456,14 +5563,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         msg = update.message
         should_process = self._should_process_message(msg)
-        if not should_process and self._telegram_voice_transcription_rule_matches_message(msg):
+        passive_audio_transcription = False
+        if not should_process and self._telegram_audio_transcription_rule_matches_message(msg):
             should_process = True
+        if not should_process and self._telegram_passive_audio_transcription_enabled(msg):
+            should_process = True
+            passive_audio_transcription = True
         if not should_process and not self._should_observe_unmentioned_group_message(msg):
             return
 
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        if passive_audio_transcription:
+            event.telegram_passive_audio_transcription = True
         
         # Add caption as text
         if msg.caption:

@@ -479,6 +479,25 @@ class TestLoadGatewayConfig:
             }
         ]
 
+    def test_bridges_telegram_show_transcription_from_top_level_section(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  show_transcription: true\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("TELEGRAM_SHOW_TRANSCRIPTION", raising=False)
+
+        config = load_gateway_config()
+
+        telegram = config.platforms[Platform.TELEGRAM]
+        assert telegram.extra["show_transcription"] is True
+        assert __import__("os").environ["TELEGRAM_SHOW_TRANSCRIPTION"] == "true"
+
     def test_top_level_platforms_override_nested_gateway_platforms(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

@@ -505,6 +505,10 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter._should_process_message(_group_message("hello everyone")) is False
     assert adapter._should_process_message(_group_message("hi @hermes_bot", entities=[_mention_entity("hi @hermes_bot")])) is True
     assert adapter._should_process_message(_group_message("replying", reply_to_bot=True)) is True
+    assert adapter._should_process_message(_group_message("/start"), is_command=True) is False
+    assert adapter._is_group_pairing_start_command(_group_message("/start")) is True
+    assert adapter._is_group_pairing_start_command(_group_message("/start@hermes_bot")) is True
+    assert adapter._is_group_pairing_start_command(_group_message("/status")) is False
     # Commands must also respect require_mention when it is enabled
     assert adapter._should_process_message(_group_message("/status"), is_command=True) is False
     # Telegram's group command menu sends ``/cmd@botname`` as a single
@@ -611,6 +615,92 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_chat_settings_response_mode_all_bypasses_mention_requirement(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {
+        "chat_settings": {
+            "settings": [
+                {"platform": "telegram", "chat_id": "-200", "response_mode": "all"}
+            ]
+        }
+    })
+    adapter = _make_adapter(require_mention=True)
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
+
+
+def test_chat_settings_response_mode_mentions_overrides_free_response(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {
+        "chat_settings": {
+            "settings": [
+                {"platform": "telegram", "chat_id": "-200", "response_mode": "mentions"}
+            ]
+        }
+    })
+    adapter = _make_adapter(require_mention=False, free_response_chats=["-200"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+
+
+def test_chat_settings_transcribe_audio_on_allows_passive_unmentioned_audio(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {
+        "chat_settings": {
+            "settings": [
+                {"platform": "telegram", "chat_id": "-200", "transcribe_audio": "on"}
+            ]
+        }
+    })
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-200"])
+    msg = _group_message("", chat_id=-200)
+    msg.voice = object()
+    msg.audio = None
+
+    assert adapter._should_process_message(msg) is False
+    assert adapter._telegram_passive_audio_transcription_enabled(msg) is True
+
+
+def test_chat_settings_transcribe_audio_does_not_bypass_allowed_chats(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {
+        "chat_settings": {
+            "settings": [
+                {"platform": "telegram", "chat_id": "-201", "transcribe_audio": "on"}
+            ]
+        }
+    })
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-200"])
+    msg = _group_message("", chat_id=-201)
+    msg.voice = object()
+    msg.audio = None
+
+    assert adapter._telegram_passive_audio_transcription_enabled(msg) is False
+
+
+def test_audio_transcription_rule_matches_audio_attachments():
+    adapter = _make_adapter(require_mention=True)
+    adapter.config.extra["audio_transcription_rules"] = [
+        {"chat_id": "-200", "message_types": ["audio"], "send_transcript": True}
+    ]
+    msg = _group_message("", chat_id=-200)
+    msg.voice = None
+    msg.audio = object()
+
+    assert adapter._telegram_audio_transcription_rule_matches_message(msg) is True
 
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():

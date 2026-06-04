@@ -242,6 +242,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    expected_signature = getattr(agent, "_system_prompt_signature", None)
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:
@@ -249,10 +250,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:
                 raw_prompt = session_row.get("system_prompt")
+                raw_signature = session_row.get("system_prompt_signature")
                 if raw_prompt is None:
                     stored_state = "null"
                 elif raw_prompt == "":
                     stored_state = "empty"
+                elif expected_signature and raw_signature != expected_signature:
+                    stored_state = "stale"
                 else:
                     stored_prompt = raw_prompt
                     stored_state = "present"
@@ -270,18 +274,25 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         agent._cached_system_prompt = stored_prompt
         return
 
-    if conversation_history and stored_state in ("null", "empty"):
+    if conversation_history and stored_state in ("null", "empty", "stale"):
         # Continuing session whose stored prompt is unusable.  The
         # previous turn's write either never happened or wrote an empty
         # string — either way every turn now rebuilds and the prefix
         # cache misses every time.
-        logger.warning(
-            "Stored system prompt for session %s is %s; rebuilding "
-            "from scratch this turn. Prefix cache will miss until "
-            "the rebuild persists. Investigate the previous turn's "
-            "update_system_prompt write path.",
-            agent.session_id, stored_state,
-        )
+        if stored_state == "stale":
+            logger.info(
+                "Stored system prompt for session %s has a stale signature; "
+                "rebuilding from current profile/config/style.",
+                agent.session_id,
+            )
+        else:
+            logger.warning(
+                "Stored system prompt for session %s is %s; rebuilding "
+                "from scratch this turn. Prefix cache will miss until "
+                "the rebuild persists. Investigate the previous turn's "
+                "update_system_prompt write path.",
+                agent.session_id, stored_state,
+            )
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
@@ -307,7 +318,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            if expected_signature:
+                agent._session_db.update_system_prompt(
+                    agent.session_id,
+                    agent._cached_system_prompt,
+                    signature=expected_signature,
+                )
+            else:
+                agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "

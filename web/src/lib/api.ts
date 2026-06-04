@@ -376,6 +376,39 @@ export const api = {
     fetchJSON<{ command: string }>(
       `/api/profiles/${encodeURIComponent(name)}/setup-command`,
     ),
+  getProfileRoutes: () => fetchJSON<ProfileRoutesResponse>("/api/profile-routes"),
+  getDiscoveredProfileRoutes: () =>
+    fetchJSON<DiscoveredProfileRoutesResponse>("/api/profile-routes/discovered"),
+  getProfileChatSettings: () =>
+    fetchJSON<ProfileChatSettingsResponse>("/api/profile-routes/chat-settings"),
+  updateProfileChatSettings: (body: ProfileChatSettingsResponse) =>
+    fetchJSON<ProfileChatSettingsResponse & { ok: boolean }>(
+      "/api/profile-routes/chat-settings",
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  updateProfileRoutes: (body: ProfileRoutesResponse) =>
+    fetchJSON<ProfileRoutesResponse & { ok: boolean }>("/api/profile-routes", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  getProfileScopes: (name: string) =>
+    fetchJSON<ProfileScopesResponse>(
+      `/api/profiles/${encodeURIComponent(name)}/profile-scopes`,
+    ),
+  updateProfileScopes: (name: string, body: ProfileScopesResponse) =>
+    fetchJSON<ProfileScopesResponse & { ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/profile-scopes`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
   getProfileSoul: (name: string) =>
     fetchJSON<{ content: string; exists: boolean }>(
       `/api/profiles/${encodeURIComponent(name)}/soul`,
@@ -387,6 +420,56 @@ export const api = {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content }),
+      },
+    ),
+  getProfileCommunicationStyle: (name: string) =>
+    fetchJSON<ProfileCommunicationStyle>(
+      `/api/profiles/${encodeURIComponent(name)}/communication-style`,
+    ),
+  updateProfileCommunicationStyle: (name: string, style: string) =>
+    fetchJSON<ProfileCommunicationStyle & { ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/communication-style`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ style }),
+      },
+    ),
+  getCommunicationStyles: () =>
+    fetchJSON<{ styles: ProfileCommunicationStyleOption[] }>("/api/communication-styles"),
+  getCommunicationStyle: (style: string) =>
+    fetchJSON<ProfileCommunicationStyle>(
+      `/api/communication-styles/${encodeURIComponent(style)}`,
+    ),
+  createCommunicationStyle: (style: string, content = "") =>
+    fetchJSON<ProfileCommunicationStyle & { ok: boolean }>(
+      "/api/communication-styles",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ style, content }),
+      },
+    ),
+  updateCommunicationStyle: (style: string, content: string) =>
+    fetchJSON<ProfileCommunicationStyle & { ok: boolean }>(
+      `/api/communication-styles/${encodeURIComponent(style)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      },
+    ),
+  getProfileSkills: (name: string) =>
+    fetchJSON<{ profile: string; skills: ProfileSkillInfo[] }>(
+      `/api/profiles/${encodeURIComponent(name)}/skills`,
+    ),
+  toggleProfileSkill: (profile: string, name: string, enabled: boolean) =>
+    fetchJSON<{ ok: boolean; name: string; enabled: boolean }>(
+      `/api/profiles/${encodeURIComponent(profile)}/skills/toggle`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, enabled }),
       },
     ),
 
@@ -600,11 +683,17 @@ export const api = {
 
   // ── Admin: Pairing ──────────────────────────────────────────────────
   getPairing: () => fetchJSON<PairingResponse>("/api/pairing"),
-  approvePairing: (platform: string, code: string) =>
+  approvePairing: (body: PairingApproveRequest) =>
     fetchJSON<{ ok: boolean; user: PairingUser }>("/api/pairing/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ platform, code }),
+      body: JSON.stringify(body),
+    }),
+  rejectPairing: (platform: string, entry_id: string) =>
+    fetchJSON<{ ok: boolean }>("/api/pairing/reject", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ platform, entry_id }),
     }),
   revokePairing: (platform: string, user_id: string) =>
     fetchJSON<{ ok: boolean }>("/api/pairing/revoke", {
@@ -640,6 +729,10 @@ export const api = {
     ),
 
   // ── Admin: Credential pool ──────────────────────────────────────────
+  getCredentialProviderCatalog: () =>
+    fetchJSON<{ providers: CredentialProviderInfo[] }>(
+      "/api/credentials/providers",
+    ),
   getCredentialPool: () =>
     fetchJSON<{ providers: CredentialPoolProvider[] }>("/api/credentials/pool"),
   addCredentialPoolEntry: (
@@ -904,8 +997,26 @@ export interface PairingUser {
   platform: string;
   user_id: string;
   user_name?: string;
+  entry_id?: string;
+  subject_type?: "user" | "chat" | string;
+  chat_id?: string;
+  chat_name?: string;
+  chat_type?: string;
+  thread_id?: string;
+  requester_user_id?: string;
+  requester_user_name?: string;
   code?: string;
   age_minutes?: number;
+}
+
+export interface PairingApproveRequest {
+  platform: string;
+  code?: string;
+  entry_id?: string;
+  profile?: string;
+  create_profile?: boolean;
+  new_profile_name?: string;
+  clone_from_default?: boolean;
 }
 
 export interface PairingResponse {
@@ -962,6 +1073,15 @@ export interface CredentialPoolProvider {
   entries: CredentialPoolEntry[];
 }
 
+export interface CredentialProviderInfo {
+  slug: string;
+  name: string;
+  auth_type: string;
+  key_env: string;
+  base_url_env: string;
+  warning: string;
+}
+
 export interface MemoryProviderInfo {
   name: string;
   description: string;
@@ -972,6 +1092,8 @@ export interface MemoryStatus {
   active: string;
   providers: MemoryProviderInfo[];
   builtin_files: { memory: number; user: number };
+  profile_name?: string;
+  hermes_home?: string;
 }
 
 export interface HookEntry {
@@ -1232,6 +1354,111 @@ export interface ProfileInfo {
   skill_count: number;
 }
 
+export interface ProfileCommunicationStyle {
+  style: string;
+  label: string;
+  file: string;
+  exists: boolean;
+  content: string;
+}
+
+export interface ProfileCommunicationStyleOption {
+  style: string;
+  label: string;
+  file: string;
+  exists: boolean;
+}
+
+export interface ProfileSkillInfo {
+  name: string;
+  description: string;
+  category: string;
+  enabled: boolean;
+}
+
+export interface ProfileRoute {
+  id: string;
+  enabled: boolean;
+  platform: string;
+  chat_id: string;
+  thread_id?: string;
+  profile: string;
+  label?: string;
+}
+
+export interface ProfileRoutesResponse {
+  default_profile: string;
+  routes: ProfileRoute[];
+}
+
+export interface DiscoveredProfileRoute {
+  id: string;
+  source: string;
+  platform: string;
+  chat_id: string;
+  chat_name?: string;
+  chat_type?: string;
+  thread_id?: string;
+  chat_topic?: string;
+  label: string;
+  direct_profile?: string;
+  effective_profile: string;
+  match_type: "topic" | "chat" | "default" | string;
+  route_id?: string;
+  enabled?: boolean;
+  updated_at?: string;
+}
+
+export interface DiscoveredProfileRoutesResponse {
+  items: DiscoveredProfileRoute[];
+}
+
+export interface ProfileChatSetting {
+  id?: string;
+  platform?: string;
+  chat_id?: string;
+  label?: string;
+  response_mode: "default" | "mentions" | "all" | string;
+  transcribe_audio: "default" | "on" | "off" | string;
+  reply_to_mode: "default" | "off" | "first" | "all" | string;
+  tool_progress: "default" | "off" | "new" | "all" | "verbose" | string;
+  show_reasoning: "default" | "on" | "off" | string;
+  tool_preview_length: "default" | number | string;
+  interim_assistant_messages: "default" | "on" | "off" | string;
+  long_running_notifications: "default" | "on" | "off" | string;
+  busy_ack_detail: "default" | "on" | "off" | string;
+  cleanup_progress: "default" | "on" | "off" | string;
+  streaming: "default" | "on" | "off" | string;
+  gateway_restart_notification: "default" | "on" | "off" | string;
+}
+
+export interface ProfileChatSettingsResponse {
+  defaults: ProfileChatSetting;
+  settings: ProfileChatSetting[];
+}
+
+export interface ProfileScopeSkillSet {
+  mode: "allow";
+  names: string[];
+}
+
+export interface ProfileScope {
+  id: string;
+  enabled: boolean;
+  platform: string;
+  chat_id: string;
+  thread_id?: string;
+  scope: string;
+  label?: string;
+  memory_scope?: string;
+  skill_sets?: ProfileScopeSkillSet;
+}
+
+export interface ProfileScopesResponse {
+  default_scope: string;
+  scopes: ProfileScope[];
+}
+
 export interface ModelsAnalyticsModelEntry {
   model: string;
   provider: string;
@@ -1347,6 +1574,7 @@ export interface ModelOptionProvider {
   total_models?: number;
   is_current?: boolean;
   is_user_defined?: boolean;
+  authenticated?: boolean;
   source?: string;
   warning?: string;
 }

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
 import {
   Eye,
   EyeOff,
@@ -15,7 +16,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { EnvVarInfo } from "@/lib/api";
+import type { EnvVarInfo, ModelOptionsResponse } from "@/lib/api";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
@@ -47,6 +48,7 @@ const PROVIDER_GROUPS: { prefix: string; name: string; priority: number }[] = [
   // Nous Portal first
   { prefix: "NOUS_", name: "Nous Portal", priority: 0 },
   // Then alphabetical by display name
+  { prefix: "OPENAI_", name: "OpenAI", priority: 1 },
   { prefix: "ANTHROPIC_", name: "Anthropic", priority: 1 },
   { prefix: "DASHSCOPE_", name: "DashScope (Qwen)", priority: 2 },
   { prefix: "HERMES_QWEN_", name: "DashScope (Qwen)", priority: 2 },
@@ -56,14 +58,21 @@ const PROVIDER_GROUPS: { prefix: string; name: string; priority: number }[] = [
   { prefix: "GLM_", name: "GLM / Z.AI", priority: 5 },
   { prefix: "ZAI_", name: "GLM / Z.AI", priority: 5 },
   { prefix: "Z_AI_", name: "GLM / Z.AI", priority: 5 },
+  { prefix: "GROQ_", name: "Groq", priority: 6 },
   { prefix: "HF_", name: "Hugging Face", priority: 6 },
   { prefix: "KIMI_", name: "Kimi / Moonshot", priority: 7 },
   { prefix: "MINIMAX_CN_", name: "MiniMax (China)", priority: 9 },
   { prefix: "MINIMAX_", name: "MiniMax", priority: 8 },
+  { prefix: "NVIDIA_", name: "NVIDIA NIM", priority: 10 },
   { prefix: "OPENCODE_GO_", name: "OpenCode Go", priority: 10 },
   { prefix: "OPENCODE_ZEN_", name: "OpenCode Zen", priority: 11 },
   { prefix: "OPENROUTER_", name: "OpenRouter", priority: 12 },
-  { prefix: "XIAOMI_", name: "Xiaomi MiMo", priority: 13 },
+  { prefix: "XAI_", name: "xAI / Grok", priority: 13 },
+  { prefix: "XIAOMI_", name: "Xiaomi MiMo", priority: 14 },
+  { prefix: "LM_", name: "LM Studio", priority: 15 },
+  { prefix: "STEPFUN_", name: "StepFun", priority: 16 },
+  { prefix: "ARCEE", name: "Arcee AI", priority: 17 },
+  { prefix: "GMI_", name: "GMI Cloud", priority: 18 },
 ];
 
 function getProviderGroup(key: string): string {
@@ -482,16 +491,58 @@ function ProviderGroupCard({
   );
 }
 
+function AvailableModelProvidersStrip({
+  options,
+}: {
+  options: ModelOptionsResponse | null;
+}) {
+  const providers = options?.providers ?? [];
+  if (providers.length === 0) return null;
+
+  const readyCount = providers.filter((provider) => provider.authenticated).length;
+
+  return (
+    <div className="border-b border-border bg-muted/10 px-4 py-3">
+      <div className="mb-2 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-display text-xs font-medium tracking-wider">
+          Available model providers
+        </span>
+        <span className="font-mono text-xs text-text-secondary">
+          {readyCount}/{providers.length} ready
+        </span>
+      </div>
+      <div className="flex min-w-0 gap-2 overflow-x-auto pb-1">
+        {providers.map((provider) => (
+          <div
+            key={provider.slug}
+            className="inline-flex shrink-0 items-center gap-2 border border-border/60 bg-background/50 px-2 py-1"
+          >
+            <span className="text-xs font-medium">{provider.name}</span>
+            <span className="font-mono text-xs text-text-secondary">
+              {provider.total_models ?? provider.models?.length ?? 0}
+            </span>
+            <Badge tone={provider.authenticated ? "success" : "secondary"}>
+              {provider.authenticated ? "ready" : "setup"}
+            </Badge>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /*  Main page                                                          */
 /* ------------------------------------------------------------------ */
 
 export default function EnvPage() {
   const [vars, setVars] = useState<Record<string, EnvVarInfo> | null>(null);
+  const [modelOptions, setModelOptions] = useState<ModelOptionsResponse | null>(null);
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [revealed, setRevealed] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(true); // Show all providers by default
+  const location = useLocation();
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setAfterTitle } = usePageHeader();
@@ -501,7 +552,21 @@ export default function EnvPage() {
       .getEnvVars()
       .then(setVars)
       .catch(() => {});
+    api
+      .getModelOptions()
+      .then(setModelOptions)
+      .catch(() => setModelOptions(null));
   }, []);
+
+  useEffect(() => {
+    if (!vars || location.hash !== "#section-providers") return;
+    const frame = window.requestAnimationFrame(() => {
+      document
+        .getElementById("section-providers")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [vars, location.hash]);
 
   // Scroll-to sub-nav in the page header
   const sections = useMemo(() => {
@@ -779,6 +844,8 @@ export default function EnvPage() {
         </CardHeader>
 
         <CardContent className="grid gap-0 p-0">
+          <AvailableModelProvidersStrip options={modelOptions} />
+
           {providerGroups.map((group) => (
             <ProviderGroupCard
               key={group.name}
