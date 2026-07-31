@@ -22,6 +22,11 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.conversation_loop import (
+    _force_exact_tool_choice,
+    _live_tool_execution_claim_without_call,
+    _live_tool_unavailability_contradiction,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +259,71 @@ def _mock_response(
 # ===================================================================
 # Group 1: Pure Functions
 # ===================================================================
+
+
+class TestLiveToolAvailabilityGuard:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "В текущей сессии нет доступного вызова Google Calendar.",
+            "Вызов Google Calendar не предоставлен интерфейсом сессии.",
+            "Я не получил доступного вызова Google Calendar.",
+            "Google Calendar is not available in this session.",
+        ],
+    )
+    def test_detects_false_claim_about_exposed_tool(self, text):
+        assert _live_tool_unavailability_contradiction(
+            text,
+            {"google_calendar"},
+        ) == "google_calendar"
+
+    def test_ignores_normal_tool_result_wording(self):
+        assert _live_tool_unavailability_contradiction(
+            "Проверил через Google Calendar: окно свободно.",
+            {"google_calendar"},
+        ) is None
+
+    def test_ignores_claim_after_tool_was_called(self):
+        assert _live_tool_unavailability_contradiction(
+            "Google Calendar is unavailable right now.",
+            {"google_calendar"},
+            {"google_calendar"},
+        ) is None
+
+    def test_exact_tool_choice_uses_responses_api_shape(self):
+        kwargs = {"tool_choice": "auto"}
+        _force_exact_tool_choice(kwargs, "codex_responses", "google_calendar")
+        assert kwargs["tool_choice"] == {
+            "type": "function",
+            "name": "google_calendar",
+        }
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Фактический вызов Google Calendar выполнен, но доступ был отклонён политикой.",
+            "Проверил через Google Calendar: окно свободно.",
+            "The Google Calendar query completed but access was denied.",
+        ],
+    )
+    def test_detects_tool_execution_claim_without_call(self, text):
+        assert _live_tool_execution_claim_without_call(
+            text,
+            {"google_calendar"},
+        ) == "google_calendar"
+
+    def test_execution_claim_allows_real_call(self):
+        assert _live_tool_execution_claim_without_call(
+            "Проверил через Google Calendar: окно свободно.",
+            {"google_calendar"},
+            {"google_calendar"},
+        ) is None
+
+    def test_execution_claim_ignores_plain_tool_description(self):
+        assert _live_tool_execution_claim_without_call(
+            "Google Calendar — инструмент для работы с календарём.",
+            {"google_calendar"},
+        ) is None
 
 
 class TestHasContentAfterThinkBlock:

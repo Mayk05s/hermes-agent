@@ -64,6 +64,119 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+_LIVE_TOOL_UNAVAILABLE_RE = re.compile(
+    r"(?:"
+    r"\b(?:no|without)\b.{0,100}\b(?:available|accessible|provided|exposed|registered|enabled|live)\b"
+    r"|\b(?:not|isn['’]?t|wasn['’]?t)\b.{0,70}\b(?:available|accessible|provided|exposed|registered|enabled)\b"
+    r"|\b(?:unavailable|inaccessible|missing)\b"
+    r"|\b(?:нет|без)\b.{0,100}(?:доступн\w*|предоставлен\w*|зарегистрирован\w*|вызов\w*|инструмент\w*|функци\w*|доступ\w*)"
+    r"|\bне\s+(?:предоставлен\w*|доступен\w*|зарегистрирован\w*|получил\w*|вижу|имею|могу)\b"
+    r"|\bотсутству\w*\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_LIVE_TOOL_EXECUTION_CLAIM_RE = re.compile(
+    r"(?:"
+    r"\b(?:called|queried|checked|verified|read|searched|retrieved|fetched|used)\b"
+    r"|\b(?:call|query|check|verification|read|search|lookup)\b.{0,70}"
+    r"\b(?:completed|performed|executed|returned|failed|denied|blocked)\b"
+    r"|\b(?:вызов|запрос|проверк\w*|чтени\w*|поиск\w*)\b.{0,80}"
+    r"(?:выполнен\w*|завершен\w*|исполнен\w*|вернул\w*|отклонен\w*|"
+    r"отклонён\w*|заблокирован\w*|не\s+удал\w*)"
+    r"|\b(?:проверил\w*|проверен\w*|прочитал\w*|получил\w*|запросил\w*|"
+    r"вызвал\w*|использовал\w*)\b"
+    r"|\bдоступ\b.{0,50}(?:отклонен\w*|отклонён\w*|заблокирован\w*)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _live_tool_unavailability_contradiction(
+    text: str,
+    valid_tool_names: Any,
+    tools_called_this_turn: Any = None,
+) -> Optional[str]:
+    """Return a live tool falsely described by the model as unavailable.
+
+    This is deliberately a response-consistency check, not intent routing:
+    the model must name a tool that is present in its actual interface and
+    explicitly claim that the tool/call/access is unavailable.  If the tool
+    was already invoked in this turn, an availability error may be a truthful
+    report from the tool itself, so the guard stays out of the way.
+    """
+    body = str(text or "").strip()
+    if not body:
+        return None
+
+    called = {str(name) for name in (tools_called_this_turn or ())}
+    lowered = body.casefold()
+    names = (str(name) for name in (valid_tool_names or ()))
+    for raw_name in sorted(names, key=len, reverse=True):
+        if not raw_name or raw_name in called:
+            continue
+        aliases = {raw_name.casefold(), raw_name.replace("_", " ").casefold()}
+        for alias in aliases:
+            start = lowered.find(alias)
+            while start >= 0:
+                # Claims are normally adjacent to the tool name, but allow a
+                # little room for phrases such as "in the current session".
+                window = lowered[max(0, start - 140): start + len(alias) + 140]
+                if _LIVE_TOOL_UNAVAILABLE_RE.search(window):
+                    return raw_name
+                start = lowered.find(alias, start + len(alias))
+    return None
+
+
+def _live_tool_execution_claim_without_call(
+    text: str,
+    valid_tool_names: Any,
+    tools_called_this_turn: Any = None,
+) -> Optional[str]:
+    """Return a live tool the model claims it used without a real call.
+
+    Like the availability guard above, this validates the model's own factual
+    statement rather than routing user intent.  A response that says a named
+    live function was queried, failed, or denied must be backed by a tool call
+    in the current turn; stale transcript text is not execution evidence.
+    """
+    body = str(text or "").strip()
+    if not body:
+        return None
+
+    called = {str(name) for name in (tools_called_this_turn or ())}
+    lowered = body.casefold()
+    names = (str(name) for name in (valid_tool_names or ()))
+    for raw_name in sorted(names, key=len, reverse=True):
+        if not raw_name or raw_name in called:
+            continue
+        aliases = {raw_name.casefold(), raw_name.replace("_", " ").casefold()}
+        for alias in aliases:
+            start = lowered.find(alias)
+            while start >= 0:
+                window = lowered[max(0, start - 140): start + len(alias) + 140]
+                if _LIVE_TOOL_EXECUTION_CLAIM_RE.search(window):
+                    return raw_name
+                start = lowered.find(alias, start + len(alias))
+    return None
+
+
+def _force_exact_tool_choice(api_kwargs: dict, api_mode: str, tool_name: str) -> None:
+    """Force one already-exposed function for the current provider request."""
+    if api_mode == "codex_responses":
+        api_kwargs["tool_choice"] = {"type": "function", "name": tool_name}
+    elif api_mode == "anthropic_messages":
+        api_kwargs["tool_choice"] = {"type": "tool", "name": tool_name}
+    elif api_mode == "bedrock_converse":
+        tool_config = api_kwargs.setdefault("toolConfig", {})
+        tool_config["toolChoice"] = {"tool": {"name": tool_name}}
+    else:
+        api_kwargs["tool_choice"] = {
+            "type": "function",
+            "function": {"name": tool_name},
+        }
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -748,6 +861,10 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    live_tool_recovery_attempts: set[str] = set()
+    tools_called_this_turn: set[str] = set()
+    forced_live_tool_name: Optional[str] = None
+    live_tool_recovery_instruction: Optional[str] = None
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Per-turn file-mutation verifier state.  Keyed by resolved path;
@@ -972,6 +1089,8 @@ def run_conversation(
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
+                if live_tool_recovery_instruction:
+                    _injections.append(live_tool_recovery_instruction)
                 if _injections:
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):
@@ -1232,6 +1351,12 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                if forced_live_tool_name:
+                    _force_exact_tool_choice(
+                        api_kwargs,
+                        agent.api_mode,
+                        forced_live_tool_name,
+                    )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -3496,6 +3621,11 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+            # A forced choice is scoped to exactly one successful model
+            # response.  API retries retain it because they rebuild kwargs
+            # before reaching this point.
+            forced_live_tool_name = None
+            live_tool_recovery_instruction = None
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -3884,6 +4014,10 @@ def run_conversation(
                 # a LATER tool round.
                 agent._post_tool_empty_retried = False
 
+                tools_called_this_turn.update(
+                    tc.function.name for tc in assistant_message.tool_calls
+                )
+
                 messages.append(assistant_msg)
                 agent._emit_interim_assistant_message(assistant_msg)
 
@@ -4001,6 +4135,57 @@ def run_conversation(
             else:
                 # No tool calls - this is the final response
                 final_response = assistant_message.content or ""
+
+                contradicted_tool = _live_tool_unavailability_contradiction(
+                    final_response,
+                    agent.valid_tool_names,
+                    tools_called_this_turn,
+                )
+                if not contradicted_tool:
+                    contradicted_tool = _live_tool_execution_claim_without_call(
+                        final_response,
+                        agent.valid_tool_names,
+                        tools_called_this_turn,
+                    )
+                if contradicted_tool:
+                    if contradicted_tool not in live_tool_recovery_attempts:
+                        live_tool_recovery_attempts.add(contradicted_tool)
+                        forced_live_tool_name = contradicted_tool
+                        live_tool_recovery_instruction = (
+                            "[Runtime consistency correction: the function "
+                            f"`{contradicted_tool}` is present in your actual live "
+                            "tool interface, but your draft was not backed by a "
+                            "call to it in this turn. Call that function now and pass it the "
+                            "complete bounded task reconstructed from the conversation. "
+                            "Do not answer with text before making the function call.]"
+                        )
+                        logger.warning(
+                            "Blocked unverified live-tool claim; forcing %s "
+                            "on the next model call (model=%s provider=%s session=%s)",
+                            contradicted_tool,
+                            agent.model,
+                            agent.provider,
+                            agent.session_id or "none",
+                        )
+                        agent._buffer_status(
+                            f"↻ Model skipped available tool {contradicted_tool}; "
+                            "forcing the live function call"
+                        )
+                        continue
+
+                    logger.error(
+                        "Model repeated a false live-tool unavailability claim after "
+                        "forced choice: tool=%s model=%s provider=%s session=%s",
+                        contradicted_tool,
+                        agent.model,
+                        agent.provider,
+                        agent.session_id or "none",
+                    )
+                    final_response = (
+                        "The model failed to invoke an available runtime tool even "
+                        "after an exact forced-tool retry. No external changes were "
+                        "made; please retry the request."
+                    )
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
