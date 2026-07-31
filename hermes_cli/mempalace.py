@@ -17,10 +17,12 @@ import re
 import shutil
 import sqlite3
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 PALACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -77,15 +79,143 @@ LOW_SIGNAL_PREDICATES = {
     "uses_model",
     "model",
 }
+LOW_SIGNAL_CHAT_RELATIONS = {
+    "talks_to",
+    "responds_to",
+    "replies_to",
+    "member_of",
+    "participates_in",
+    "participant_of",
+    "mentioned",
+    "mentions",
+    "discussed",
+    "chat_member",
+    "sent_message_to",
+}
+TRANSIENT_PREDICATES = {
+    "today",
+    "current_status",
+    "current_state",
+    "current_location",
+    "currently",
+    "now",
+    "arrived_home",
+    "came_home",
+    "is_ready",
+    "ready",
+    "ok",
+}
 AUTO_CLEAN_MAX_DELETE = 250
 AUTO_REFRESH_INTERVAL_SECONDS = 15 * 60
 HISTORY_MAX_SESSIONS_PER_PROFILE = 2000
 HISTORY_MAX_MESSAGES_PER_SESSION = 24
 HISTORY_MAX_FACTS_PER_PROFILE = 10000
+LLM_CONSOLIDATOR_BATCH_SIZE = 25
+LLM_CONSOLIDATOR_MAX_BATCH_SIZE = 80
+LLM_CONSOLIDATOR_MAX_BATCHES = 40
+LLM_CONSOLIDATOR_WORKERS = 5
+LLM_CONSOLIDATOR_MAX_WORKERS = 8
+LLM_CONSOLIDATOR_FULL_MAX_ROUNDS = 1000
+LLM_CONSOLIDATOR_STALE_SECONDS = 6 * 60
+LLM_CONSOLIDATOR_TASK = "mempalace_extractor"
+LLM_CONSOLIDATOR_ADAPTER = "hermes_history_llm"
+LLM_CONSOLIDATOR_STATE_KEY = "consolidator"
+LLM_CONSOLIDATOR_DEFAULT_TIMEOUT = 180
+LLM_CONSOLIDATOR_MAX_TEXT_CHARS = 1400
+LLM_VALIDATOR_TASK = "mempalace_validator"
+LLM_VALIDATOR_ADAPTER = "hermes_graph_validator"
+LLM_VALIDATOR_DEFAULT_TIMEOUT = 240
+LLM_VALIDATOR_MAX_CANDIDATES = 80
 _TRANSIENT_VALUE_RE = re.compile(
-    r"(?:готов|ready|sonnet|true|false|ok|done|closed|deleted|working|not[_ -]?responding)",
+    r"(?:not[_ -]?responding|сегодня|today|now|currently|пришел\s+домой|пришла\s+домой|"
+    r"приш[её]л\s+домой|arrived\s+home|came\s+home)",
     re.IGNORECASE,
 )
+_TRANSIENT_TOKEN_RE = re.compile(
+    r"(?:готов|готово|ready|active|sonnet|true|false|ok|done|closed|deleted|working)",
+    re.IGNORECASE,
+)
+_DURABLE_TIME_ANCHOR_RE = re.compile(
+    r"(?:\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b|"
+    r"\b(?:expires?|until|ttl|valid[_ -]?to|deadline|due)\b|"
+    r"\b(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*)",
+    re.IGNORECASE,
+)
+_LOW_SIGNAL_LITERAL_RE = re.compile(
+    r"(?:true|false|active|inactive|enabled|disabled|null|none|unknown|ok|done|ready)",
+    re.IGNORECASE,
+)
+_TELEGRAM_ID_RE = re.compile(r"(?:-?100\d{6,}|-?\d{7,}|(?:telegram|chat|tg)[_:\s-]*-?\d{5,})", re.IGNORECASE)
+_INTERNAL_DEBRIS_RE = re.compile(
+    r"(?:delegate_task|tool_call|tool_result|function_call|specialist_label|toolsets?|"
+    r"required_toolsets?|mcp_servers?|contract|schema|arguments|structured_content|"
+    r"response\.output|response_item|turn_context)",
+    re.IGNORECASE,
+)
+_SECRET_RE = re.compile(
+    r"(?:api[_-]?key|token|password|passwd|secret|authorization|bearer|sk-[A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_PREDICATE_RE = re.compile(r"[^a-zA-Z0-9_а-яА-ЯёЁ-]+")
+_LLM_ALLOWED_ENTITY_TYPES = {
+    "person",
+    "project",
+    "system",
+    "service",
+    "organization",
+    "profile",
+    "artifact",
+    "concept",
+    "preference",
+    "place",
+    "medical",
+    "medication",
+    "device",
+    "task",
+}
+_LLM_TYPE_ALIASES = {
+    "org": "organization",
+    "company": "organization",
+    "repo": "artifact",
+    "repository": "artifact",
+    "file": "artifact",
+    "tool": "service",
+    "app": "service",
+    "user": "person",
+}
+_MEMORY_EXTRACTOR_SYSTEM = """You are the Hermes MemPalace memory consolidator.
+
+Extract only durable, useful memory from chat messages. Return JSON only with this shape:
+{
+  "entities": [
+    {"name": "canonical name", "type": "person|project|system|service|organization|profile|artifact|concept|preference|place|medical|medication|device|task", "description": "short durable description", "confidence": 0.0}
+  ],
+  "facts": [
+    {"subject": "entity name", "predicate": "short_snake_case", "object": "literal value or entity name", "confidence": 0.0, "evidence_message_ids": [1, 2]}
+  ],
+  "relations": [
+    {"subject": "entity name", "predicate": "short_snake_case", "object": "entity name", "confidence": 0.0, "evidence_message_ids": [1]}
+  ],
+  "contradictions": [
+    {"subject": "entity name", "predicate": "short_snake_case", "old": "old value", "new": "new value", "evidence_message_ids": [2]}
+  ]
+}
+
+Rules:
+- Keep only facts that should be remembered across future chats: user preferences, stable project details, system architecture, responsibilities, constraints, health/medical facts, household/device facts, and important decisions.
+- Skip one-off commands, transient statuses, greetings, acknowledgements, logs, stack traces, install/build output, generated code unless the code artifact itself is important, and vague names with no future value.
+- Never create entities or literals for booleans/status tokens/numbers/IDs such as true, false, active, ok, done, ready, 42, Telegram chat IDs, or raw message IDs.
+- Do not save transient facts as durable memory without an explicit date, deadline, TTL, or validity window: "today", "now/currently", "came home", "ready/ok/done", current status/location, or temporary availability.
+- Do not emit casual chat/social graph edges such as talks_to, responds_to, member_of, participates_in, mentioned, mentions, or discussed. Use facts only when they capture durable meaning.
+- Treat third-party/news claims as reported_claim or mentioned_claim attributed to the speaker/source. Do not turn them into verified facts about the world.
+- Ignore internal tool calls, specialist routing, MCP/tool JSON, contracts, schemas, logs, raw structured_content, and assistant implementation traces.
+- Do not extract secrets, API keys, passwords, tokens, private credentials, or authorization headers.
+- Normalize names. Use a real name when stated; otherwise use "profile:<profile>" instead of generic "user".
+- Prefer meaningful relations between entities over "mentioned" edges.
+- Every fact/relation/contradiction must include concrete evidence_message_ids from the input batch. If evidence is unclear, skip the item.
+- If nothing durable is present, return empty arrays.
+"""
 
 
 @dataclass(frozen=True)
@@ -97,6 +227,33 @@ class PalacePaths:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _iso_age_seconds(value: Any) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+
+def _append_consolidator_event(paths: PalacePaths, event: dict[str, Any], *, limit: int = 24) -> dict[str, Any]:
+    state = _read_refresh_state(paths)
+    cstate = _consolidator_state(state)
+    events = cstate.get("events")
+    if not isinstance(events, list):
+        events = []
+    events.append({"at": utc_now(), **event})
+    cstate["events"] = events[-limit:]
+    state[LLM_CONSOLIDATOR_STATE_KEY] = cstate
+    state.setdefault("profile", paths.profile)
+    _write_refresh_state(paths, state)
+    return cstate
 
 
 def _stable_id(prefix: str, *parts: object, max_len: int = 96) -> str:
@@ -227,12 +384,19 @@ def _ensure_schema(db_path: Path) -> None:
                 source_file TEXT,
                 source_drawer_id TEXT,
                 adapter_name TEXT,
+                evidence TEXT,
                 extracted_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (subject) REFERENCES entities(id),
                 FOREIGN KEY (object) REFERENCES entities(id)
             )
             """
         )
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(triples)").fetchall()
+        }
+        if "evidence" not in columns:
+            conn.execute("ALTER TABLE triples ADD COLUMN evidence TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
@@ -265,6 +429,44 @@ def _decode_properties(raw: Any) -> dict[str, Any]:
         return {}
 
 
+def _literal_fact_attributes(props: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
+    raw = props.get("literal_facts")
+    facts = raw if isinstance(raw, list) else []
+    attrs: list[dict[str, Any]] = []
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        predicate = str(item.get("predicate") or "").strip()
+        if not predicate:
+            continue
+        attrs.append(
+            {
+                "predicate": predicate,
+                "value": item.get("value"),
+                "confidence": item.get("confidence"),
+                "source_file": item.get("source_file"),
+                "source_closet": item.get("source_closet"),
+                "adapter_name": item.get("adapter_name"),
+                "extracted_at": item.get("extracted_at"),
+                "evidence": item.get("evidence"),
+                "compacted": True,
+            }
+        )
+        if len(attrs) >= limit:
+            break
+    return attrs
+
+
+def _literal_facts_snippet(props: dict[str, Any], *, limit: int = 4) -> str:
+    parts = []
+    for item in _literal_fact_attributes(props, limit=limit):
+        value = str(item.get("value") or "").strip()
+        predicate = str(item.get("predicate") or "").strip()
+        if predicate and value:
+            parts.append(f"{predicate}: {value}")
+    return "; ".join(parts)
+
+
 def _query_terms(query: str) -> list[str]:
     terms = [t.lower() for t in _TERM_RE.findall(query or "") if len(t.strip("-_")) >= 2]
     if not terms and query.strip():
@@ -282,14 +484,14 @@ def _entity_dict(row: sqlite3.Row, degree: int = 0) -> dict[str, Any]:
         "properties": props,
         "degree": degree,
         "created_at": row["created_at"] if "created_at" in row.keys() else None,
-        "attributes": [],
+        "attributes": _literal_fact_attributes(props),
     }
 
 
 def _noise_candidate_for_entity(conn: sqlite3.Connection, row: sqlite3.Row) -> Optional[dict[str, Any]]:
     entity_id = row["id"]
-    if (row["type"] or "unknown") == "unknown":
-        return None
+    label = str(row["name"] or entity_id or "").strip()
+    entity_type = row["type"] or "unknown"
     props = _decode_properties(row["properties"] if "properties" in row.keys() else "{}")
     triples = conn.execute(
         """
@@ -302,23 +504,36 @@ def _noise_candidate_for_entity(conn: sqlite3.Connection, row: sqlite3.Row) -> O
         """,
         (entity_id, entity_id),
     ).fetchall()
-    if not triples:
+    if not triples and entity_type != "unknown":
         return None
 
     predicates = [str(item["predicate"] or "").lower() for item in triples]
-    only_low_signal = bool(predicates) and all(item in LOW_SIGNAL_PREDICATES for item in predicates)
-    has_strong_relation = any(item not in LOW_SIGNAL_PREDICATES for item in predicates)
+    low_signal_predicates = LOW_SIGNAL_PREDICATES | LOW_SIGNAL_CHAT_RELATIONS | TRANSIENT_PREDICATES
+    only_low_signal = bool(predicates) and all(item in low_signal_predicates for item in predicates)
+    has_strong_relation = any(item not in low_signal_predicates for item in predicates)
     has_source_file = bool(props.get("source_file")) or any(item["source_file"] for item in triples)
     transient_literal = any(
         item["subject"] == entity_id
-        and str(item["predicate"] or "").lower() in LOW_SIGNAL_PREDICATES
-        and _TRANSIENT_VALUE_RE.search(str(item["object"] or ""))
+        and str(item["predicate"] or "").lower() in low_signal_predicates
+        and _is_unanchored_transient(str(item["object"] or ""))
         for item in triples
     )
+    has_chat_noise = any(item in LOW_SIGNAL_CHAT_RELATIONS for item in predicates)
+    has_transient_predicate = any(item in TRANSIENT_PREDICATES for item in predicates)
     degree = len(triples)
 
     reason = ""
-    if degree <= 2 and only_low_signal and not has_strong_relation and not has_source_file:
+    if entity_type == "unknown" and _is_low_signal_literal(label):
+        reason = "unknown boolean/status/id literal"
+    elif entity_type == "unknown" and _looks_like_json_debris(label):
+        reason = "internal tool/json debris"
+    elif entity_type == "unknown" and _is_unanchored_transient(label):
+        reason = "unknown transient literal"
+    elif has_chat_noise and degree <= 3 and not has_source_file:
+        reason = "low-signal chat edge"
+    elif has_transient_predicate and degree <= 3 and not has_source_file:
+        reason = "transient predicate"
+    elif degree <= 2 and only_low_signal and not has_strong_relation and not has_source_file:
         reason = "only transient status facts"
     elif degree <= 1 and transient_literal and not has_source_file:
         reason = "single transient status"
@@ -335,7 +550,7 @@ def _noise_candidate_for_entity(conn: sqlite3.Connection, row: sqlite3.Row) -> O
     return {
         "id": entity_id,
         "label": row["name"],
-        "type": row["type"] or "unknown",
+        "type": entity_type,
         "description": props.get("description", ""),
         "degree": degree,
         "reason": reason,
@@ -565,7 +780,6 @@ def scan_noise(
                 """
                 SELECT id, name, type, properties, created_at
                 FROM entities
-                WHERE type != 'unknown'
                 ORDER BY created_at DESC, name COLLATE NOCASE ASC
                 """
             ).fetchall()
@@ -690,6 +904,622 @@ def clean_noise(
         "backup_root": str(backup_root) if backup_root else "",
         "cleaned_palaces": cleaned_palaces,
     }
+
+
+_MEMORY_VALIDATOR_SYSTEM = """You are the Hermes MemPalace graph validator.
+
+You receive graph candidates already flagged by deterministic cleanup rules.
+Delete obvious noise: unknown boolean/status/ID literal nodes, transient current-state
+facts without a date/TTL, casual chat edges, internal tool/specialist JSON, schema
+fragments, logs, and empty/vague values that carry no durable memory.
+
+Keep durable people, projects, services, devices, preferences, medical facts,
+stable constraints, and useful relationships even when small. When a candidate is
+a real user preference or project decision with concrete evidence, keep it.
+Return JSON only:
+{"delete":[{"candidate_id":"exact id copied from candidates","reason":"short reason"}],"keep":[{"candidate_id":"exact id copied from candidates","reason":"short reason"}],"summary":"short"}
+
+Important contract:
+- Every delete item must use an exact candidate_id copied verbatim from the candidate list.
+- Do not invent ids, summarize a deletion set, or say "delete the remaining candidates" without listing exact ids.
+- Labels are shown only for human context; candidate_id is the authority.
+- If you are unsure, keep the candidate.
+"""
+
+
+def _call_validator_llm(
+    messages: list[dict[str, str]],
+    *,
+    timeout: int = LLM_VALIDATOR_DEFAULT_TIMEOUT,
+    max_tokens: int = 3072,
+) -> str:
+    from agent.auxiliary_client import call_llm
+
+    response = call_llm(
+        task=LLM_VALIDATOR_TASK,
+        messages=messages,
+        temperature=0.0,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+    return _llm_response_content(response)
+
+
+def _delete_noise_candidates(
+    *,
+    paths: PalacePaths,
+    candidates: list[dict[str, Any]],
+    backup: bool = True,
+    backup_prefix: str = "llm-clean",
+) -> dict[str, Any]:
+    by_palace: dict[str, list[str]] = {}
+    for item in candidates:
+        palace_name = str(item.get("palace") or "").strip()
+        entity_id = str(item.get("id") or "").strip()
+        if palace_name and entity_id:
+            by_palace.setdefault(palace_name, []).append(entity_id)
+
+    backup_root: Optional[Path] = None
+    if backup and by_palace:
+        backup_root = paths.profile_home / "mempalace" / "backups" / f"{backup_prefix}-{utc_now().replace(':', '').replace('+', 'Z')}"
+        backup_root.mkdir(parents=True, exist_ok=True)
+
+    deleted_entities = 0
+    deleted_triples = 0
+    deleted_orphans = 0
+    cleaned_palaces: list[dict[str, Any]] = []
+    for palace_name, entity_ids in sorted(by_palace.items()):
+        db_path = _db_path(paths, palace_name)
+        if backup_root is not None:
+            shutil.copy2(db_path, backup_root / f"{palace_name}.knowledge_graph.sqlite3")
+        placeholders = ",".join(["?"] * len(entity_ids))
+        with _connect_rw(db_path) as conn:
+            triple_count = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM triples WHERE subject IN ({placeholders}) OR object IN ({placeholders})",
+                    [*entity_ids, *entity_ids],
+                ).fetchone()[0]
+            )
+            conn.execute(
+                f"DELETE FROM triples WHERE subject IN ({placeholders}) OR object IN ({placeholders})",
+                [*entity_ids, *entity_ids],
+            )
+            entity_count = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM entities WHERE id IN ({placeholders})",
+                    entity_ids,
+                ).fetchone()[0]
+            )
+            conn.execute(f"DELETE FROM entities WHERE id IN ({placeholders})", entity_ids)
+            orphan_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entities e
+                    WHERE e.type = 'unknown'
+                      AND NOT EXISTS (SELECT 1 FROM triples t WHERE t.subject = e.id OR t.object = e.id)
+                    """
+                ).fetchone()[0]
+            )
+            conn.execute(
+                """
+                DELETE FROM entities
+                WHERE type = 'unknown'
+                  AND NOT EXISTS (SELECT 1 FROM triples t WHERE t.subject = entities.id OR t.object = entities.id)
+                """
+            )
+            conn.commit()
+        deleted_entities += entity_count
+        deleted_triples += triple_count
+        deleted_orphans += orphan_count
+        cleaned_palaces.append(
+            {
+                "palace": palace_name,
+                "deleted_entities": entity_count,
+                "deleted_triples": triple_count,
+                "deleted_orphans": orphan_count,
+            }
+        )
+
+    return {
+        "deleted_entities": deleted_entities,
+        "deleted_triples": deleted_triples,
+        "deleted_orphans": deleted_orphans,
+        "backup_root": str(backup_root) if backup_root else "",
+        "cleaned_palaces": cleaned_palaces,
+    }
+
+
+def _literal_backup_root(paths: PalacePaths, prefix: str) -> Path:
+    backup_root = paths.profile_home / "mempalace" / "backups" / f"{prefix}-{utc_now().replace(':', '').replace('+', 'Z')}"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    return backup_root
+
+
+def _is_compactable_literal_value(value: Any) -> bool:
+    text = _compact_label(value, max_len=160)
+    if not text or _is_secretish(text) or _looks_like_json_debris(text):
+        return False
+    lower = text.lower()
+    if _is_low_signal_literal(text):
+        return True
+    if re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?(?:\s*(?:g|kg|mg|ml|kcal|cal|%|x|times|раза?))?", lower):
+        return True
+    if re.fullmatch(r"[$€₽]?\s*\d+(?:[.,]\d+)?(?:\s*[$€₽])?", text):
+        return True
+    if _is_unanchored_transient(text):
+        return True
+    if len(text) <= 80 and not re.search(r"[/:\\]|[{}[\]<>]", text):
+        if _NAMED_ENTITY_RE.fullmatch(text):
+            return False
+        if re.search(r"[A-ZА-ЯЁ][a-zа-яё]+(?:\s+[A-ZА-ЯЁ][a-zа-яё]+)+", text):
+            return False
+        return True
+    return False
+
+
+def _literal_fact_key(item: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(item.get("predicate") or ""),
+        str(item.get("value") or ""),
+        str(item.get("source_triple_id") or ""),
+    )
+
+
+def _compact_literal_candidates(
+    *,
+    paths: PalacePaths,
+    candidates: list[dict[str, Any]],
+    exclude_ids: Optional[set[str]] = None,
+    backup: bool = True,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    exclude_ids = exclude_ids or set()
+    by_palace: dict[str, list[str]] = {}
+    for item in candidates:
+        entity_id = str(item.get("id") or "").strip()
+        palace_name = str(item.get("palace") or "").strip()
+        if entity_id and palace_name and entity_id not in exclude_ids and str(item.get("type") or "") == "unknown":
+            by_palace.setdefault(palace_name, []).append(entity_id)
+
+    backup_root: Optional[Path] = None
+    compacted_literals = 0
+    compacted_triples = 0
+    compacted_palaces: list[dict[str, Any]] = []
+    preview_items: list[dict[str, Any]] = []
+
+    for palace_name, raw_entity_ids in sorted(by_palace.items()):
+        db_path = _db_path(paths, palace_name)
+        if not db_path.is_file():
+            continue
+        entity_ids = sorted(set(raw_entity_ids))
+        palace_literals = 0
+        palace_triples = 0
+        with _connect_rw(db_path) as conn:
+            for entity_id in entity_ids:
+                row = conn.execute(
+                    "SELECT id, name, type, properties, created_at FROM entities WHERE id = ?",
+                    (entity_id,),
+                ).fetchone()
+                if row is None or str(row["type"] or "unknown") != "unknown":
+                    continue
+                label = str(row["name"] or "").strip()
+                if not _is_compactable_literal_value(label):
+                    continue
+                incoming = conn.execute(
+                    """
+                    SELECT t.id, t.subject, t.predicate, t.object, t.confidence,
+                           t.source_closet, t.source_file, t.source_drawer_id,
+                           t.adapter_name, t.extracted_at, t.evidence,
+                           s.name AS subject_name, s.type AS subject_type,
+                           s.properties AS subject_properties
+                    FROM triples t
+                    JOIN entities s ON s.id = t.subject
+                    WHERE t.object = ?
+                    """,
+                    (entity_id,),
+                ).fetchall()
+                outgoing_count = int(
+                    conn.execute("SELECT COUNT(*) FROM triples WHERE subject = ?", (entity_id,)).fetchone()[0]
+                )
+                if len(incoming) != 1 or outgoing_count != 0:
+                    continue
+                triple = incoming[0]
+                subject_type = str(triple["subject_type"] or "unknown")
+                predicate = str(triple["predicate"] or "").strip()
+                if subject_type == "unknown" or not predicate or predicate in LOW_SIGNAL_CHAT_RELATIONS:
+                    continue
+
+                subject_props = _decode_properties(triple["subject_properties"])
+                facts = subject_props.get("literal_facts")
+                if not isinstance(facts, list):
+                    facts = []
+                fact = {
+                    "predicate": predicate,
+                    "value": label,
+                    "literal_entity_id": entity_id,
+                    "source_triple_id": triple["id"],
+                    "confidence": float(triple["confidence"] if triple["confidence"] is not None else 1.0),
+                    "source_closet": triple["source_closet"],
+                    "source_file": triple["source_file"],
+                    "source_drawer_id": triple["source_drawer_id"],
+                    "adapter_name": triple["adapter_name"],
+                    "extracted_at": triple["extracted_at"],
+                    "evidence": _decode_properties(triple["evidence"]),
+                    "compacted_at": utc_now(),
+                    "compacted_from": "mempalace_validator",
+                }
+                preview_items.append(
+                    {
+                        "palace": palace_name,
+                        "subject": triple["subject"],
+                        "subject_label": triple["subject_name"],
+                        "literal": entity_id,
+                        "predicate": predicate,
+                        "value": label,
+                        "triple": triple["id"],
+                    }
+                )
+                if dry_run:
+                    palace_literals += 1
+                    palace_triples += 1
+                    continue
+                if backup and backup_root is None:
+                    backup_root = _literal_backup_root(paths, "literal-compact")
+                if backup and backup_root is not None:
+                    backup_file = backup_root / f"{palace_name}.knowledge_graph.sqlite3"
+                    if not backup_file.exists():
+                        shutil.copy2(db_path, backup_file)
+                existing_keys = {_literal_fact_key(item) for item in facts if isinstance(item, dict)}
+                if _literal_fact_key(fact) not in existing_keys:
+                    facts.append(fact)
+                subject_props["literal_facts"] = facts[-200:]
+                conn.execute(
+                    "UPDATE entities SET properties = ? WHERE id = ?",
+                    (json.dumps(subject_props, ensure_ascii=False), triple["subject"]),
+                )
+                conn.execute("DELETE FROM triples WHERE id = ?", (triple["id"],))
+                conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+                palace_literals += 1
+                palace_triples += 1
+            if not dry_run:
+                conn.commit()
+        if palace_literals or palace_triples:
+            compacted_literals += palace_literals
+            compacted_triples += palace_triples
+            compacted_palaces.append(
+                {
+                    "palace": palace_name,
+                    "compacted_literals": palace_literals,
+                    "compacted_triples": palace_triples,
+                }
+            )
+
+    return {
+        "compacted_literals": compacted_literals,
+        "compacted_triples": compacted_triples,
+        "compaction_backup_root": str(backup_root) if backup_root else "",
+        "compacted_palaces": compacted_palaces,
+        "compaction_preview": preview_items[:50] if dry_run else [],
+    }
+
+
+def _validator_label_key(value: Any) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _validator_delete_intent(value: Any) -> bool:
+    text = str(value or "")
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"\b(delete|remove|clean|purge|drop)\b|"
+            r"\b(transient|status|debris|junk|noise|low-signal|low signal|obvious)\b|"
+            r"(удал|очист|мусор|шум|низкосигнал|очевид)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _validator_delete_entries(data: dict[str, Any]) -> list[Any]:
+    for key in ("delete", "delete_ids", "delete_candidates", "remove", "remove_ids", "purge"):
+        value = data.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            return value
+        if isinstance(value, (str, int, float)):
+            return [value]
+    return []
+
+
+def _validator_candidate_label_map(candidates: list[dict[str, Any]]) -> dict[str, Optional[dict[str, Any]]]:
+    by_label: dict[str, Optional[dict[str, Any]]] = {}
+    for item in candidates:
+        key = _validator_label_key(item.get("label"))
+        if not key:
+            continue
+        if key in by_label:
+            by_label[key] = None
+        else:
+            by_label[key] = item
+    return by_label
+
+
+def _validator_resolve_deletes(
+    delete_entries: list[Any],
+    candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    candidate_by_id = {str(item.get("id") or ""): item for item in candidates if str(item.get("id") or "")}
+    candidate_by_label = _validator_candidate_label_map(candidates)
+    selected_by_id: dict[str, dict[str, Any]] = {}
+    normalized_rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for entry in delete_entries:
+        reason = ""
+        raw_id = ""
+        raw_label = ""
+        if isinstance(entry, (str, int, float)):
+            raw_id = str(entry).strip()
+            normalized = {"id": raw_id, "reason": ""}
+        elif isinstance(entry, dict):
+            raw_id = str(
+                entry.get("candidate_id")
+                or entry.get("id")
+                or entry.get("entity_id")
+                or entry.get("node_id")
+                or entry.get("candidate")
+                or ""
+            ).strip()
+            raw_label = str(
+                entry.get("label")
+                or entry.get("name")
+                or entry.get("candidate_label")
+                or entry.get("entity")
+                or ""
+            ).strip()
+            reason = str(entry.get("reason") or entry.get("why") or "").strip()
+            normalized = {"id": raw_id, "label": raw_label, "reason": reason}
+        else:
+            errors.append(f"unsupported delete entry type: {type(entry).__name__}")
+            continue
+
+        matched = candidate_by_id.get(raw_id)
+        if matched is not None:
+            selected_by_id[str(matched.get("id"))] = matched
+            normalized_rows.append({**normalized, "id": str(matched.get("id")), "matched_by": "id"})
+            continue
+
+        if raw_label:
+            label_key = _validator_label_key(raw_label)
+            label_match = candidate_by_label.get(label_key)
+            if label_match is None and label_key in candidate_by_label:
+                errors.append(f"ambiguous delete label {raw_label!r}; exact candidate_id required")
+            elif label_match is not None:
+                selected_by_id[str(label_match.get("id"))] = label_match
+                normalized_rows.append(
+                    {
+                        **normalized,
+                        "id": str(label_match.get("id")),
+                        "label": raw_label,
+                        "matched_by": "unique_label",
+                    }
+                )
+            else:
+                errors.append(f"delete label {raw_label!r} did not match a candidate")
+            continue
+
+        if raw_id:
+            errors.append(f"delete id {raw_id!r} did not match a candidate")
+        else:
+            errors.append("delete entry missing candidate_id")
+
+    return list(selected_by_id.values()), normalized_rows, errors
+
+
+def _record_validation_state(paths: PalacePaths, result: dict[str, Any]) -> None:
+    model_fields = {
+        "last_validation_model": result.get("model", ""),
+        "last_validation_model_provider": result.get("model_provider", ""),
+        "last_validation_model_name": result.get("model_name", ""),
+        "last_validation_model_task": result.get("model_task", LLM_VALIDATOR_TASK),
+    }
+    _set_consolidator_state(
+        paths,
+        {
+            "last_validation_finished_at": result.get("finished_at") or utc_now(),
+            "last_validation_status": result.get("status") or "",
+            "last_validation_summary": result.get("summary") or "",
+            "last_validation_candidates": int(result.get("total_candidates") or 0),
+            "last_validation_selected": len(result.get("selected") or []),
+            "last_validation_deleted_entities": int(result.get("deleted_entities") or 0),
+            "last_validation_deleted_triples": int(result.get("deleted_triples") or 0),
+            "last_validation_compacted_literals": int(result.get("compacted_literals") or 0),
+            "last_validation_compacted_triples": int(result.get("compacted_triples") or 0),
+            "last_validation_contract_error": bool(result.get("validator_contract_error", False)),
+            **model_fields,
+        },
+    )
+
+
+def validate_and_clean_noise_with_llm(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    palace: str = "",
+    dry_run: bool = False,
+    backup: bool = True,
+    max_candidates: int = LLM_VALIDATOR_MAX_CANDIDATES,
+    llm_call: Optional[Callable[..., str]] = None,
+) -> dict[str, Any]:
+    paths = palace_paths(profile, profile_home=profile_home)
+    max_candidates = max(1, min(int(max_candidates or LLM_VALIDATOR_MAX_CANDIDATES), 300))
+    preview = scan_noise(
+        profile=paths.profile,
+        profile_home=paths.profile_home,
+        palace=palace,
+        limit=max_candidates,
+    )
+    candidates = list(preview.get("candidates") or [])[:max_candidates]
+    model_fields = _llm_event_model_fields(LLM_VALIDATOR_TASK)
+    started_at = utc_now()
+    if not candidates:
+        result = {
+            **preview,
+            "enabled": True,
+            "automatic": True,
+            "dry_run": dry_run,
+            "validator": True,
+            "status": "success",
+            "selected": [],
+            "kept": [],
+            "summary": "No noise candidates.",
+            "deleted_entities": 0,
+            "deleted_triples": 0,
+            "deleted_orphans": 0,
+            "backup_root": "",
+            "cleaned_palaces": [],
+            "compacted_literals": 0,
+            "compacted_triples": 0,
+            "compaction_backup_root": "",
+            "compacted_palaces": [],
+            "finished_at": utc_now(),
+            **model_fields,
+        }
+        _record_validation_state(paths, result)
+        _append_consolidator_event(
+            paths,
+            {
+                "level": "info",
+                "message": "MemPalace validation clean: no cleanup candidates",
+                "status": "success",
+                "candidates": 0,
+                **model_fields,
+            },
+        )
+        return result
+
+    compact_candidates = [
+        {
+            "candidate_id": item.get("id"),
+            "id": item.get("id"),
+            "index": idx + 1,
+            "palace": item.get("palace"),
+            "label": item.get("label"),
+            "type": item.get("type"),
+            "description": item.get("description"),
+            "degree": item.get("degree"),
+            "rule_reason": item.get("reason"),
+            "predicates": item.get("predicates", [])[:8],
+            "triples": [
+                {
+                    "predicate": triple.get("predicate"),
+                    "object": str(triple.get("object") or "")[:120],
+                }
+                for triple in (item.get("triples") or [])[:4]
+            ],
+        }
+        for idx, item in enumerate(candidates)
+    ]
+    caller = llm_call or _call_validator_llm
+    raw = caller(
+        [
+            {"role": "system", "content": _MEMORY_VALIDATOR_SYSTEM},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "profile": paths.profile,
+                        "palace": palace or "all",
+                        "candidates": compact_candidates,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        timeout=LLM_VALIDATOR_DEFAULT_TIMEOUT,
+        max_tokens=3072,
+    )
+    data = _json_object_from_llm_text(raw)
+    delete_entries = _validator_delete_entries(data)
+    keep_rows = [item for item in data.get("keep", []) if isinstance(item, dict)]
+    selected, delete_rows, contract_errors = _validator_resolve_deletes(delete_entries, candidates)
+    summary = str(data.get("summary") or "")
+    delete_intent_without_ids = (
+        not delete_entries
+        and not selected
+        and _validator_delete_intent(summary)
+        and not re.search(r"\b(no|none|nothing|keep|kept|нет|ничего|остав)\b", summary, re.IGNORECASE)
+    )
+    if delete_intent_without_ids:
+        contract_errors.append("validator summary implies deletion but no exact candidate_ids were provided")
+    validator_contract_error = bool(contract_errors)
+    if validator_contract_error:
+        selected = []
+    deleted = (
+        {"deleted_entities": 0, "deleted_triples": 0, "deleted_orphans": 0, "backup_root": "", "cleaned_palaces": []}
+        if dry_run or not selected
+        else _delete_noise_candidates(paths=paths, candidates=selected, backup=backup, backup_prefix="llm-clean")
+    )
+    selected_ids = {str(item.get("id") or "") for item in selected}
+    compacted = (
+        {"compacted_literals": 0, "compacted_triples": 0, "compaction_backup_root": "", "compacted_palaces": [], "compaction_preview": []}
+        if validator_contract_error
+        else _compact_literal_candidates(
+            paths=paths,
+            candidates=candidates,
+            exclude_ids=selected_ids,
+            backup=backup,
+            dry_run=dry_run,
+        )
+    )
+    result = {
+        **preview,
+        "enabled": True,
+        "automatic": True,
+        "dry_run": dry_run,
+        "validator": True,
+        "status": "contract_error" if validator_contract_error else "success",
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "validator_contract_error": validator_contract_error,
+        "validator_contract_errors": contract_errors,
+        "selected": [
+            {
+                **item,
+                "validator_reason": next((row.get("reason", "") for row in delete_rows if str(row.get("id")) == str(item.get("id"))), ""),
+                "validator_matched_by": next((row.get("matched_by", "") for row in delete_rows if str(row.get("id")) == str(item.get("id"))), ""),
+            }
+            for item in selected
+        ],
+        "kept": keep_rows,
+        "summary": summary,
+        **deleted,
+        **compacted,
+        **model_fields,
+    }
+    _record_validation_state(paths, result)
+    _append_consolidator_event(
+        paths,
+        {
+            "level": "info",
+            "message": "MemPalace validation finished",
+            "status": "success",
+            "validator_status": result["status"],
+            "validator_contract_error": validator_contract_error,
+            "candidates": len(candidates),
+            "selected": len(selected),
+            "deleted_entities": result["deleted_entities"],
+            "deleted_triples": result["deleted_triples"],
+            "compacted_literals": result["compacted_literals"],
+            "compacted_triples": result["compacted_triples"],
+            **model_fields,
+        },
+    )
+    return result
 
 
 def auto_clean_noise(
@@ -828,6 +1658,84 @@ def auto_clean_palaces(
         )
         for name in names
     ]
+
+
+def _validator_clean_palaces(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    palaces: Optional[Iterable[str]] = None,
+    enabled: bool = True,
+    backup: bool = True,
+    max_candidates: int = LLM_VALIDATOR_MAX_CANDIDATES,
+) -> list[dict[str, Any]]:
+    paths = palace_paths(profile, profile_home=profile_home)
+    names = sorted({validate_palace_name(str(item)) for item in (palaces or []) if str(item or "").strip()})
+    if not names:
+        names = [""]
+    results: list[dict[str, Any]] = []
+    for name in names:
+        if not enabled:
+            results.append(
+                {
+                    "profile": paths.profile,
+                    "palace": name,
+                    "enabled": False,
+                    "automatic": True,
+                    "validator": True,
+                    "skipped": True,
+                    "skip_reason": "disabled",
+                    "total_candidates": 0,
+                    "returned": 0,
+                    "limited": False,
+                    "by_palace": [],
+                    "candidates": [],
+                    "dry_run": True,
+                    "deleted_entities": 0,
+                    "deleted_triples": 0,
+                    "deleted_orphans": 0,
+                    "backup_root": "",
+                    "cleaned_palaces": [],
+                }
+            )
+            continue
+        try:
+            results.append(
+                validate_and_clean_noise_with_llm(
+                    profile=paths.profile,
+                    profile_home=paths.profile_home,
+                    palace=name,
+                    dry_run=False,
+                    backup=backup,
+                    max_candidates=max_candidates,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "profile": paths.profile,
+                    "palace": name,
+                    "enabled": True,
+                    "automatic": True,
+                    "validator": True,
+                    "status": "error",
+                    "skipped": True,
+                    "skip_reason": str(exc),
+                    "total_candidates": 0,
+                    "returned": 0,
+                    "limited": False,
+                    "by_palace": [],
+                    "candidates": [],
+                    "dry_run": True,
+                    "deleted_entities": 0,
+                    "deleted_triples": 0,
+                    "deleted_orphans": 0,
+                    "backup_root": "",
+                    "cleaned_palaces": [],
+                    **_llm_event_model_fields(LLM_VALIDATOR_TASK),
+                }
+            )
+    return results
 
 
 def load_graph(
@@ -1413,6 +2321,10 @@ def search(
                 entity_params,
             ):
                 props = _decode_properties(row["properties"])
+                literal_snippet = _literal_facts_snippet(props)
+                snippet = props.get("description", "")
+                if literal_snippet:
+                    snippet = f"{snippet}; {literal_snippet}" if snippet else literal_snippet
                 results.append(
                     {
                         "kind": "entity",
@@ -1420,7 +2332,7 @@ def search(
                         "id": row["id"],
                         "title": row["name"],
                         "subtitle": row["type"] or "unknown",
-                        "snippet": props.get("description", ""),
+                        "snippet": snippet,
                         "created_at": row["created_at"],
                     }
                 )
@@ -1586,6 +2498,13 @@ def _write_refresh_state(paths: PalacePaths, state: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _update_refresh_state(paths: PalacePaths, updates: dict[str, Any]) -> dict[str, Any]:
+    state = _read_refresh_state(paths)
+    state.update(updates)
+    _write_refresh_state(paths, state)
+    return state
+
+
 def _acquire_refresh_lock(paths: PalacePaths, *, stale_after: int = 30 * 60) -> Optional[Path]:
     lock_path = paths.profile_home / "mempalace" / "refresh.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1615,6 +2534,27 @@ def _release_refresh_lock(lock_path: Optional[Path]) -> None:
         lock_path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _lock_owner_pid(lock_path: Path) -> Optional[int]:
+    try:
+        first = lock_path.read_text(encoding="utf-8").split()[0]
+        pid = int(first)
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
 
 
 def _state_db_path(path: Optional[Path] = None) -> Path:
@@ -1700,6 +2640,38 @@ def _session_index_signature(state_db_path: Optional[Path] = None) -> str:
 
 def _parse_access_scope(scope: str) -> dict[str, str]:
     raw = str(scope or "").strip()
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else payload
+            parsed: dict[str, str] = {}
+            for key in (
+                "platform",
+                "chat_type",
+                "chat_id",
+                "thread_id",
+                "chat_name",
+                "chat_topic",
+                "user_id",
+                "user_name",
+                "memory_scope",
+                "session_key",
+            ):
+                value = origin.get(key) if isinstance(origin, dict) else None
+                if value not in (None, ""):
+                    parsed[key] = str(value)
+            profile_name = origin.get("profile_name") if isinstance(origin, dict) else None
+            scope_name = origin.get("scope_name") if isinstance(origin, dict) else None
+            if profile_name not in (None, ""):
+                parsed["profile"] = str(profile_name)
+            if scope_name not in (None, ""):
+                parsed["scope"] = str(scope_name)
+            if isinstance(payload.get("session_key"), str):
+                parsed.setdefault("session_key", payload["session_key"])
+            return parsed
     match = _ACCESS_SCOPE_RE.match(raw)
     if match:
         return {key: str(value or "") for key, value in match.groupdict().items()}
@@ -1721,6 +2693,23 @@ def _parse_access_scope(scope: str) -> dict[str, str]:
     return parsed
 
 
+def _origin_for_history_session(
+    row: sqlite3.Row,
+    session_lookup: Optional[dict[str, dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    parsed = _parse_access_scope(row["access_scope"] if "access_scope" in row.keys() else "")
+    origin: dict[str, Any] = {}
+    if parsed:
+        origin.update(parsed)
+        if parsed.get("profile"):
+            origin["profile_name"] = parsed["profile"]
+        if parsed.get("scope"):
+            origin["scope_name"] = parsed["scope"]
+    lookup_origin = (session_lookup or {}).get(str(row["id"])) or {}
+    origin.update({key: value for key, value in lookup_origin.items() if value not in (None, "")})
+    return origin
+
+
 def _profile_for_history_session(
     row: sqlite3.Row,
     *,
@@ -1728,7 +2717,7 @@ def _profile_for_history_session(
     routes: dict[tuple[str, str], str],
     session_lookup: Optional[dict[str, dict[str, Any]]] = None,
 ) -> str:
-    origin = (session_lookup or {}).get(str(row["id"])) or {}
+    origin = _origin_for_history_session(row, session_lookup)
     origin_profile = str(origin.get("profile_name") or "").strip()
     if origin_profile:
         return origin_profile
@@ -1746,7 +2735,26 @@ def _profile_for_history_session(
     return default_profile
 
 
-def _history_palace_for_session(row: sqlite3.Row) -> str:
+def _history_palace_for_session(
+    row: sqlite3.Row,
+    origin: Optional[dict[str, Any]] = None,
+) -> str:
+    origin = origin or _origin_for_history_session(row)
+    platform = str(origin.get("platform") or row["source"] or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    thread_id = str(origin.get("thread_id") or "").strip()
+    if platform == "telegram" and thread_id:
+        for candidate in (
+            origin.get("memory_scope"),
+            origin.get("scope_name"),
+            origin.get("chat_topic"),
+        ):
+            label = re.sub(r"[^a-z0-9]+", "_", str(candidate or "").lower()).strip("_")
+            if label and label != "default":
+                return validate_palace_name(f"telegram_{label}"[:80])
+        chat_part = re.sub(r"[^0-9a-z]+", "_", chat_id.lower()).strip("_") or "chat"
+        thread_part = re.sub(r"[^0-9a-z]+", "_", thread_id.lower()).strip("_")
+        return validate_palace_name(f"tg_{chat_part}_{thread_part}"[:80])
     source = re.sub(r"[^a-z0-9]+", "_", str(row["source"] or "session").lower()).strip("_") or "session"
     return validate_palace_name(f"history_{source}"[:80])
 
@@ -1985,14 +2993,20 @@ def _upsert_triple(
     source_file: str = "",
     source_closet: str = "",
     adapter_name: str = "hermes_markdown",
+    evidence: str | dict[str, Any] | None = None,
 ) -> None:
+    evidence_text = (
+        json.dumps(evidence, ensure_ascii=False)
+        if isinstance(evidence, dict)
+        else str(evidence or "")
+    )
     conn.execute(
         """
         INSERT INTO triples(
             id, subject, predicate, object, confidence, source_closet,
-            source_file, adapter_name, extracted_at
+            source_file, adapter_name, evidence, extracted_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             subject = excluded.subject,
             predicate = excluded.predicate,
@@ -2001,6 +3015,7 @@ def _upsert_triple(
             source_closet = excluded.source_closet,
             source_file = excluded.source_file,
             adapter_name = excluded.adapter_name,
+            evidence = excluded.evidence,
             extracted_at = excluded.extracted_at
         """,
         (
@@ -2012,9 +3027,1629 @@ def _upsert_triple(
             source_closet,
             source_file,
             adapter_name,
+            evidence_text,
             utc_now(),
         ),
     )
+
+
+def _coerce_float(value: Any, default: float = 0.84) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(0.05, min(number, 1.0))
+
+
+def _safe_message_id(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_label(value: Any, *, max_len: int = 120) -> str:
+    text = _CONTROL_RE.sub(" ", str(value or ""))
+    text = " ".join(text.strip(" \t\r\n\"'`[]{}()<>").split())
+    if len(text) > max_len:
+        text = text[:max_len].rstrip()
+    return text
+
+
+def _is_secretish(value: Any) -> bool:
+    text = str(value or "")
+    if not text:
+        return False
+    return bool(_SECRET_RE.search(text))
+
+
+def _looks_like_json_debris(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _INTERNAL_DEBRIS_RE.search(text):
+        return True
+    if len(text) > 40 and text[:1] in "{[" and re.search(r"['\"]\w+['\"]\s*:", text):
+        return True
+    return False
+
+
+def _is_low_signal_literal(value: Any) -> bool:
+    text = _compact_label(value, max_len=180)
+    lower = text.lower()
+    if not text:
+        return True
+    if _LOW_SIGNAL_LITERAL_RE.fullmatch(lower):
+        return True
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", lower):
+        return True
+    if _TELEGRAM_ID_RE.fullmatch(lower) or _TELEGRAM_ID_RE.search(lower):
+        return True
+    return False
+
+
+def _is_unanchored_transient(value: Any) -> bool:
+    text = str(value or "")
+    if not text:
+        return False
+    if _DURABLE_TIME_ANCHOR_RE.search(text):
+        return False
+    compact = _compact_label(text, max_len=180)
+    return bool(_TRANSIENT_TOKEN_RE.fullmatch(compact) or _TRANSIENT_VALUE_RE.search(text))
+
+
+def _is_noise_entity_label(label: Any) -> bool:
+    text = _compact_label(label, max_len=240)
+    return _is_low_signal_literal(text) or _looks_like_json_debris(text) or _is_unanchored_transient(text)
+
+
+def _is_noise_predicate(predicate: Any) -> bool:
+    value = _llm_predicate(predicate)
+    return value in TRANSIENT_PREDICATES or value in LOW_SIGNAL_CHAT_RELATIONS
+
+
+def _triple_evidence_payload(
+    *,
+    message_ids: Optional[list[int]] = None,
+    source_file: str = "",
+    source_closet: str = "",
+    adapter_name: str = "",
+) -> str:
+    payload: dict[str, Any] = {}
+    ids = sorted({int(item) for item in (message_ids or []) if _safe_message_id(item) is not None})
+    if ids:
+        payload["message_ids"] = ids[:24]
+    if source_file:
+        payload["source_file"] = source_file
+    if source_closet:
+        payload["source_closet"] = source_closet
+    if adapter_name:
+        payload["adapter_name"] = adapter_name
+    return json.dumps(payload, ensure_ascii=False) if payload else ""
+
+
+def _llm_entity_type(raw_type: Any, name: str) -> str:
+    value = str(raw_type or "").strip().lower().replace(" ", "_").replace("-", "_")
+    value = _LLM_TYPE_ALIASES.get(value, value)
+    if value in _LLM_ALLOWED_ENTITY_TYPES:
+        return value
+    if re.search(r"\.(?:py|ts|tsx|js|json|md|yaml|sqlite3?)$|/", name):
+        return "artifact"
+    if name.startswith("profile:"):
+        return "profile"
+    return _history_entity_type(name)
+
+
+def _llm_predicate(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    raw = _PREDICATE_RE.sub("_", raw).strip("_")
+    raw = re.sub(r"_+", "_", raw)
+    return raw[:64] or "relates_to"
+
+
+def _json_from_llm_text(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("LLM extractor did not return JSON")
+        data = json.loads(raw[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("LLM extractor JSON must be an object")
+    normalized: dict[str, Any] = {}
+    for key in ("entities", "facts", "relations", "contradictions"):
+        value = data.get(key)
+        normalized[key] = value if isinstance(value, list) else []
+    return normalized
+
+
+def _json_object_from_llm_text(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("LLM did not return JSON")
+        data = json.loads(raw[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("LLM JSON must be an object")
+    return data
+
+
+def _llm_response_content(response: Any) -> str:
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        if choices:
+            message = (choices[0] or {}).get("message") or {}
+            return str(message.get("content") or "")
+        return str(response.get("content") or "")
+    choices = getattr(response, "choices", None)
+    if choices:
+        message = getattr(choices[0], "message", None)
+        return str(getattr(message, "content", "") or "")
+    return str(getattr(response, "content", "") or "")
+
+
+def _call_history_llm(
+    messages: list[dict[str, str]],
+    *,
+    timeout: int = LLM_CONSOLIDATOR_DEFAULT_TIMEOUT,
+    max_tokens: int = 4096,
+) -> str:
+    from agent.auxiliary_client import call_llm
+
+    response = call_llm(
+        task=LLM_CONSOLIDATOR_TASK,
+        messages=messages,
+        temperature=0.1,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+    return _llm_response_content(response)
+
+
+def llm_task_model_config(task: str = LLM_CONSOLIDATOR_TASK) -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    task_cfg = (cfg.get("auxiliary") or {}).get(task) or {}
+    fallback = task_cfg.get("fallback_chain") or []
+    primary = {
+        "role": "Primary",
+        "provider": task_cfg.get("provider") or "auto",
+        "model": task_cfg.get("model") or "",
+    }
+    models = [primary]
+    for item in fallback:
+        if isinstance(item, dict):
+            models.append(
+                {
+                    "role": "Fallback",
+                    "provider": item.get("provider") or "auto",
+                    "model": item.get("model") or "",
+                }
+            )
+    label = f"{primary['provider']} / {primary['model'] or 'main model'}"
+    return {
+        "task": task,
+        "primary": primary,
+        "models": models,
+        "label": label,
+    }
+
+
+def _llm_event_model_fields(task: str = LLM_CONSOLIDATOR_TASK) -> dict[str, Any]:
+    config = llm_task_model_config(task)
+    primary = config.get("primary") or {}
+    return {
+        "model": config.get("label") or "auto / main model",
+        "model_provider": primary.get("provider") or "auto",
+        "model_name": primary.get("model") or "",
+        "model_task": task,
+    }
+
+
+def _extract_llm_payload(
+    *,
+    profile: str,
+    palace: str,
+    batch_messages: list[dict[str, Any]],
+    llm_call: Optional[Callable[..., str]] = None,
+) -> dict[str, Any]:
+    payload = {
+        "profile": profile,
+        "palace": palace,
+        "messages": batch_messages,
+    }
+    user_prompt = (
+        "Extract durable MemPalace memory from this profile-scoped batch.\n"
+        "Return JSON only.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+    caller = llm_call or _call_history_llm
+    raw = caller(
+        [
+            {"role": "system", "content": _MEMORY_EXTRACTOR_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        timeout=LLM_CONSOLIDATOR_DEFAULT_TIMEOUT,
+        max_tokens=4096,
+    )
+    return _json_from_llm_text(raw)
+
+
+def _session_title(session: sqlite3.Row, origin: dict[str, Any]) -> str:
+    return (
+        str(session["title"] or "").strip()
+        or str(origin.get("chat_topic") or "").strip()
+        or str(origin.get("display_name") or origin.get("chat_name") or "").strip()
+        or f"{session['source']} session {session['id']}"
+    )
+
+
+def _batch_message_payload(
+    message: sqlite3.Row,
+    session: sqlite3.Row,
+    origin: dict[str, Any],
+) -> dict[str, Any]:
+    parsed_scope = _parse_access_scope(session["access_scope"] if "access_scope" in session.keys() else "")
+    content = _clean_history_content(message["content"])[:LLM_CONSOLIDATOR_MAX_TEXT_CHARS]
+    return {
+        "id": int(message["id"]),
+        "session_id": str(message["session_id"]),
+        "role": str(message["role"] or ""),
+        "timestamp": message["timestamp"],
+        "source": str(origin.get("platform") or session["source"] or ""),
+        "title": _session_title(session, origin)[:160],
+        "chat_id": origin.get("chat_id", parsed_scope.get("chat_id", "")),
+        "chat_type": origin.get("chat_type", parsed_scope.get("chat_type", "")),
+        "chat_name": origin.get("chat_name", origin.get("display_name", "")),
+        "chat_topic": origin.get("chat_topic", ""),
+        "user_name": origin.get("user_name", ""),
+        "content": content,
+    }
+
+
+def _profile_sessions(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    default_profile: str,
+    routes: dict[tuple[str, str], str],
+    session_lookup: dict[str, dict[str, Any]],
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT id, source, user_id, access_scope, title, started_at, ended_at,
+               message_count, cwd
+        FROM sessions
+        WHERE COALESCE(message_count, 0) > 0
+        ORDER BY started_at ASC
+        """
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if _profile_for_history_session(
+            row,
+            default_profile=default_profile,
+            routes=routes,
+            session_lookup=session_lookup,
+        )
+        == profile
+    ]
+
+
+def _chunked(values: list[str], size: int = 700) -> Iterable[list[str]]:
+    for idx in range(0, len(values), size):
+        yield values[idx : idx + size]
+
+
+def _profile_message_counts(
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+    *,
+    after_id: int = 0,
+) -> dict[str, int]:
+    if not session_ids:
+        return {"total": 0, "max_id": 0}
+    total = 0
+    max_id = 0
+    for chunk in _chunked(session_ids):
+        placeholders = ",".join(["?"] * len(chunk))
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id
+            FROM messages
+            WHERE active = 1
+              AND role IN ('user', 'assistant')
+              AND content IS NOT NULL
+              AND id > ?
+              AND session_id IN ({placeholders})
+            """,
+            [after_id, *chunk],
+        ).fetchone()
+        total += int(row["count"] or 0)
+        max_id = max(max_id, int(row["max_id"] or 0))
+    return {"total": total, "max_id": max_id}
+
+
+def _fetch_profile_messages(
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+    *,
+    after_id: int,
+    limit: int,
+) -> list[sqlite3.Row]:
+    if not session_ids:
+        return []
+    rows: list[sqlite3.Row] = []
+    for chunk in _chunked(session_ids):
+        placeholders = ",".join(["?"] * len(chunk))
+        rows.extend(
+            conn.execute(
+                f"""
+                SELECT id, session_id, role, content, tool_name, timestamp
+                FROM messages
+                WHERE active = 1
+                  AND role IN ('user', 'assistant')
+                  AND content IS NOT NULL
+                  AND id > ?
+                  AND session_id IN ({placeholders})
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                [after_id, *chunk, limit],
+            ).fetchall()
+        )
+    rows.sort(key=lambda row: int(row["id"]))
+    return rows[:limit]
+
+
+def _consolidator_state(state: dict[str, Any]) -> dict[str, Any]:
+    raw = state.get(LLM_CONSOLIDATOR_STATE_KEY)
+    current = dict(raw) if isinstance(raw, dict) else {}
+    current.setdefault("auto_enabled", True)
+    current.setdefault("paused", False)
+    return current
+
+
+def _set_consolidator_state(paths: PalacePaths, updates: dict[str, Any]) -> dict[str, Any]:
+    state = _read_refresh_state(paths)
+    current = _consolidator_state(state)
+    current.update(updates)
+    state[LLM_CONSOLIDATOR_STATE_KEY] = current
+    state.setdefault("profile", paths.profile)
+    _write_refresh_state(paths, state)
+    return current
+
+
+def _clear_history_palaces(paths: PalacePaths, *, backup: bool = True) -> dict[str, Any]:
+    names = [
+        row["palace"]
+        for row in list_palaces(profile=paths.profile, profile_home=paths.profile_home, include_stats=False)
+        if str(row["palace"]).startswith("history_")
+    ]
+    if not names:
+        return {"removed": [], "backup_root": ""}
+    backup_root = ""
+    if backup:
+        backup_dir = (
+            paths.profile_home
+            / "mempalace"
+            / "backups"
+            / f"llm-backfill-{utc_now().replace(':', '').replace('+', 'Z')}"
+        )
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_root = str(backup_dir)
+    for name in names:
+        root = paths.storage_root / name
+        if not root.exists():
+            continue
+        if backup_root:
+            shutil.copytree(root, Path(backup_root) / name, dirs_exist_ok=True)
+        shutil.rmtree(root)
+    return {"removed": names, "backup_root": backup_root}
+
+
+def _entity_source_props(
+    *,
+    profile: str,
+    palace: str,
+    description: str,
+    confidence: float,
+    source_ids: list[int],
+) -> dict[str, Any]:
+    props: dict[str, Any] = {
+        "description": description,
+        "profile_name": profile,
+        "palace": palace,
+        "adapter_name": LLM_CONSOLIDATOR_ADAPTER,
+        "confidence": confidence,
+    }
+    if source_ids:
+        props["source_message_ids"] = source_ids[:24]
+    return props
+
+
+def _write_llm_extraction(
+    *,
+    paths: PalacePaths,
+    palace: str,
+    extraction: dict[str, Any],
+    batch_messages: list[dict[str, Any]],
+) -> dict[str, int]:
+    db_path = _db_path(paths, palace)
+    all_message_ids = sorted(
+        {
+            int(item["id"])
+            for item in batch_messages
+            if _safe_message_id(item.get("id")) is not None
+        }
+    )
+    min_id = all_message_ids[0] if all_message_ids else 0
+    max_id = all_message_ids[-1] if all_message_ids else 0
+    source_closet = f"state.db:{palace}:{min_id}-{max_id}"
+
+    def evidence_ids(item: dict[str, Any]) -> list[int]:
+        raw = item.get("evidence_message_ids")
+        values = raw if isinstance(raw, list) else []
+        ids = [safe for safe in (_safe_message_id(v) for v in values) if safe is not None]
+        batch_ids = set(all_message_ids)
+        return sorted({item_id for item_id in ids if item_id in batch_ids})[:24]
+
+    def evidence_for(item: dict[str, Any]) -> str:
+        return _triple_evidence_payload(
+            message_ids=evidence_ids(item),
+            source_closet=source_closet,
+            adapter_name=LLM_CONSOLIDATOR_ADAPTER,
+        )
+
+    entity_specs: dict[str, dict[str, Any]] = {}
+    for item in extraction.get("entities", []):
+        if not isinstance(item, dict):
+            continue
+        name = _compact_label(item.get("name"))
+        if len(name) < 2 or _is_secretish(name) or _is_noise_entity_label(name):
+            continue
+        entity_specs[name.lower()] = {
+            "name": name,
+            "type": _llm_entity_type(item.get("type"), name),
+            "description": _compact_label(item.get("description"), max_len=360),
+            "confidence": _coerce_float(item.get("confidence"), 0.84),
+            "source_ids": evidence_ids(item),
+        }
+
+    def ensure_entity(
+        conn: sqlite3.Connection,
+        name: Any,
+        *,
+        raw_type: Any = "concept",
+        description: str = "",
+        confidence: float = 0.82,
+        source_ids: Optional[list[int]] = None,
+    ) -> Optional[str]:
+        label = _compact_label(name)
+        if len(label) < 2 or _is_secretish(label) or _looks_like_json_debris(label):
+            return None
+        if _is_low_signal_literal(label) or _is_unanchored_transient(label):
+            return None
+        key = label.lower()
+        spec = entity_specs.get(key)
+        entity_type = _llm_entity_type((spec or {}).get("type") or raw_type, label)
+        entity_id = _stable_id("entity", key)
+        _upsert_entity(
+            conn,
+            entity_id,
+            label,
+            entity_type,
+            _entity_source_props(
+                profile=paths.profile,
+                palace=palace,
+                description=(spec or {}).get("description") or description,
+                confidence=_coerce_float((spec or {}).get("confidence"), confidence),
+                source_ids=(spec or {}).get("source_ids") or source_ids or all_message_ids,
+            ),
+        )
+        return entity_id
+
+    written_entities = 0
+    written_triples = 0
+    skipped = 0
+    with _connect_rw(db_path) as conn:
+        for spec in entity_specs.values():
+            if ensure_entity(
+                conn,
+                spec["name"],
+                raw_type=spec["type"],
+                description=spec.get("description") or "",
+                confidence=spec.get("confidence") or 0.84,
+                source_ids=spec.get("source_ids") or all_message_ids,
+            ):
+                written_entities += 1
+
+        for item in extraction.get("facts", []):
+            if not isinstance(item, dict):
+                continue
+            item_evidence_ids = evidence_ids(item)
+            if not item_evidence_ids:
+                skipped += 1
+                continue
+            predicate = _llm_predicate(item.get("predicate"))
+            subject_name = _compact_label(item.get("subject"))
+            object_name = _compact_label(item.get("object"), max_len=420)
+            if not subject_name or not object_name or _is_secretish(object_name):
+                skipped += 1
+                continue
+            if _looks_like_json_debris(subject_name) or _looks_like_json_debris(object_name):
+                skipped += 1
+                continue
+            if _is_noise_predicate(predicate):
+                skipped += 1
+                continue
+            if _is_low_signal_literal(object_name) or _is_unanchored_transient(object_name):
+                skipped += 1
+                continue
+            if predicate in LOW_SIGNAL_PREDICATES and _TRANSIENT_VALUE_RE.search(object_name):
+                skipped += 1
+                continue
+            subject_id = ensure_entity(conn, subject_name, raw_type="concept", source_ids=item_evidence_ids)
+            if not subject_id:
+                skipped += 1
+                continue
+            object_key = object_name.lower()
+            if object_key in entity_specs:
+                object_id = ensure_entity(conn, object_name, source_ids=item_evidence_ids)
+            else:
+                object_id = _stable_id("literal", subject_name, predicate, object_name)
+                _upsert_entity(
+                    conn,
+                    object_id,
+                    object_name,
+                    "unknown",
+                    _entity_source_props(
+                        profile=paths.profile,
+                        palace=palace,
+                        description=object_name,
+                        confidence=_coerce_float(item.get("confidence"), 0.8),
+                        source_ids=item_evidence_ids,
+                    ),
+                )
+            if not object_id:
+                skipped += 1
+                continue
+            _upsert_triple(
+                conn,
+                _stable_id("hllm_fact", subject_id, predicate, object_id),
+                subject_id,
+                predicate,
+                object_id,
+                confidence=_coerce_float(item.get("confidence"), 0.82),
+                source_closet=source_closet,
+                adapter_name=LLM_CONSOLIDATOR_ADAPTER,
+                evidence=evidence_for(item),
+            )
+            written_triples += 1
+
+        for item in extraction.get("relations", []):
+            if not isinstance(item, dict):
+                continue
+            item_evidence_ids = evidence_ids(item)
+            if not item_evidence_ids:
+                skipped += 1
+                continue
+            subject_name = _compact_label(item.get("subject"))
+            object_name = _compact_label(item.get("object"))
+            predicate = _llm_predicate(item.get("predicate"))
+            if not subject_name or not object_name or _is_secretish(subject_name) or _is_secretish(object_name):
+                skipped += 1
+                continue
+            if _looks_like_json_debris(subject_name) or _looks_like_json_debris(object_name):
+                skipped += 1
+                continue
+            if _is_noise_predicate(predicate):
+                skipped += 1
+                continue
+            subject_id = ensure_entity(conn, subject_name, raw_type="concept", source_ids=item_evidence_ids)
+            object_id = ensure_entity(conn, object_name, raw_type="concept", source_ids=item_evidence_ids)
+            if not subject_id or not object_id or subject_id == object_id:
+                skipped += 1
+                continue
+            _upsert_triple(
+                conn,
+                _stable_id("hllm_rel", subject_id, predicate, object_id),
+                subject_id,
+                predicate,
+                object_id,
+                confidence=_coerce_float(item.get("confidence"), 0.84),
+                source_closet=source_closet,
+                adapter_name=LLM_CONSOLIDATOR_ADAPTER,
+                evidence=evidence_for(item),
+            )
+            written_triples += 1
+
+        for item in extraction.get("contradictions", []):
+            if not isinstance(item, dict):
+                continue
+            skipped += 1
+        conn.commit()
+    return {"entities": written_entities, "triples": written_triples, "skipped": skipped}
+
+
+def consolidator_status(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    state_db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    paths = palace_paths(profile, profile_home=profile_home)
+    state = _read_refresh_state(paths)
+    cstate = _consolidator_state(state)
+    lock_path = paths.profile_home / "mempalace" / "refresh.lock"
+    running = bool(cstate.get("running", False))
+    stale = False
+    if running:
+        run_age = _iso_age_seconds(cstate.get("last_started_at"))
+        lock_age = time.time() - lock_path.stat().st_mtime if lock_path.exists() else None
+        lock_pid = _lock_owner_pid(lock_path) if lock_path.exists() else None
+        owner_pid = int(cstate.get("owner_pid") or lock_pid or 0)
+        owner_dead = bool(owner_pid and not _pid_exists(owner_pid))
+        stale = bool(
+            owner_dead
+            or (run_age is not None and run_age > LLM_CONSOLIDATOR_STALE_SECONDS)
+            and (lock_age is None or lock_age > LLM_CONSOLIDATOR_STALE_SECONDS)
+        )
+        if stale:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            cstate = _set_consolidator_state(
+                paths,
+                {
+                    "running": False,
+                    "stale": True,
+                    "phase": "stale",
+                    "current": {},
+                    "last_error": (
+                        "stale run recovered: dashboard process stopped before cleanup"
+                        if owner_dead
+                        else "stale run recovered: no extractor activity"
+                    ),
+                    "last_finished_at": utc_now(),
+                },
+            )
+            _append_consolidator_event(
+                paths,
+                {
+                    "level": "warning",
+                    "message": "Recovered stale MemPalace run",
+                    "run_age_seconds": int(run_age or 0),
+                    "owner_pid": owner_pid or None,
+                },
+            )
+            running = False
+    cursor = int(cstate.get("cursor_message_id") or 0)
+    status: dict[str, Any] = {
+        "profile": paths.profile,
+        "profile_home": str(paths.profile_home),
+        "task": LLM_CONSOLIDATOR_TASK,
+        "adapter": LLM_CONSOLIDATOR_ADAPTER,
+        "cursor_message_id": cursor,
+        "auto_enabled": bool(cstate.get("auto_enabled", False)),
+        "paused": bool(cstate.get("paused", False)),
+        "running": running,
+        "stale": bool(cstate.get("stale", False)),
+        "phase": cstate.get("phase", ""),
+        "current": cstate.get("current", {}),
+        "events": cstate.get("events", []),
+        "last_started_at": cstate.get("last_started_at", ""),
+        "last_finished_at": cstate.get("last_finished_at", ""),
+        "last_error": cstate.get("last_error", ""),
+        "last_batch": cstate.get("last_batch", {}),
+        "current_updated_at": cstate.get("current_updated_at", ""),
+        "owner_pid": cstate.get("owner_pid", ""),
+        "current_run_id": cstate.get("current_run_id", ""),
+        "model": cstate.get("model", ""),
+        "model_provider": cstate.get("model_provider", ""),
+        "model_name": cstate.get("model_name", ""),
+        "model_task": cstate.get("model_task", ""),
+        "last_validation_finished_at": cstate.get("last_validation_finished_at", ""),
+        "last_validation_status": cstate.get("last_validation_status", ""),
+        "last_validation_summary": cstate.get("last_validation_summary", ""),
+        "last_validation_candidates": cstate.get("last_validation_candidates", 0),
+        "last_validation_selected": cstate.get("last_validation_selected", 0),
+        "last_validation_deleted_entities": cstate.get("last_validation_deleted_entities", 0),
+        "last_validation_deleted_triples": cstate.get("last_validation_deleted_triples", 0),
+        "last_validation_compacted_literals": cstate.get("last_validation_compacted_literals", 0),
+        "last_validation_compacted_triples": cstate.get("last_validation_compacted_triples", 0),
+        "last_validation_contract_error": bool(cstate.get("last_validation_contract_error", False)),
+        "last_validation_model": cstate.get("last_validation_model", ""),
+        "last_validation_model_provider": cstate.get("last_validation_model_provider", ""),
+        "last_validation_model_name": cstate.get("last_validation_model_name", ""),
+        "last_validation_model_task": cstate.get("last_validation_model_task", ""),
+        "state_db": str(_state_db_path(state_db_path)),
+        "total_messages": 0,
+        "pending_messages": 0,
+        "max_message_id": 0,
+        "palaces": list_palaces(profile=paths.profile, profile_home=paths.profile_home),
+    }
+    try:
+        default_profile, routes = _profile_route_lookup()
+        session_lookup = _session_origin_lookup(state_db_path)
+        with _connect_state_readonly(state_db_path) as conn:
+            sessions = _profile_sessions(
+                conn,
+                profile=paths.profile,
+                default_profile=default_profile,
+                routes=routes,
+                session_lookup=session_lookup,
+            )
+            session_ids = [str(row["id"]) for row in sessions]
+            total = _profile_message_counts(conn, session_ids, after_id=0)
+            pending = _profile_message_counts(conn, session_ids, after_id=cursor)
+            status.update(
+                {
+                    "session_count": len(session_ids),
+                    "total_messages": total["total"],
+                    "pending_messages": pending["total"],
+                    "max_message_id": total["max_id"],
+                }
+            )
+    except FileNotFoundError:
+        status["missing_state_db"] = True
+    return status
+
+
+def set_consolidator_paused(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    paused: bool = True,
+) -> dict[str, Any]:
+    paths = palace_paths(profile, profile_home=profile_home)
+    _set_consolidator_state(paths, {"paused": bool(paused)})
+    return consolidator_status(profile=paths.profile, profile_home=paths.profile_home)
+
+
+def set_consolidator_auto_enabled(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    paths = palace_paths(profile, profile_home=profile_home)
+    _set_consolidator_state(paths, {"auto_enabled": bool(enabled)})
+    return consolidator_status(profile=paths.profile, profile_home=paths.profile_home)
+
+
+def reset_consolidator_cursor(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    cursor: int = 0,
+) -> dict[str, Any]:
+    paths = palace_paths(profile, profile_home=profile_home)
+    _set_consolidator_state(
+        paths,
+        {
+            "cursor_message_id": max(0, int(cursor or 0)),
+            "last_error": "",
+            "last_batch": {},
+            "last_finished_at": utc_now(),
+        },
+    )
+    return consolidator_status(profile=paths.profile, profile_home=paths.profile_home)
+
+
+def consolidate_profile(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    state_db_path: Optional[Path] = None,
+    limit: int = LLM_CONSOLIDATOR_BATCH_SIZE,
+    max_batches: int = 1,
+    dry_run: bool = False,
+    force: bool = False,
+    reset_cursor: bool = False,
+    clear_history: bool = False,
+    backup: bool = True,
+    auto_clean: bool = True,
+    clean_backup: bool = True,
+    clean_max_delete: int = AUTO_CLEAN_MAX_DELETE,
+    validate_clean: bool = True,
+    validator_max_candidates: int = LLM_VALIDATOR_MAX_CANDIDATES,
+    workers: int = LLM_CONSOLIDATOR_WORKERS,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    llm_call: Optional[Callable[..., str]] = None,
+) -> dict[str, Any]:
+    paths = palace_paths(profile, profile_home=profile_home)
+    limit = max(1, min(int(limit or LLM_CONSOLIDATOR_BATCH_SIZE), LLM_CONSOLIDATOR_MAX_BATCH_SIZE))
+    max_batches = max(1, min(int(max_batches or 1), LLM_CONSOLIDATOR_MAX_BATCHES))
+    workers = max(1, min(int(workers or 1), LLM_CONSOLIDATOR_MAX_WORKERS))
+    state = _read_refresh_state(paths)
+    cstate = _consolidator_state(state)
+    if cstate.get("paused") and not force:
+        return {
+            "profile": paths.profile,
+            "dry_run": dry_run,
+            "processed_messages": 0,
+            "skipped": True,
+            "reason": "paused",
+            "status": consolidator_status(profile=paths.profile, profile_home=paths.profile_home, state_db_path=state_db_path),
+        }
+
+    lock_path = _acquire_refresh_lock(paths)
+    if lock_path is None:
+        return {
+            "profile": paths.profile,
+            "dry_run": dry_run,
+            "processed_messages": 0,
+            "skipped": True,
+            "reason": "locked",
+        }
+
+    cleared = {"removed": [], "backup_root": ""}
+    batch_results: list[dict[str, Any]] = []
+    touched_palaces: set[str] = set()
+    processed_messages = 0
+    wrote_entities = 0
+    wrote_triples = 0
+    skipped_items = 0
+    local_cursor = 0
+    run_id = uuid.uuid4().hex[:12]
+    model_fields = _llm_event_model_fields(LLM_CONSOLIDATOR_TASK)
+    run_fields = {"run_id": run_id, **model_fields}
+
+    def report(phase: str, **current: Any) -> None:
+        now_iso = utc_now()
+        snapshot = {
+            "phase": phase,
+            "updated_at": now_iso,
+            "profile": paths.profile,
+            "cursor_message_id": local_cursor,
+            "processed_messages": processed_messages,
+            "entities": wrote_entities,
+            "triples": wrote_triples,
+            "skipped_items": skipped_items,
+            **run_fields,
+            **current,
+        }
+        _set_consolidator_state(
+            paths,
+            {
+                "phase": phase,
+                "current": snapshot,
+                "current_updated_at": now_iso,
+                "stale": False,
+            },
+        )
+        if progress_callback:
+            progress_callback(
+                {
+                    "profile": paths.profile,
+                    "phase": phase,
+                    "current": snapshot,
+                    "processed_messages": processed_messages,
+                    "entities": wrote_entities,
+                    "triples": wrote_triples,
+                    "skipped_items": skipped_items,
+                }
+            )
+
+    try:
+        now_iso = utc_now()
+        cstate = _set_consolidator_state(
+            paths,
+            {
+                "running": True,
+                "stale": False,
+                "phase": "starting",
+                "current": {"phase": "starting", "profile": paths.profile, **run_fields},
+                "last_started_at": now_iso,
+                "last_error": "",
+                "owner_pid": os.getpid(),
+                "current_run_id": run_id,
+                **model_fields,
+            },
+        )
+        _append_consolidator_event(
+            paths,
+            {
+                "level": "info",
+                "message": "Started MemPalace extraction",
+                "status": "running",
+                "dry_run": dry_run,
+                **run_fields,
+            },
+        )
+        if reset_cursor:
+            cstate = _set_consolidator_state(paths, {"cursor_message_id": 0})
+        if clear_history and not dry_run:
+            report("clearing_history")
+            cleared = _clear_history_palaces(paths, backup=backup)
+
+        cstate = _consolidator_state(_read_refresh_state(paths))
+        local_cursor = int(cstate.get("cursor_message_id") or 0)
+        default_profile, routes = _profile_route_lookup()
+        session_lookup = _session_origin_lookup(state_db_path)
+
+        try:
+            conn_ctx = _connect_state_readonly(state_db_path)
+        except FileNotFoundError:
+            _set_consolidator_state(
+                paths,
+                {
+                    "running": False,
+                    "last_finished_at": utc_now(),
+                    "last_error": "missing_state_db",
+                },
+            )
+            return {
+                "profile": paths.profile,
+                "dry_run": dry_run,
+                "processed_messages": 0,
+                "skipped": True,
+                "reason": "missing_state_db",
+                "state_db": str(_state_db_path(state_db_path)),
+            }
+
+        with conn_ctx as state_conn:
+            sessions = _profile_sessions(
+                state_conn,
+                profile=paths.profile,
+                default_profile=default_profile,
+                routes=routes,
+                session_lookup=session_lookup,
+            )
+            session_by_id = {str(row["id"]): row for row in sessions}
+            session_ids = list(session_by_id)
+            if not session_ids:
+                _set_consolidator_state(
+                    paths,
+                    {
+                        "running": False,
+                        "last_finished_at": utc_now(),
+                        "last_error": "",
+                    },
+                )
+                return {
+                    "profile": paths.profile,
+                    "dry_run": dry_run,
+                    "processed_messages": 0,
+                    "skipped": True,
+                    "reason": "no_profile_sessions",
+                    "status": consolidator_status(profile=paths.profile, profile_home=paths.profile_home, state_db_path=state_db_path),
+                }
+
+            for _batch_index in range(max_batches):
+                report("fetching", batch_index=_batch_index + 1, max_batches=max_batches)
+                rows = _fetch_profile_messages(
+                    state_conn,
+                    session_ids,
+                    after_id=local_cursor,
+                    limit=limit,
+                )
+                if not rows:
+                    report("complete", batch_index=_batch_index + 1)
+                    break
+
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                max_row_id = local_cursor
+                for row in rows:
+                    session = session_by_id.get(str(row["session_id"]))
+                    if not session:
+                        continue
+                    max_row_id = max(max_row_id, int(row["id"]))
+                    origin = _origin_for_history_session(session, session_lookup)
+                    palace = _history_palace_for_session(session, origin)
+                    payload = _batch_message_payload(row, session, origin)
+                    if not payload["content"]:
+                        continue
+                    grouped.setdefault(palace, []).append(payload)
+
+                if not grouped:
+                    local_cursor = max_row_id
+                    report("skipping_empty_batch", batch_index=_batch_index + 1, cursor=max_row_id)
+                    continue
+
+                grouped_items = sorted(grouped.items())
+                report(
+                    "extracting",
+                    batch_index=_batch_index + 1,
+                    message_count=sum(len(items) for _, items in grouped_items),
+                    palace_count=len(grouped_items),
+                    palaces=[name for name, _items in grouped_items],
+                    cursor=max_row_id,
+                )
+
+                def extract_one(item: tuple[str, list[dict[str, Any]]]) -> dict[str, Any]:
+                    palace_name, messages_for_palace = item
+                    extraction = _extract_llm_payload(
+                        profile=paths.profile,
+                        palace=palace_name,
+                        batch_messages=messages_for_palace,
+                        llm_call=llm_call,
+                    )
+                    return {
+                        "palace": palace_name,
+                        "messages": messages_for_palace,
+                        "extraction": extraction,
+                    }
+
+                if workers > 1 and len(grouped_items) > 1:
+                    extractions: list[dict[str, Any] | None] = [None] * len(grouped_items)
+                    with ThreadPoolExecutor(max_workers=min(workers, len(grouped_items))) as executor:
+                        future_map = {
+                            executor.submit(extract_one, item): idx
+                            for idx, item in enumerate(grouped_items)
+                        }
+                        for future in as_completed(future_map):
+                            idx = future_map[future]
+                            item = future.result()
+                            extractions[idx] = item
+                            report(
+                                "extracted",
+                                batch_index=_batch_index + 1,
+                                palace=item["palace"],
+                                messages=len(item["messages"]),
+                                entities=len(item["extraction"].get("entities", [])),
+                                facts=len(item["extraction"].get("facts", [])),
+                                relations=len(item["extraction"].get("relations", [])),
+                            )
+                    extractions = [item for item in extractions if item is not None]
+                else:
+                    extractions = []
+                    for item in grouped_items:
+                        extracted = extract_one(item)
+                        extractions.append(extracted)
+                        report(
+                            "extracted",
+                            batch_index=_batch_index + 1,
+                            palace=extracted["palace"],
+                            messages=len(extracted["messages"]),
+                            entities=len(extracted["extraction"].get("entities", [])),
+                            facts=len(extracted["extraction"].get("facts", [])),
+                            relations=len(extracted["extraction"].get("relations", [])),
+                        )
+
+                batch_entities = 0
+                batch_triples = 0
+                batch_skipped = 0
+                if not dry_run:
+                    for item in extractions:
+                        report("writing", batch_index=_batch_index + 1, palace=item["palace"])
+                        touched_palaces.add(item["palace"])
+                        counts = _write_llm_extraction(
+                            paths=paths,
+                            palace=item["palace"],
+                            extraction=item["extraction"],
+                            batch_messages=item["messages"],
+                        )
+                        batch_entities += counts["entities"]
+                        batch_triples += counts["triples"]
+                        batch_skipped += counts["skipped"]
+                    local_cursor = max_row_id
+                    _set_consolidator_state(paths, {"cursor_message_id": local_cursor})
+                else:
+                    local_cursor = max_row_id
+
+                message_count = sum(len(item["messages"]) for item in extractions)
+                processed_messages += message_count
+                wrote_entities += batch_entities
+                wrote_triples += batch_triples
+                skipped_items += batch_skipped
+                batch_results.append(
+                    {
+                        "cursor": max_row_id,
+                        "messages": message_count,
+                        "palaces": [
+                            {
+                                "palace": item["palace"],
+                                "messages": len(item["messages"]),
+                                "entities": len(item["extraction"].get("entities", [])),
+                                "facts": len(item["extraction"].get("facts", [])),
+                                "relations": len(item["extraction"].get("relations", [])),
+                                "contradictions": len(item["extraction"].get("contradictions", [])),
+                                "preview": item["extraction"] if dry_run else None,
+                            }
+                            for item in extractions
+                        ],
+                        "written_entities": batch_entities,
+                        "written_triples": batch_triples,
+                        "skipped_items": batch_skipped,
+                    }
+                )
+                _append_consolidator_event(
+                    paths,
+                    {
+                        "level": "info",
+                        "message": "Batch processed",
+                        "status": "success",
+                        "batch_index": _batch_index + 1,
+                        "messages": message_count,
+                        "entities": batch_entities,
+                        "triples": batch_triples,
+                        "cursor": max_row_id,
+                        "palaces": [item["palace"] for item in extractions],
+                        **run_fields,
+                    },
+                )
+                report(
+                    "batch_done",
+                    batch_index=_batch_index + 1,
+                    messages=message_count,
+                    batch_entities=batch_entities,
+                    batch_triples=batch_triples,
+                    cursor=max_row_id,
+                )
+                if dry_run:
+                    break
+
+        finished_at = utc_now()
+        last_batch = {
+            "finished_at": finished_at,
+            "dry_run": dry_run,
+            "processed_messages": processed_messages,
+            "entities": wrote_entities,
+            "triples": wrote_triples,
+            "skipped_items": skipped_items,
+            "cursor_message_id": local_cursor,
+            "batches": len(batch_results),
+            **run_fields,
+        }
+        _set_consolidator_state(
+            paths,
+            {
+                "running": False,
+                "phase": "done",
+                "current": {
+                    "phase": "done",
+                    "profile": paths.profile,
+                    "processed_messages": processed_messages,
+                    "entities": wrote_entities,
+                    "triples": wrote_triples,
+                    "cursor_message_id": local_cursor,
+                    **run_fields,
+                },
+                "last_finished_at": finished_at,
+                "last_error": "",
+                "last_batch": last_batch,
+                "owner_pid": "",
+            },
+        )
+        _append_consolidator_event(
+            paths,
+            {
+                "level": "info",
+                "message": "MemPalace extraction finished",
+                "status": "success",
+                "processed_messages": processed_messages,
+                "entities": wrote_entities,
+                "triples": wrote_triples,
+                "cursor": local_cursor,
+                **run_fields,
+            },
+        )
+        now_epoch = time.time()
+        _update_refresh_state(
+            paths,
+            {
+                "profile": paths.profile,
+                "last_checked_at": finished_at,
+                "last_checked_epoch": now_epoch,
+                "source_kind": "history_llm+markdown",
+            },
+        )
+        return {
+            "profile": paths.profile,
+            "profile_home": str(paths.profile_home),
+            "dry_run": dry_run,
+            "processed_messages": processed_messages,
+            "entities": wrote_entities,
+            "triples": wrote_triples,
+            "skipped_items": skipped_items,
+            "cursor_message_id": local_cursor,
+            "batches": batch_results,
+            "cleared": cleared,
+            "auto_clean": _validator_clean_palaces(
+                profile=paths.profile,
+                profile_home=paths.profile_home,
+                palaces=touched_palaces,
+                enabled=bool(auto_clean and validate_clean and not dry_run and touched_palaces),
+                backup=clean_backup,
+                max_candidates=validator_max_candidates,
+            ),
+            "status": consolidator_status(profile=paths.profile, profile_home=paths.profile_home, state_db_path=state_db_path),
+        }
+    except Exception as exc:
+        _append_consolidator_event(
+            paths,
+            {
+                "level": "error",
+                "message": str(exc),
+                "status": "error",
+                "phase": "error",
+                "cursor": local_cursor,
+                **run_fields,
+            },
+        )
+        _set_consolidator_state(
+            paths,
+            {
+                "running": False,
+                "phase": "error",
+                "current": {
+                    "phase": "error",
+                    "profile": paths.profile,
+                    "cursor_message_id": local_cursor,
+                    "error": str(exc),
+                    **run_fields,
+                },
+                "last_finished_at": utc_now(),
+                "last_error": str(exc),
+                "owner_pid": "",
+            },
+        )
+        raise
+    finally:
+        _release_refresh_lock(lock_path)
+
+
+def backfill_profile_with_llm(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    state_db_path: Optional[Path] = None,
+    limit: int = LLM_CONSOLIDATOR_BATCH_SIZE,
+    max_batches: int = 10,
+    dry_run: bool = False,
+    backup: bool = True,
+    auto_clean: bool = True,
+    clean_backup: bool = True,
+    clean_max_delete: int = AUTO_CLEAN_MAX_DELETE,
+    workers: int = LLM_CONSOLIDATOR_WORKERS,
+    llm_call: Optional[Callable[..., str]] = None,
+) -> dict[str, Any]:
+    return consolidate_profile(
+        profile=profile,
+        profile_home=profile_home,
+        state_db_path=state_db_path,
+        limit=limit,
+        max_batches=max_batches,
+        dry_run=dry_run,
+        force=True,
+        reset_cursor=True,
+        clear_history=True,
+        backup=backup,
+        auto_clean=auto_clean,
+        clean_backup=clean_backup,
+        clean_max_delete=clean_max_delete,
+        workers=workers,
+        llm_call=llm_call,
+    )
+
+
+def backfill_profile_with_llm_full(
+    *,
+    profile: str = "default",
+    profile_home: Optional[Path] = None,
+    state_db_path: Optional[Path] = None,
+    limit: int = LLM_CONSOLIDATOR_BATCH_SIZE,
+    max_batches: int = 10,
+    max_rounds: int = LLM_CONSOLIDATOR_FULL_MAX_ROUNDS,
+    dry_run: bool = False,
+    backup: bool = True,
+    reset_cursor: bool = True,
+    clear_history: bool = True,
+    auto_clean: bool = True,
+    clean_backup: bool = True,
+    clean_max_delete: int = AUTO_CLEAN_MAX_DELETE,
+    validate_clean: bool = True,
+    validator_max_candidates: int = LLM_VALIDATOR_MAX_CANDIDATES,
+    workers: int = LLM_CONSOLIDATOR_WORKERS,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    llm_call: Optional[Callable[..., str]] = None,
+) -> dict[str, Any]:
+    """Rebuild history-derived graph memory until the profile cursor catches up.
+
+    ``backfill_profile_with_llm`` intentionally processes a bounded number of
+    batches. This helper is the operational "wipe + daemon catches up" path:
+    clear once, reset the cursor once, then keep consolidating until no pending
+    chat messages remain or no progress is possible.
+    """
+    paths = palace_paths(profile, profile_home=profile_home)
+    max_rounds = max(1, min(int(max_rounds or LLM_CONSOLIDATOR_FULL_MAX_ROUNDS), LLM_CONSOLIDATOR_FULL_MAX_ROUNDS))
+    aggregate: dict[str, Any] = {
+        "profile": paths.profile,
+        "profile_home": str(paths.profile_home),
+        "full": True,
+        "dry_run": dry_run,
+        "rounds": 0,
+        "processed_messages": 0,
+        "entities": 0,
+        "triples": 0,
+        "skipped_items": 0,
+        "cursor_message_id": 0,
+        "runs": [],
+        "cleared": {"removed": [], "backup_root": ""},
+        "status": {},
+        "validation": None,
+    }
+
+    if dry_run:
+        result = consolidate_profile(
+            profile=paths.profile,
+            profile_home=paths.profile_home,
+            state_db_path=state_db_path,
+            limit=limit,
+            max_batches=max_batches,
+            dry_run=True,
+            force=True,
+            reset_cursor=reset_cursor,
+            clear_history=clear_history,
+            backup=backup,
+            auto_clean=auto_clean,
+            clean_backup=clean_backup,
+            clean_max_delete=clean_max_delete,
+            workers=workers,
+            progress_callback=progress_callback,
+            llm_call=llm_call,
+        )
+        aggregate.update(
+            {
+                "full": False,
+                "reason": "dry_run_preview_only",
+                "rounds": 1,
+                "processed_messages": int(result.get("processed_messages") or 0),
+                "entities": int(result.get("entities") or 0),
+                "triples": int(result.get("triples") or 0),
+                "skipped_items": int(result.get("skipped_items") or 0),
+                "cursor_message_id": int(result.get("cursor_message_id") or 0),
+                "runs": [result],
+                "status": result.get("status") or {},
+            }
+        )
+        if progress_callback:
+            progress_callback(aggregate)
+        return aggregate
+
+    do_reset_cursor = reset_cursor
+    do_clear_history = clear_history
+    for round_index in range(max_rounds):
+        result = consolidate_profile(
+            profile=paths.profile,
+            profile_home=paths.profile_home,
+            state_db_path=state_db_path,
+            limit=limit,
+            max_batches=max_batches,
+            dry_run=False,
+            force=True,
+            reset_cursor=do_reset_cursor,
+            clear_history=do_clear_history,
+            backup=backup,
+            auto_clean=auto_clean,
+            clean_backup=clean_backup,
+            clean_max_delete=clean_max_delete,
+            workers=workers,
+            progress_callback=progress_callback,
+            llm_call=llm_call,
+        )
+        do_reset_cursor = False
+        do_clear_history = False
+
+        aggregate["rounds"] = round_index + 1
+        aggregate["processed_messages"] += int(result.get("processed_messages") or 0)
+        aggregate["entities"] += int(result.get("entities") or 0)
+        aggregate["triples"] += int(result.get("triples") or 0)
+        aggregate["skipped_items"] += int(result.get("skipped_items") or 0)
+        aggregate["cursor_message_id"] = int(result.get("cursor_message_id") or aggregate["cursor_message_id"] or 0)
+        aggregate["status"] = result.get("status") or consolidator_status(
+            profile=paths.profile,
+            profile_home=paths.profile_home,
+            state_db_path=state_db_path,
+        )
+        if result.get("cleared") and not aggregate["cleared"].get("removed"):
+            aggregate["cleared"] = result.get("cleared") or aggregate["cleared"]
+        aggregate["runs"].append(
+            {
+                "processed_messages": result.get("processed_messages", 0),
+                "entities": result.get("entities", 0),
+                "triples": result.get("triples", 0),
+                "cursor_message_id": result.get("cursor_message_id", 0),
+                "status": result.get("status") or {},
+            }
+        )
+        if progress_callback:
+            progress_callback(aggregate)
+
+        status = aggregate["status"] or {}
+        pending = int(status.get("pending_messages") or 0)
+        processed = int(result.get("processed_messages") or 0)
+        if pending <= 0:
+            aggregate["reason"] = "complete"
+            break
+        if processed <= 0 or result.get("skipped"):
+            aggregate["reason"] = result.get("reason") or "no_progress"
+            break
+    else:
+        aggregate["reason"] = "max_rounds"
+
+    aggregate["status"] = consolidator_status(
+        profile=paths.profile,
+        profile_home=paths.profile_home,
+        state_db_path=state_db_path,
+    )
+    aggregate["cursor_message_id"] = int(aggregate["status"].get("cursor_message_id") or aggregate["cursor_message_id"] or 0)
+    if validate_clean and int((aggregate["status"] or {}).get("pending_messages") or 0) <= 0:
+        try:
+            aggregate["validation"] = validate_and_clean_noise_with_llm(
+                profile=paths.profile,
+                profile_home=paths.profile_home,
+                dry_run=False,
+                backup=backup,
+                max_candidates=validator_max_candidates,
+            )
+            aggregate["status"] = consolidator_status(
+                profile=paths.profile,
+                profile_home=paths.profile_home,
+                state_db_path=state_db_path,
+            )
+            if progress_callback:
+                progress_callback(aggregate)
+        except Exception as exc:
+            model_fields = _llm_event_model_fields(LLM_VALIDATOR_TASK)
+            aggregate["validation"] = {
+                "validator": True,
+                "status": "error",
+                "error": str(exc),
+                **model_fields,
+            }
+            _append_consolidator_event(
+                paths,
+                {
+                    "level": "error",
+                    "message": f"MemPalace validation failed: {exc}",
+                    "status": "error",
+                    **model_fields,
+                },
+            )
+    return aggregate
+
+
+def backfill_all_profiles_with_llm(
+    *,
+    state_db_path: Optional[Path] = None,
+    limit: int = LLM_CONSOLIDATOR_BATCH_SIZE,
+    max_batches: int = 10,
+    dry_run: bool = False,
+    backup: bool = True,
+    auto_clean: bool = True,
+    clean_backup: bool = True,
+    clean_max_delete: int = AUTO_CLEAN_MAX_DELETE,
+    workers: int = LLM_CONSOLIDATOR_WORKERS,
+) -> dict[str, Any]:
+    results = [
+        backfill_profile_with_llm(
+            profile=str(row["name"]),
+            state_db_path=state_db_path,
+            limit=limit,
+            max_batches=max_batches,
+            dry_run=dry_run,
+            backup=backup,
+            auto_clean=auto_clean,
+            clean_backup=clean_backup,
+            clean_max_delete=clean_max_delete,
+            workers=workers,
+        )
+        for row in list_profiles()
+    ]
+    return {
+        "profiles": results,
+        "matrix": profile_matrix(),
+    }
+
+
+def backfill_all_profiles_with_llm_full(
+    *,
+    state_db_path: Optional[Path] = None,
+    limit: int = LLM_CONSOLIDATOR_BATCH_SIZE,
+    max_batches: int = 10,
+    max_rounds: int = LLM_CONSOLIDATOR_FULL_MAX_ROUNDS,
+    dry_run: bool = False,
+    backup: bool = True,
+    reset_cursor: bool = True,
+    clear_history: bool = True,
+    auto_clean: bool = True,
+    clean_backup: bool = True,
+    clean_max_delete: int = AUTO_CLEAN_MAX_DELETE,
+    validate_clean: bool = True,
+    validator_max_candidates: int = LLM_VALIDATOR_MAX_CANDIDATES,
+    workers: int = LLM_CONSOLIDATOR_WORKERS,
+    profile_workers: int = 2,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    profiles = [str(row["name"]) for row in list_profiles()]
+    profile_workers = max(1, min(int(profile_workers or 1), min(4, max(1, len(profiles)))))
+    results: list[dict[str, Any] | None] = [None] * len(profiles)
+
+    def run_one(index: int, profile_name: str) -> dict[str, Any]:
+        def profile_progress(progress: dict[str, Any]) -> None:
+            if progress_callback:
+                progress_callback(
+                    {
+                        "profile": profile_name,
+                        "profile_index": index,
+                        "profiles_total": len(profiles),
+                        "profile_progress": progress,
+                    }
+                )
+
+        result = backfill_profile_with_llm_full(
+            profile=profile_name,
+            state_db_path=state_db_path,
+            limit=limit,
+            max_batches=max_batches,
+            max_rounds=max_rounds,
+            dry_run=dry_run,
+            backup=backup,
+            reset_cursor=reset_cursor,
+            clear_history=clear_history,
+            auto_clean=auto_clean,
+            clean_backup=clean_backup,
+            clean_max_delete=clean_max_delete,
+            validate_clean=validate_clean,
+            validator_max_candidates=validator_max_candidates,
+            workers=workers,
+            progress_callback=profile_progress,
+        )
+        if progress_callback:
+            progress_callback(
+                {
+                    "profile": profile_name,
+                    "profile_index": index,
+                    "profiles_total": len(profiles),
+                    "profile_result": result,
+                }
+            )
+        return result
+
+    if profile_workers > 1 and len(profiles) > 1:
+        with ThreadPoolExecutor(max_workers=profile_workers) as executor:
+            future_map = {
+                executor.submit(run_one, idx, profile_name): idx
+                for idx, profile_name in enumerate(profiles)
+            }
+            for future in as_completed(future_map):
+                results[future_map[future]] = future.result()
+    else:
+        for idx, profile_name in enumerate(profiles):
+            results[idx] = run_one(idx, profile_name)
+
+    final_results = [row for row in results if row is not None]
+    return {
+        "profiles": final_results,
+        "processed_messages": sum(int(row.get("processed_messages") or 0) for row in final_results),
+        "entities": sum(int(row.get("entities") or 0) for row in final_results),
+        "triples": sum(int(row.get("triples") or 0) for row in final_results),
+        "matrix": profile_matrix(),
+    }
 
 
 def generate_from_markdown(
@@ -2083,6 +4718,11 @@ def generate_from_markdown(
                     literal_id,
                     source_file=source,
                     source_closet=f"hermes:{tenant}",
+                    evidence=_triple_evidence_payload(
+                        source_file=source,
+                        source_closet=f"hermes:{tenant}",
+                        adapter_name="hermes_markdown",
+                    ),
                 )
                 _upsert_triple(
                     conn,
@@ -2092,6 +4732,11 @@ def generate_from_markdown(
                     topic_id,
                     source_file=source,
                     source_closet=f"hermes:{tenant}",
+                    evidence=_triple_evidence_payload(
+                        source_file=source,
+                        source_closet=f"hermes:{tenant}",
+                        adapter_name="hermes_markdown",
+                    ),
                 )
                 record["entities"] += 2
                 record["triples"] += 2
@@ -2100,7 +4745,7 @@ def generate_from_markdown(
     if not dry_run:
         now_iso = utc_now()
         now_epoch = time.time()
-        _write_refresh_state(
+        _update_refresh_state(
             paths,
             {
                 "profile": paths.profile,
@@ -2119,13 +4764,12 @@ def generate_from_markdown(
         "dry_run": dry_run,
         "files": len(sources),
         "palaces": sorted(by_palace.values(), key=lambda item: item["palace"]),
-        "auto_clean": auto_clean_palaces(
+        "auto_clean": _validator_clean_palaces(
             profile=paths.profile,
             profile_home=paths.profile_home,
             palaces=by_palace.keys(),
             enabled=bool(auto_clean and not dry_run),
             backup=clean_backup,
-            max_delete=clean_max_delete,
         ),
     }
 
@@ -2196,7 +4840,7 @@ def generate_from_history(
             )
             if session_profile != paths.profile:
                 continue
-            origin = session_lookup.get(str(session["id"])) or {}
+            origin = _origin_for_history_session(session, session_lookup)
 
             rows = state_conn.execute(
                 """
@@ -2221,7 +4865,7 @@ def generate_from_history(
             if not selected:
                 continue
 
-            palace = _history_palace_for_session(session)
+            palace = _history_palace_for_session(session, origin)
             touched.add(palace)
             record = by_palace.setdefault(
                 palace,
@@ -2300,6 +4944,10 @@ def generate_from_history(
                     session_id,
                     source_closet=f"state.db:{session['id']}",
                     adapter_name="hermes_history",
+                    evidence=_triple_evidence_payload(
+                        source_closet=f"state.db:{session['id']}",
+                        adapter_name="hermes_history",
+                    ),
                 )
                 _upsert_triple(
                     conn,
@@ -2309,6 +4957,10 @@ def generate_from_history(
                     source_id,
                     source_closet=f"state.db:{session['id']}",
                     adapter_name="hermes_history",
+                    evidence=_triple_evidence_payload(
+                        source_closet=f"state.db:{session['id']}",
+                        adapter_name="hermes_history",
+                    ),
                 )
                 record["entities"] += 3
                 record["triples"] += 2
@@ -2345,6 +4997,11 @@ def generate_from_history(
                         confidence=min(0.99, 0.55 + score * 0.06),
                         source_closet=f"state.db:{session['id']}:{message['id']}",
                         adapter_name="hermes_history",
+                        evidence=_triple_evidence_payload(
+                            message_ids=[message["id"]],
+                            source_closet=f"state.db:{session['id']}:{message['id']}",
+                            adapter_name="hermes_history",
+                        ),
                     )
                     record["messages"] += 1
                     record["facts"] += 1
@@ -2371,6 +5028,11 @@ def generate_from_history(
                             confidence=0.72,
                             source_closet=f"state.db:{session['id']}:{message['id']}",
                             adapter_name="hermes_history",
+                            evidence=_triple_evidence_payload(
+                                message_ids=[message["id"]],
+                                source_closet=f"state.db:{session['id']}:{message['id']}",
+                                adapter_name="hermes_history",
+                            ),
                         )
                         _upsert_triple(
                             conn,
@@ -2381,6 +5043,11 @@ def generate_from_history(
                             confidence=0.66,
                             source_closet=f"state.db:{session['id']}:{message['id']}",
                             adapter_name="hermes_history",
+                            evidence=_triple_evidence_payload(
+                                message_ids=[message["id"]],
+                                source_closet=f"state.db:{session['id']}:{message['id']}",
+                                adapter_name="hermes_history",
+                            ),
                         )
                         record["entities"] += 1
                         record["triples"] += 2
@@ -2395,13 +5062,12 @@ def generate_from_history(
         "messages": total_messages,
         "facts": total_facts,
         "palaces": sorted(by_palace.values(), key=lambda item: item["palace"]),
-        "auto_clean": auto_clean_palaces(
+        "auto_clean": _validator_clean_palaces(
             profile=paths.profile,
             profile_home=paths.profile_home,
             palaces=touched,
             enabled=bool(auto_clean and not dry_run),
             backup=clean_backup,
-            max_delete=clean_max_delete,
         ),
     }
 
@@ -2638,71 +5304,84 @@ def refresh_if_due(
             "next_check_in_seconds": int(interval_seconds - (now - last_checked_at)),
         }
 
-    lock_path = _acquire_refresh_lock(paths)
-    if lock_path is None:
+    cstate = _consolidator_state(state)
+    if not force and not bool(cstate.get("auto_enabled", False)):
         return {
             "profile": paths.profile,
             "refreshed": False,
             "skipped": True,
-            "reason": "locked",
+            "reason": "auto_disabled",
+            "status": consolidator_status(
+                profile=paths.profile,
+                profile_home=paths.profile_home,
+                state_db_path=state_db_path,
+            ),
         }
-    try:
-        sources = _markdown_sources(paths.profile_home)
-        signature = _combined_source_signature(paths, state_db_path=state_db_path)
-        state = _read_refresh_state(paths)
-        previous = str(state.get("source_signature") or "")
-        state.update(
-            {
-                "profile": paths.profile,
-                "last_checked_at": utc_now(),
-                "last_checked_epoch": now,
-                "source_signature": previous or signature,
-                "source_kind": "history+markdown",
-                "files": len(sources),
-            }
-        )
-        if not force and previous == signature and paths.storage_root.exists():
-            state["source_signature"] = signature
-            _write_refresh_state(paths, state)
-            return {
-                "profile": paths.profile,
-                "refreshed": False,
-                "skipped": True,
-                "reason": "unchanged",
-                "files": len(sources),
-            }
-        result = rebuild_from_history(
-            profile=paths.profile,
-            profile_home=paths.profile_home,
-            state_db_path=state_db_path,
-            backup=backup,
-            include_markdown=include_markdown,
-        )
-        history = result.get("history") or {}
-        state.update(
-            {
-                "last_rebuild_at": utc_now(),
-                "last_rebuild_epoch": time.time(),
-                "source_signature": signature,
-                "source_kind": "history+markdown",
-                "history_sessions": history.get("sessions", 0),
-                "history_facts": history.get("facts", 0),
-                "files": len(sources),
-            }
-        )
-        _write_refresh_state(paths, state)
+    if not force and bool(cstate.get("paused", False)):
         return {
             "profile": paths.profile,
-            "refreshed": True,
-            "skipped": False,
-            "reason": "forced" if force else "changed",
-            "files": len(sources),
-            "history_sessions": history.get("sessions", 0),
-            "history_facts": history.get("facts", 0),
-            "result": result,
+            "refreshed": False,
+            "skipped": True,
+            "reason": "paused",
         }
-    finally:
-        _release_refresh_lock(lock_path)
+
+    sources = _markdown_sources(paths.profile_home)
+    markdown_signature = _source_signature(sources)
+    previous_markdown = str(state.get("markdown_signature") or state.get("source_signature") or "")
+    markdown_result = None
+    markdown_changed = include_markdown and (force or previous_markdown != markdown_signature)
+    if markdown_changed:
+        markdown_result = generate_from_markdown(
+            profile=paths.profile,
+            profile_home=paths.profile_home,
+            dry_run=False,
+            auto_clean=True,
+        )
+        _update_refresh_state(paths, {"markdown_signature": markdown_signature})
+
+    result = consolidate_profile(
+        profile=paths.profile,
+        profile_home=paths.profile_home,
+        state_db_path=state_db_path,
+        limit=LLM_CONSOLIDATOR_BATCH_SIZE,
+        max_batches=1,
+        dry_run=False,
+        force=force,
+        backup=backup,
+        auto_clean=True,
+    )
+    processed = int(result.get("processed_messages") or 0)
+    refreshed = bool(markdown_changed or processed)
+    reason = "forced" if force else ("changed" if refreshed else "unchanged")
+    _update_refresh_state(
+        paths,
+        {
+            "profile": paths.profile,
+            "last_checked_at": utc_now(),
+            "last_checked_epoch": time.time(),
+            "source_kind": "history_llm+markdown",
+            "source_signature": _combined_source_signature(
+                paths,
+                state_db_path=state_db_path,
+            ),
+            "markdown_signature": markdown_signature,
+            "files": len(sources),
+            "history_messages_processed": processed,
+        },
+    )
+    return {
+        "profile": paths.profile,
+        "refreshed": refreshed,
+        "skipped": not refreshed,
+        "reason": reason,
+        "files": len(sources),
+        "history_messages_processed": processed,
+        "history_entities": result.get("entities", 0),
+        "history_triples": result.get("triples", 0),
+        "markdown": markdown_result,
+        "result": result,
+        "status": result.get("status"),
+    }
 
 
 def refresh_all_profiles_if_due(
@@ -2794,13 +5473,12 @@ def copy_import_to_profile(
         "copied": copied,
         "skipped": skipped,
         "storage_root": str(paths.storage_root),
-        "auto_clean": auto_clean_palaces(
+        "auto_clean": _validator_clean_palaces(
             profile=paths.profile,
             profile_home=paths.profile_home,
             palaces=copied_palaces,
             enabled=auto_clean,
             backup=clean_backup,
-            max_delete=clean_max_delete,
         ),
     }
 
@@ -2944,14 +5622,19 @@ def partition_import_to_profiles(
 
     auto_cleaned: list[dict[str, Any]] = []
     for name in profile_names:
-        result = auto_clean_noise(
+        palace_names = [
+            str(item.get("palace"))
+            for item in per_profile[name].get("palaces", [])
+            if str(item.get("palace") or "").strip()
+        ]
+        result = _validator_clean_palaces(
             profile=name,
+            palaces=palace_names,
             enabled=auto_clean,
             backup=clean_backup,
-            max_delete=clean_max_delete,
         )
         per_profile[name]["auto_clean"] = result
-        auto_cleaned.append(result)
+        auto_cleaned.extend(result)
 
     return {
         "snapshot": selected["name"],

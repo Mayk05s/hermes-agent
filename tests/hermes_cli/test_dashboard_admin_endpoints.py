@@ -232,6 +232,78 @@ class TestPairingEndpoints:
         assert routes[0]["chat_id"] == "-100123"
         assert routes[0]["profile"] == "default"
 
+    def test_approve_topic_pairing_can_choose_chat_scope(self):
+        from gateway.pairing import PairingStore
+        from hermes_cli.config import load_config
+        from hermes_constants import get_hermes_home
+
+        (get_hermes_home() / "pairing").mkdir(exist_ok=True)
+        store = PairingStore()
+        first_entry_id = store.generate_chat_request(
+            "telegram",
+            "-100555",
+            "BoxMap",
+            thread_id="1",
+            requester_user_id="111",
+            requester_user_name="Alice",
+        )
+
+        first = self.client.post(
+            "/api/pairing/approve",
+            json={
+                "platform": "telegram",
+                "entry_id": first_entry_id,
+                "approval_scope": "topic",
+                "profile": "default",
+            },
+        )
+
+        assert first.status_code == 200
+        assert first.json()["user"]["thread_id"] == "1"
+
+        second_entry_id = store.generate_chat_request(
+            "telegram",
+            "-100555",
+            "BoxMap",
+            thread_id="35",
+            requester_user_id="111",
+            requester_user_name="Alice",
+        )
+
+        second = self.client.post(
+            "/api/pairing/approve",
+            json={
+                "platform": "telegram",
+                "entry_id": second_entry_id,
+                "approval_scope": "chat",
+                "profile": "default",
+            },
+        )
+
+        assert second.status_code == 200
+        data = second.json()
+        assert data["user"]["user_id"] == "chat:-100555"
+        assert data["user"]["thread_id"] == ""
+        assert "thread_id" not in data["route"]
+
+        approved = [
+            item for item in store.list_approved("telegram")
+            if item.get("chat_id") == "-100555"
+        ]
+        assert len(approved) == 1
+        assert approved[0]["user_id"] == "chat:-100555"
+        assert approved[0]["thread_id"] == ""
+        assert store.is_chat_approved("telegram", "-100555", "1") is True
+        assert store.is_chat_approved("telegram", "-100555", "35") is True
+
+        cfg = load_config()
+        routes = [
+            route for route in cfg["profile_routes"]["routes"]
+            if route["platform"] == "telegram" and route["chat_id"] == "-100555"
+        ]
+        assert len(routes) == 1
+        assert "thread_id" not in routes[0]
+
     def test_reject_chat_pairing_removes_pending_request(self):
         from gateway.pairing import PairingStore
 

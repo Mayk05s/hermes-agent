@@ -49,7 +49,7 @@ ONESHOT_GRACE_SECONDS = 120
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "origin", "access_context"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -564,6 +564,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     profile: Optional[str] = None,
+    access_context: Optional[Dict[str, Any]] = None,
     no_agent: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -610,6 +611,9 @@ def create_job(
                 credentials, scripts, skills, and memory paths resolve
                 consistently. ``default`` selects the root profile; empty /
                 None preserves the scheduler's existing behaviour.
+        access_context: Protected creator capability snapshot. When present,
+                scheduler/tool callers must enforce it instead of trusting
+                mutable LLM-supplied profile, skill, or toolset fields.
         no_agent: When True, skip the agent entirely — run ``script`` on schedule
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
@@ -703,6 +707,7 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
         "profile": normalized_profile,
+        "access_context": access_context if isinstance(access_context, dict) else None,
     }
 
     jobs = load_jobs()
@@ -928,6 +933,16 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+
+                # A failed one-shot is evidence of unfinished work. Keep it
+                # visible (but do not retry it automatically, since the job
+                # may have side effects) so it can be inspected and resumed.
+                if not success and job.get("schedule", {}).get("kind") == "once":
+                    job["enabled"] = False
+                    job["state"] = "error"
+                    job["next_run_at"] = None
+                    save_jobs(jobs)
+                    return
                 
                 # Increment completed count
                 if job.get("repeat"):

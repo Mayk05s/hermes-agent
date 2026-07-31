@@ -224,6 +224,38 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
 
 
 @pytest.mark.asyncio
+async def test_streaming_delivery_sends_local_markdown_image_as_photo_batch(tmp_path, monkeypatch):
+    event = _event(thread_id="topic-1")
+    image_file = _allowed_media_path(tmp_path, monkeypatch, "generated.png")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_multiple_images=AsyncMock(),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"Готово\n\n![Пост 3 — новая локация]({image_file})",
+        event,
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once_with(
+        chat_id="chat-1",
+        images=[(image_file.as_uri(), "Пост 3 — новая локация")],
+        metadata={"thread_id": "topic-1"},
+    )
+    adapter.send_document.assert_not_awaited()
+    adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_path, monkeypatch):
     event = _event(thread_id="topic-1")
     allowed_root = tmp_path / "media-cache"

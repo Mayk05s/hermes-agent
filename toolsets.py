@@ -49,7 +49,7 @@ _HERMES_CORE_TOOLS = [
     # Planning & memory
     "todo", "memory",
     # Session history search
-    "session_search",
+    "session_search", "recall_access",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -58,6 +58,8 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # External Google Workspace agent provider (dev/staging only, gated)
+    "workspace_external_provider",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -221,10 +223,22 @@ TOOLSETS = {
         "tools": [],
         "includes": []
     },
+
+    "codex_calendar": {
+        "description": "Profile-scoped Google Calendar access through an isolated Codex connector",
+        "tools": ["google_calendar"],
+        "includes": []
+    },
+
+    "workspace_external": {
+        "description": "Dev/staging external agent provider for Google Workspace reads via Antigravity/Gemini CLI",
+        "tools": ["workspace_external_provider"],
+        "includes": []
+    },
     
     "session_search": {
         "description": "Search and recall past conversations with summarization",
-        "tools": ["session_search"],
+        "tools": ["session_search", "recall_access"],
         "includes": []
     },
     
@@ -357,7 +371,7 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
-            "session_search",
+            "session_search", "recall_access",
             "execute_code", "delegate_task",
         ],
         "includes": []
@@ -384,7 +398,7 @@ TOOLSETS = {
             # Planning & memory
             "todo", "memory",
             # Session history search
-            "session_search",
+            "session_search", "recall_access",
             # Code execution + delegation
             "execute_code", "delegate_task",
             # Cronjob management

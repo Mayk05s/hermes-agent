@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from urllib.parse import quote as _url_quote, unquote as _url_unquote, urlsplit
 
 from utils import normalize_proxy_url
 
@@ -491,6 +491,143 @@ GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
     "Secure secret entry is not supported over messaging. "
     "Load this skill in the local CLI to be prompted, or add the key to ~/.hermes/.env manually."
 )
+
+
+@dataclass(frozen=True)
+class AgentControlResponse:
+    """A final-response marker that controls gateway delivery instead of text."""
+
+    action: str
+    emoji: Optional[str] = None
+
+
+_CONTROL_RESPONSE_MAX_LEN = 96
+_CONTROL_SILENT_RE = re.compile(
+    r"^\s*(?:"
+    r"\[\[\s*(?:silent|silence|no[_\s-]*(?:response|reply))\s*\]\]"
+    r"|\[\s*(?:silent|silence|no[_\s-]*(?:response|reply))\s*\]"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_CONTROL_REACTION_RE = re.compile(
+    r"^\s*(?:"
+    r"\[\[\s*(?:reaction|react)\s*:\s*(?P<emoji1>[^\]\r\n]{1,32})\s*\]\]"
+    r"|\[\s*(?:reaction|react)\s*:\s*(?P<emoji2>[^\]\r\n]{1,32})\s*\]"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_CONTROL_REACTION_MARKER_BODY = (
+    r"\[\[\s*(?:reaction|react)\s*:[^\]\r\n]{1,32}\s*\]\]"
+    r"|\[\s*(?:reaction|react)\s*:[^\]\r\n]{1,32}\s*\]"
+)
+_CONTROL_REACTION_PREFIX_RE = re.compile(
+    r"^\s*(?P<marker>(?:" + _CONTROL_REACTION_MARKER_BODY + r"))\s*(?P<rest>.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONTROL_REACTION_SUFFIX_RE = re.compile(
+    r"(?P<rest>.*?)\s*(?P<marker>(?:" + _CONTROL_REACTION_MARKER_BODY + r"))\s*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+_TELEGRAM_BARE_REACTION_EMOJIS = frozenset(
+    {
+        "👍", "👎", "❤", "❤️", "🔥", "🥰", "👏", "😁", "🤔", "🤯",
+        "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊",
+        "🤡", "🥱", "🥴", "😍", "🐳", "❤️‍🔥", "🌚", "🌭", "💯", "🤣",
+        "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕",
+        "😈", "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈", "😇",
+        "😨", "🤝", "✍", "✍️", "🤗", "🫡", "🎅", "🎄", "☃", "☃️",
+        "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊",
+        "😎", "👾", "🤷", "🤷‍♂️", "🤷‍♀️", "😡",
+    }
+)
+
+
+def _clean_control_emoji(value: Optional[str]) -> Optional[str]:
+    emoji = str(value or "").strip()
+    if not emoji or len(emoji) > 16:
+        return None
+    if any(ch.isspace() for ch in emoji):
+        return None
+    return emoji
+
+
+def parse_agent_control_response(
+    content: Optional[str],
+    *,
+    include_legacy_silence: bool = False,
+) -> Optional[AgentControlResponse]:
+    """Parse explicit final-response markers such as ``[[silent]]``.
+
+    These markers let a gateway turn end without sending an ordinary message.
+    They are intentionally explicit so normal short replies like ``ok`` or a
+    bare emoji still behave as normal text.
+    """
+    if not content:
+        return None
+    stripped = str(content).strip()
+    if not stripped or len(stripped) > _CONTROL_RESPONSE_MAX_LEN:
+        return None
+
+    reaction = _CONTROL_REACTION_RE.match(stripped)
+    if reaction:
+        emoji = _clean_control_emoji(
+            reaction.group("emoji1") or reaction.group("emoji2")
+        )
+        if emoji:
+            return AgentControlResponse(action="reaction", emoji=emoji)
+        return AgentControlResponse(action="silent")
+
+    if _CONTROL_SILENT_RE.match(stripped):
+        return AgentControlResponse(action="silent")
+
+    if include_legacy_silence:
+        # Backward-compatible safety net for already-observed silence
+        # narrations such as "*(silent)*" or "🔇". Keep it best-effort to
+        # avoid coupling the base adapter import path to DeliveryRouter at
+        # module import time.
+        try:
+            from gateway.delivery import _is_silence_narration
+
+            if _is_silence_narration(stripped):
+                return AgentControlResponse(action="silent")
+        except Exception:
+            pass
+
+    return None
+
+
+def extract_agent_reaction_control(
+    content: Optional[str],
+    *,
+    include_bare_telegram_emoji: bool = False,
+) -> Tuple[Optional[AgentControlResponse], str, bool]:
+    """Extract a native-reaction marker from a final response.
+
+    The explicit whole-response parser above is intentionally strict. This
+    helper covers Telegram's social reaction path: a model can attach a
+    reaction marker at the start/end of an otherwise normal answer, or it can
+    answer with a single supported Telegram reaction emoji.
+
+    Returns ``(control, remaining_text, bare_emoji)``.
+    """
+    if not content:
+        return None, "", False
+
+    original = str(content)
+    for pattern in (_CONTROL_REACTION_PREFIX_RE, _CONTROL_REACTION_SUFFIX_RE):
+        match = pattern.match(original)
+        if not match:
+            continue
+        marker = match.group("marker")
+        control = parse_agent_control_response(marker)
+        if control and control.action == "reaction" and control.emoji:
+            return control, match.group("rest").strip(), False
+
+    stripped = original.strip()
+    if include_bare_telegram_emoji and stripped in _TELEGRAM_BARE_REACTION_EMOJIS:
+        return AgentControlResponse(action="reaction", emoji=stripped), "", True
+
+    return None, original, False
 
 
 def safe_url_for_log(url: str, max_len: int = 80) -> str:
@@ -1441,8 +1578,28 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Durable gateway-job identity.  Normal inbound work receives this before
+    # the agent starts; restart recovery reuses the same ID so execution state
+    # and final-result delivery can be reconciled across gateway processes.
+    durable_job_id: Optional[str] = None
+    durable_recovery: bool = False
+    durable_request_text: Optional[str] = None
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Telegram voice/audio input is parsed before the runner knows whether an
+    # agent response is needed.  The base adapter stores a per-event gate here
+    # so typing can stay hidden during STT and start only once the runner
+    # commits to producing a response.  This is a dataclass field (rather than
+    # an ad-hoc attribute) so dataclasses.replace() preserves the same gate.
+    _typing_indicator_ready: Any = field(default=None, repr=False, compare=False)
+
+    def mark_response_started(self) -> None:
+        """Release a deferred typing indicator once a response will be made."""
+        ready = self._typing_indicator_ready
+        if ready is not None:
+            ready.set()
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -1524,6 +1681,9 @@ class SendResult:
     error: Optional[str] = None
     raw_response: Any = None
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # Platform-supplied cooldown in seconds (for example Telegram 429
+    # RetryAfter). The generic retry loop must never retry before this window.
+    retry_after: Optional[float] = None
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -1776,6 +1936,7 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._durable_job_delivery_handler: Optional[Callable[..., Any]] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -2135,6 +2296,13 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_durable_job_delivery_handler(
+        self,
+        handler: Optional[Callable[..., Any]],
+    ) -> None:
+        """Install the runner callback that persists final delivery receipts."""
+        self._durable_job_delivery_handler = handler
 
     def set_topic_recovery_fn(
         self,
@@ -2591,13 +2759,52 @@ class BasePlatformAdapter(ABC):
         lower = url.lower().split('?')[0]  # Strip query params
         return lower.endswith('.gif')
 
+    async def _send_single_image_attachment(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> SendResult:
+        """Send one image through the same routing used by image batches."""
+        if human_delay > 0:
+            await asyncio.sleep(human_delay)
+
+        if image_url.startswith("file://"):
+            return await self.send_image_file(
+                chat_id=chat_id,
+                image_path=_url_unquote(image_url[7:]),
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        if self._is_animation_url(image_url):
+            return await self.send_animation(
+                chat_id=chat_id,
+                animation_url=image_url,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=image_url,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     @staticmethod
     def extract_images(content: str) -> Tuple[List[Tuple[str, str]], str]:
         """
-        Extract image URLs from markdown and HTML image tags in a response.
+        Extract image URLs/paths from markdown and HTML image tags in a response.
         
         Finds patterns like:
         - ![alt text](https://example.com/image.png)
+        - ![alt text](/home/user/.hermes/cache/images/image.png)
+        - ![alt text](file:///home/user/.hermes/cache/images/image.png)
         - <img src="https://example.com/image.png">
         - <img src="https://example.com/image.png"></img>
         
@@ -2609,29 +2816,61 @@ class BasePlatformAdapter(ABC):
         """
         images = []
         cleaned = content
-        
+
+        def _looks_like_image_ref(ref: str) -> bool:
+            lower = (ref or "").lower()
+            pathish = lower.split("?", 1)[0].split("#", 1)[0]
+            return (
+                any(pathish.endswith(ext) for ext in SUPPORTED_IMAGE_DOCUMENT_TYPES)
+                or any(marker in lower for marker in ("fal.media", "fal-cdn", "replicate.delivery"))
+            )
+
+        def _normalize_image_ref(ref: str) -> Optional[str]:
+            raw = (ref or "").strip().strip("<>")
+            if not raw:
+                return None
+            if raw.startswith(("http://", "https://")):
+                return raw if _looks_like_image_ref(raw) else None
+            if raw.startswith("file://"):
+                local_ref = _url_unquote(raw[7:])
+            elif raw.startswith(("/", "~/")):
+                local_ref = raw
+            else:
+                return None
+
+            safe_path = validate_media_delivery_path(local_ref)
+            if not safe_path:
+                return None
+            if Path(safe_path).suffix.lower() not in SUPPORTED_IMAGE_DOCUMENT_TYPES:
+                return None
+            return "file://" + _url_quote(safe_path)
+
+        extracted_refs = set()
+
         # Match markdown images: ![alt](url)
-        md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
+        md_pattern = r'!\[([^\]]*)\]\(([^\)\n]+)\)'
         for match in re.finditer(md_pattern, content):
             alt_text = match.group(1)
-            url = match.group(2)
-            # Only extract URLs that look like actual images
-            if any(url.lower().endswith(ext) or ext in url.lower() for ext in
-                   ['.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn', 'replicate.delivery']):
-                images.append((url, alt_text))
+            ref = match.group(2)
+            normalized = _normalize_image_ref(ref)
+            if normalized:
+                images.append((normalized, alt_text))
+                extracted_refs.add(ref)
         
         # Match HTML img tags: <img src="url"> or <img src="url"></img> or <img src="url"/>
         html_pattern = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
         for match in re.finditer(html_pattern, content):
             url = match.group(1)
-            images.append((url, ""))
+            normalized = _normalize_image_ref(url)
+            if normalized:
+                images.append((normalized, ""))
+                extracted_refs.add(url)
         
         # Remove only the matched image tags from content (not all markdown images)
         if images:
-            extracted_urls = {url for url, _ in images}
             def _remove_if_extracted(match):
-                url = match.group(2) if match.lastindex >= 2 else match.group(1)
-                return '' if url in extracted_urls else match.group(0)
+                ref = match.group(2) if match.lastindex >= 2 else match.group(1)
+                return '' if ref in extracted_refs else match.group(0)
             cleaned = re.sub(md_pattern, _remove_if_extracted, cleaned)
             cleaned = re.sub(html_pattern, _remove_if_extracted, cleaned)
             # Clean up leftover blank lines
@@ -3214,6 +3453,32 @@ class BasePlatformAdapter(ABC):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes."""
 
+    async def handle_agent_control_response(
+        self,
+        event: MessageEvent,
+        control: AgentControlResponse,
+    ) -> SendResult:
+        """Consume an explicit non-text final-response marker.
+
+        Subclasses can override this to perform native platform actions, such
+        as reacting to the triggering message. The default behavior is a quiet
+        success so the marker is never sent as user-visible text.
+        """
+        try:
+            setattr(event, "_agent_control_response", control.action)
+            if control.emoji:
+                setattr(event, "_agent_control_reaction", control.emoji)
+        except Exception:
+            pass
+        return SendResult(
+            success=True,
+            message_id=None,
+            raw_response={
+                "control_response": control.action,
+                "emoji": control.emoji,
+            },
+        )
+
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
@@ -3305,7 +3570,15 @@ class BasePlatformAdapter(ABC):
         if is_network:
             # Retry with exponential backoff for transient errors
             for attempt in range(1, max_retries + 1):
-                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                retry_after = result.retry_after or 0.0
+                # Honor platform flood-control windows rather than immediately
+                # re-sending with the generic 2s/4s backoff. A small buffer
+                # prevents a boundary-timing 429 from turning into a retry
+                # storm when several gateway tasks finish together.
+                delay = max(
+                    base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1),
+                    float(retry_after) + 1.0 if retry_after else 0.0,
+                )
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,
@@ -3993,14 +4266,41 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_error: Optional[str] = None
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_error
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                delivery_error = None
+            else:
+                delivery_error = str(
+                    getattr(result, "error", None) or "platform delivery failed"
+                )
+
+        async def _persist_durable_delivery_receipt() -> None:
+            job_id = str(getattr(event, "durable_job_id", None) or "")
+            handler = getattr(self, "_durable_job_delivery_handler", None)
+            if not job_id or not callable(handler) or not delivery_attempted:
+                return
+            try:
+                result = handler(
+                    event,
+                    attempted=delivery_attempted,
+                    succeeded=delivery_succeeded,
+                    error=delivery_error,
+                )
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception(
+                    "[%s] Failed to persist durable delivery receipt for job %s",
+                    self.name,
+                    job_id,
+                )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -4008,7 +4308,13 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         
-        # Start continuous typing indicator (refreshes every 2 seconds)
+        # Start continuous typing indicator (refreshes every 2 seconds).
+        #
+        # Telegram voice/audio must first pass through STT and trigger-policy
+        # evaluation.  Starting typing before that decision makes transcript-
+        # only audio look as if the bot is preparing a reply.  Keep the typing
+        # task dormant for those events; GatewayRunner releases the per-event
+        # gate only after preprocessing confirms that a response will follow.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
@@ -4017,11 +4323,29 @@ class BasePlatformAdapter(ABC):
             _keep_typing_sig = None
         if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
             _keep_typing_kwargs["stop_event"] = interrupt_event
-        typing_task = asyncio.create_task(
-            self._keep_typing(
+
+        _defer_typing = (
+            self.platform == Platform.TELEGRAM
+            and event.message_type in {MessageType.VOICE, MessageType.AUDIO}
+        )
+        if _defer_typing:
+            event._typing_indicator_ready = asyncio.Event()
+
+            async def _keep_typing_after_response_decision() -> None:
+                await event._typing_indicator_ready.wait()
+                await self._keep_typing(
+                    event.source.chat_id,
+                    **_keep_typing_kwargs,
+                )
+
+            _typing_coro = _keep_typing_after_response_decision()
+        else:
+            _typing_coro = self._keep_typing(
                 event.source.chat_id,
                 **_keep_typing_kwargs,
             )
+        typing_task = asyncio.create_task(
+            _typing_coro
         )
 
         async def _stop_typing_task() -> None:
@@ -4069,6 +4393,55 @@ class BasePlatformAdapter(ABC):
                     session_key,
                 )
                 response = None
+            if response:
+                if self.platform == Platform.TELEGRAM:
+                    (
+                        reaction_control,
+                        reaction_remaining,
+                        bare_reaction,
+                    ) = extract_agent_reaction_control(
+                        response,
+                        include_bare_telegram_emoji=True,
+                    )
+                    if reaction_control is not None:
+                        original_reaction_response = response
+                        logger.info(
+                            "[%s] Consuming agent reaction response (%s) for %s",
+                            self.name,
+                            "bare_emoji" if bare_reaction else "marker",
+                            event.source.chat_id,
+                        )
+                        control_result = await self.handle_agent_control_response(
+                            event,
+                            reaction_control,
+                        )
+                        _record_delivery(control_result)
+                        response = reaction_remaining
+                        reaction_sent = bool(
+                            isinstance(control_result.raw_response, dict)
+                            and control_result.raw_response.get("reaction_sent")
+                        )
+                        if bare_reaction and not response and not reaction_sent:
+                            response = original_reaction_response
+
+            if response:
+                control_response = parse_agent_control_response(
+                    response,
+                    include_legacy_silence=True,
+                )
+                if control_response is not None:
+                    logger.info(
+                        "[%s] Consuming agent control response (%s) for %s",
+                        self.name,
+                        control_response.action,
+                        event.source.chat_id,
+                    )
+                    control_result = await self.handle_agent_control_response(
+                        event,
+                        control_response,
+                    )
+                    _record_delivery(control_result)
+                    response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
@@ -4175,63 +4548,9 @@ class BasePlatformAdapter(ABC):
                         except OSError:
                             pass
 
-                # Send the text portion
-                if text_content and not _tts_caption_delivered:
-                    logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    _reply_anchor = _reply_anchor_for_event(event)
-                    # Mark final response messages for notification delivery.
-                    # Platform adapters that support per-message notification
-                    # control (e.g. Telegram's disable_notification) use this
-                    # flag to override silent-mode and ensure the final
-                    # response triggers a push notification.
-                    # Clone to avoid mutating the metadata shared with the
-                    # typing-indicator task (which must remain unmarked).
-                    if _thread_metadata is not None:
-                        _thread_metadata = dict(_thread_metadata)
-                        _thread_metadata["notify"] = True
-                    else:
-                        _thread_metadata = {"notify": True}
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_thread_metadata,
-                    )
-                    _record_delivery(result)
-
-                    # Schedule auto-deletion of system-notice replies.
-                    # Detached so the handler returns immediately; errors
-                    # (permission denied, message too old) are swallowed.
-                    if (
-                        _ephemeral_ttl
-                        and _ephemeral_ttl > 0
-                        and result.success
-                        and result.message_id
-                    ):
-                        self._schedule_ephemeral_delete(
-                            chat_id=event.source.chat_id,
-                            message_id=result.message_id,
-                            ttl_seconds=_ephemeral_ttl,
-                        )
-
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
-                # Send extracted images as native attachments
-                if images:
-                    logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-                    try:
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=images,
-                            metadata=_thread_metadata,
-                            human_delay=human_delay,
-                        )
-                    except Exception as batch_err:
-                        logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
-
-
-                # Send extracted media files — route by file type
                 _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
                 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
@@ -4260,18 +4579,105 @@ class BasePlatformAdapter(ABC):
                     else:
                         _non_image_local.append(file_path)
 
-                if _image_paths:
+                image_attachments = list(images or [])
+                image_attachments.extend((f"file://{_quote(p)}", "") for p in _image_paths)
+
+                def _mark_final_notification_metadata() -> Optional[Dict[str, Any]]:
+                    nonlocal _thread_metadata
+                    if _thread_metadata is not None:
+                        if _thread_metadata.get("notify") is not True:
+                            _thread_metadata = dict(_thread_metadata)
+                            _thread_metadata["notify"] = True
+                    else:
+                        _thread_metadata = {"notify": True}
+                    return _thread_metadata
+
+                def _schedule_ephemeral_result(result: SendResult) -> None:
+                    if (
+                        _ephemeral_ttl
+                        and _ephemeral_ttl > 0
+                        and result.success
+                        and result.message_id
+                    ):
+                        self._schedule_ephemeral_delete(
+                            chat_id=event.source.chat_id,
+                            message_id=result.message_id,
+                            ttl_seconds=_ephemeral_ttl,
+                        )
+
+                # Telegram has native photo captions. For the common "post +
+                # one generated picture" shape, deliver one post instead of a
+                # text bubble followed by a separate image bubble. Keep longer
+                # text separate so Telegram does not silently truncate captions.
+                _captioned_image_delivered = False
+                if (
+                    self.platform == Platform.TELEGRAM
+                    and text_content
+                    and not _tts_caption_delivered
+                    and len(image_attachments) == 1
+                    and utf16_len(text_content) <= 1024
+                ):
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                        logger.info(
+                            "[%s] Sending one Telegram image with text caption (%d chars)",
+                            self.name, len(text_content),
+                        )
+                        result = await self._send_single_image_attachment(
+                            chat_id=event.source.chat_id,
+                            image_url=image_attachments[0][0],
+                            caption=text_content,
+                            reply_to=_reply_anchor_for_event(event),
+                            metadata=_mark_final_notification_metadata(),
+                        )
+                        _record_delivery(result)
+                        if result.success:
+                            _schedule_ephemeral_result(result)
+                            image_attachments = []
+                            text_content = ""
+                            _captioned_image_delivered = True
+                        else:
+                            logger.warning(
+                                "[%s] Captioned image send failed, falling back to separate text/media: %s",
+                                self.name, result.error,
+                            )
+                    except Exception as caption_err:
+                        logger.warning(
+                            "[%s] Captioned image delivery failed, falling back to separate text/media: %s",
+                            self.name, caption_err, exc_info=True,
+                        )
+
+                # Send the text portion
+                if text_content and not _tts_caption_delivered and not _captioned_image_delivered:
+                    logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                    _reply_anchor = _reply_anchor_for_event(event)
+                    result = await self._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=text_content,
+                        reply_to=_reply_anchor,
+                        metadata=_mark_final_notification_metadata(),
+                    )
+                    _record_delivery(result)
+
+                    # Schedule auto-deletion of system-notice replies.
+                    # Detached so the handler returns immediately; errors
+                    # (permission denied, message too old) are swallowed.
+                    _schedule_ephemeral_result(result)
+
+                # Send extracted images as native attachments
+                if image_attachments:
+                    logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(image_attachments))
+                    try:
                         await self.send_multiple_images(
                             chat_id=event.source.chat_id,
-                            images=_batch,
-                            metadata=_thread_metadata,
+                            images=image_attachments,
+                            metadata=_mark_final_notification_metadata(),
                             human_delay=human_delay,
                         )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
+
+                # Send extracted media files — route by file type
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
@@ -4403,7 +4809,7 @@ class BasePlatformAdapter(ABC):
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
+                error_result = await self.send(
                     chat_id=event.source.chat_id,
                     content=(
                         f"Sorry, I encountered an error ({error_type}).\n"
@@ -4412,9 +4818,11 @@ class BasePlatformAdapter(ABC):
                     ),
                     metadata=_thread_metadata,
                 )
+                _record_delivery(error_result)
             except Exception:
                 pass  # Last resort — don't let error reporting crash the handler
         finally:
+            await _persist_durable_delivery_receipt()
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
             #

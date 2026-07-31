@@ -27,14 +27,144 @@ def _reset_signal_scheduler():
 
 from gateway.config import Platform
 from tools.send_message_tool import (
+    _explicit_cross_chat_request_error,
+    _is_cross_chat_delivery,
     _is_telegram_thread_not_found,
     _parse_target_ref,
+    _personal_planning_delivery_error,
+    _personal_planning_origin_scope,
+    _same_telegram_chat_delivery_error,
+    _telegram_cross_chat_request_users,
+    _telegram_send_message_scope,
     _send_matrix_via_adapter,
     _send_signal,
     _send_telegram,
     _send_to_platform,
     send_message_tool,
 )
+
+
+def _planning_session_env(monkeypatch, *, chat_id="-1003735932411", thread_id="313"):
+    values = {
+        "HERMES_SESSION_PROFILE_NAME": "personal",
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_ALLOWED_SKILLS": (
+            "telegram_planning/telegram_planning_context"
+        ),
+        "HERMES_SESSION_CHAT_ID": chat_id,
+        "HERMES_SESSION_THREAD_ID": thread_id,
+    }
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": values.get(name, default),
+    )
+
+
+def test_personal_planning_delivery_is_origin_chat_and_topic_only(monkeypatch):
+    _planning_session_env(monkeypatch)
+
+    assert _personal_planning_origin_scope() == {
+        "chat_id": "-1003735932411",
+        "thread_id": "313",
+    }
+    assert _personal_planning_delivery_error(
+        "telegram", "-1003735932411", "313"
+    ) is None
+    assert "originating Telegram chat" in _personal_planning_delivery_error(
+        "telegram", "-1002757852891", "313"
+    )
+    assert "originating Telegram topic" in _personal_planning_delivery_error(
+        "telegram", "-1003735932411", None
+    )
+
+
+def test_personal_planning_target_list_exposes_only_origin(monkeypatch):
+    _planning_session_env(monkeypatch)
+
+    payload = json.loads(send_message_tool({"action": "list"}))
+
+    assert payload == {
+        "targets": ["telegram:-1003735932411:313"],
+        "scope": "personal_planning_origin_only",
+    }
+
+
+def test_same_chat_policy_allows_another_topic_but_blocks_another_chat():
+    telegram_extra = {
+        "group_topics": [{
+            "chat_id": "-1003938895426",
+            "send_message_scope": "same_chat",
+            "topics": [],
+        }],
+    }
+
+    assert _same_telegram_chat_delivery_error(
+        origin_platform="telegram",
+        origin_chat_id="-1003938895426",
+        destination_platform="telegram",
+        destination_chat_id="-1003938895426",
+        telegram_extra=telegram_extra,
+    ) is None
+    error = _same_telegram_chat_delivery_error(
+        origin_platform="telegram",
+        origin_chat_id="-1003938895426",
+        destination_platform="telegram",
+        destination_chat_id="179555559",
+        telegram_extra=telegram_extra,
+    )
+    assert "only allows cross-topic delivery inside the same chat" in error
+
+
+def test_cross_chat_approval_policy_detects_external_route_without_hard_block():
+    telegram_extra = {
+        "group_topics": [{
+            "chat_id": "-1003938895426",
+            "send_message_scope": "cross_chat_approval",
+            "cross_chat_request_users": [179555559],
+            "topics": [],
+        }],
+    }
+
+    assert _telegram_send_message_scope(
+        origin_platform="telegram",
+        origin_chat_id="-1003938895426",
+        telegram_extra=telegram_extra,
+    ) == "cross_chat_approval"
+    assert _telegram_cross_chat_request_users(
+        origin_platform="telegram",
+        origin_chat_id="-1003938895426",
+        telegram_extra=telegram_extra,
+    ) == {"179555559"}
+    assert _same_telegram_chat_delivery_error(
+        origin_platform="telegram",
+        origin_chat_id="-1003938895426",
+        destination_platform="telegram",
+        destination_chat_id="179555559",
+        telegram_extra=telegram_extra,
+    ) is None
+    assert _is_cross_chat_delivery(
+        origin_platform="telegram",
+        origin_chat_id="-1003938895426",
+        destination_platform="telegram",
+        destination_chat_id="179555559",
+    ) is True
+
+
+def test_cross_chat_request_quote_must_be_verbatim_and_explicit():
+    request = "Отправь, пожалуйста, этот результат в Ассистент"
+
+    assert _explicit_cross_chat_request_error(
+        current_user_request=request,
+        user_request_quote="Отправь, пожалуйста, этот результат в Ассистент",
+    ) is None
+    assert "not present" in _explicit_cross_chat_request_error(
+        current_user_request=request,
+        user_request_quote="Отправь результат в другой чат",
+    )
+    assert "does not explicitly request" in _explicit_cross_chat_request_error(
+        current_user_request="Ассистент — мой личный чат",
+        user_request_quote="Ассистент — мой личный чат",
+    )
 # Discord helpers moved to the plugin in #24325.  Import from the new path
 # and provide a thin ``_send_discord(token, ...)`` shim that mirrors the
 # pre-migration signature so the existing test bodies keep working.
@@ -133,7 +263,43 @@ def _install_telegram_mock(monkeypatch, bot):
     # MessageEntity needed by #27865 mention-detection path; tests don't
     # inspect it but the import must succeed.
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot, MessageEntity=_MessageEntity, constants=constants_mod)
+
+    class _WebAppInfo:
+        def __init__(self, url):
+            self.url = url
+
+    class _InlineKeyboardButton:
+        def __init__(self, text, url=None, web_app=None, **_kwargs):
+            self.text = text
+            self.url = url
+            self.web_app = web_app
+
+    class _InlineKeyboardMarkup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+
+    class _InputMediaPhoto:
+        def __init__(self, media, caption=None, **kwargs):
+            self.media = media
+            self.caption = caption
+            self.kwargs = kwargs
+
+    class _InputMediaVideo:
+        def __init__(self, media, caption=None, **kwargs):
+            self.media = media
+            self.caption = caption
+            self.kwargs = kwargs
+
+    telegram_mod = SimpleNamespace(
+        Bot=lambda token: bot,
+        InlineKeyboardButton=_InlineKeyboardButton,
+        InlineKeyboardMarkup=_InlineKeyboardMarkup,
+        WebAppInfo=_WebAppInfo,
+        InputMediaPhoto=_InputMediaPhoto,
+        InputMediaVideo=_InputMediaVideo,
+        MessageEntity=_MessageEntity,
+        constants=constants_mod,
+    )
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
@@ -163,6 +329,140 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    @staticmethod
+    def _cross_chat_config():
+        telegram_cfg = SimpleNamespace(
+            enabled=True,
+            token="***",
+            extra={
+                "group_topics": [{
+                    "chat_id": "-1003938895426",
+                    "send_message_scope": "cross_chat_approval",
+                    "cross_chat_request_users": [179555559],
+                    "topics": [],
+                }],
+            },
+        )
+        config = SimpleNamespace(
+            platforms={Platform.TELEGRAM: telegram_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        return config, telegram_cfg
+
+    def test_cross_chat_send_requires_current_user_request_quote(self):
+        config, _telegram_cfg = self._cross_chat_config()
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "telegram",
+            "HERMES_SESSION_CHAT_ID": "-1003938895426",
+            "HERMES_SESSION_USER_REQUEST": (
+                "Покажи результат здесь, никуда его не отправляй"
+            ),
+            "HERMES_SESSION_USER_ID": "179555559",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "gateway.session_context.get_session_env",
+                 side_effect=lambda name, default="": session_values.get(name, default),
+             ), \
+             patch("tools.approval.check_gateway_action_approval") as approval_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "telegram:179555559",
+                    "message": "result",
+                })
+            )
+
+        assert "exact quote" in result["error"]
+        approval_mock.assert_not_called()
+        send_mock.assert_not_awaited()
+
+    def test_cross_chat_send_cannot_be_requested_by_another_participant(self):
+        config, _telegram_cfg = self._cross_chat_config()
+        user_request = "Отправь этот результат в личный Ассистент"
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "telegram",
+            "HERMES_SESSION_CHAT_ID": "-1003938895426",
+            "HERMES_SESSION_USER_REQUEST": user_request,
+            "HERMES_SESSION_USER_ID": "5843430403",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "gateway.session_context.get_session_env",
+                 side_effect=lambda name, default="": session_values.get(name, default),
+             ), \
+             patch("tools.approval.check_gateway_action_approval") as approval_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "telegram:179555559",
+                    "message": "result",
+                    "user_request_quote": user_request,
+                })
+            )
+
+        assert "configured owner" in result["error"]
+        approval_mock.assert_not_called()
+        send_mock.assert_not_awaited()
+
+    def test_cross_chat_send_asks_route_approval_after_explicit_request(self):
+        config, telegram_cfg = self._cross_chat_config()
+        user_request = "Отправь этот результат в личный Ассистент"
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "telegram",
+            "HERMES_SESSION_CHAT_ID": "-1003938895426",
+            "HERMES_SESSION_USER_REQUEST": user_request,
+            "HERMES_SESSION_USER_ID": "179555559",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "gateway.session_context.get_session_env",
+                 side_effect=lambda name, default="": session_values.get(name, default),
+             ), \
+             patch(
+                 "tools.approval.check_gateway_action_approval",
+                 return_value={"approved": True, "approval_scope": "once"},
+             ) as approval_mock, \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True}),
+             ) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "telegram:179555559",
+                    "message": "result",
+                    "user_request_quote": user_request,
+                })
+            )
+
+        assert result["success"] is True
+        approval_mock.assert_called_once()
+        assert (
+            approval_mock.call_args.kwargs["action_key"]
+            == "send_message:cross_chat:telegram:-1003938895426"
+               "->telegram:179555559"
+        )
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "179555559",
+            "result",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()
@@ -442,7 +742,7 @@ class TestSendMessageTool:
 
 
 class TestSendTelegramMediaDelivery:
-    def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):
+    def test_sends_single_photo_with_caption_for_short_image_post(self, tmp_path, monkeypatch):
         image_path = tmp_path / "photo.png"
         image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
 
@@ -466,11 +766,69 @@ class TestSendTelegramMediaDelivery:
 
         assert result["success"] is True
         assert result["message_id"] == "2"
+        bot.send_message.assert_not_awaited()
+        bot.send_photo.assert_awaited_once()
+        assert bot.send_photo.await_args.kwargs["caption"] == "Hello there"
+
+    def test_sends_multiple_photos_with_caption_on_first_photo(self, tmp_path, monkeypatch):
+        first_path = tmp_path / "first.png"
+        second_path = tmp_path / "second.png"
+        first_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        second_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.send_photo = AsyncMock(side_effect=[SimpleNamespace(message_id=2), SimpleNamespace(message_id=3)])
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                "Caption text",
+                media_files=[(str(first_path), False), (str(second_path), False)],
+            )
+        )
+
+        assert result["success"] is True
+        assert result["message_id"] == "3"
+        bot.send_message.assert_not_awaited()
+        assert bot.send_photo.await_count == 2
+        first_call, second_call = bot.send_photo.await_args_list
+        assert first_call.kwargs["caption"] == "Caption text"
+        assert "caption" not in second_call.kwargs
+
+    def test_sends_long_text_separately_before_photo(self, tmp_path, monkeypatch):
+        image_path = tmp_path / "photo.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=2))
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        long_text = "x" * 1025
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                long_text,
+                media_files=[(str(image_path), False)],
+            )
+        )
+
+        assert result["success"] is True
         bot.send_message.assert_awaited_once()
         bot.send_photo.assert_awaited_once()
-        sent_text = bot.send_message.await_args.kwargs["text"]
-        assert "MEDIA:" not in sent_text
-        assert sent_text == "Hello there"
+        assert "caption" not in bot.send_photo.await_args.kwargs
 
     def test_sends_voice_for_ogg_with_voice_directive(self, tmp_path, monkeypatch):
         voice_path = tmp_path / "voice.ogg"
@@ -939,6 +1297,56 @@ class TestSendTelegramHtmlDetection:
         sleep_mock.assert_awaited_once()
 
 
+class TestSendTelegramMiniappButtons:
+    def test_startapp_link_is_sent_as_inline_button(self, monkeypatch):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        message = (
+            "Подтягивания 15:30: 4-5 повторов.\n\n"
+            "Открыть тренировки: https://t.me/TripiooBot?startapp=fitness_day"
+        )
+        result = asyncio.run(_send_telegram("tok", "123", message))
+
+        assert result["success"] is True
+        kwargs = bot.send_message.await_args.kwargs
+        assert "https://t.me/TripiooBot" not in kwargs["text"]
+        assert "reply_markup" in kwargs
+        button = kwargs["reply_markup"].inline_keyboard[0][0]
+        assert button.text == "Открыть день"
+        assert button.web_app.url == "https://miniapp.mayk05.pro/?startapp=fitness_day"
+
+    def test_group_startapp_link_stays_url_button(self, monkeypatch):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram(
+                "tok",
+                "-100123",
+                "Открыть планирование: https://t.me/TripiooBot?startapp=planning",
+            )
+        )
+
+        assert result["success"] is True
+        button = bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        assert button.text == "Открыть планирование"
+        assert button.url == "https://t.me/TripiooBot?startapp=planning"
+        assert button.web_app is None
+
+
 class TestSendTelegramThreadIdMapping:
     """General-topic mapping in _send_telegram (issue #22267).
 
@@ -996,44 +1404,38 @@ class TestSendTelegramThreadIdMapping:
         kwargs = bot.send_message.await_args.kwargs
         assert "message_thread_id" not in kwargs
 
-    def test_thread_not_found_retries_without_message_thread_id(self, monkeypatch):
-        """When send_message raises "thread not found", retry without thread_id (#27012)."""
+    def test_group_thread_not_found_fails_without_general_fallback(self, monkeypatch):
+        """A failed group-topic send must never escape into General."""
         bot = self._make_bot()
         _install_telegram_mock(monkeypatch, bot)
 
-        # First call raises thread-not-found, second succeeds
-        bot.send_message = AsyncMock(side_effect=[
-            Exception("Bad Request: message thread not found"),
-            SimpleNamespace(message_id=2),
-        ])
+        bot.send_message = AsyncMock(
+            side_effect=Exception("Bad Request: message thread not found")
+        )
 
-        asyncio.run(
+        result = asyncio.run(
             _send_telegram("tok", "-1001234567890", "hello", thread_id="17585")
         )
 
-        assert bot.send_message.await_count == 2
-        # First call: should include message_thread_id=17585
+        assert "error" in result
+        assert bot.send_message.await_count == 1
         call1_kwargs = bot.send_message.await_args_list[0].kwargs
         assert call1_kwargs["message_thread_id"] == 17585
-        # Second call (retry): should NOT include message_thread_id
-        call2_kwargs = bot.send_message.await_args_list[1].kwargs
-        assert "message_thread_id" not in call2_kwargs
 
-    def test_thread_not_found_for_media_retries_without_message_thread_id(self, monkeypatch, tmp_path):
-        """Media send with stale thread_id retries without it (#27012)."""
+    def test_group_thread_not_found_for_media_fails_without_general_fallback(self, monkeypatch, tmp_path):
+        """Group-topic media must not be retried into General."""
         bot = self._make_bot()
         # Mock send_document to fail with thread-not-found, then succeed
-        bot.send_document = AsyncMock(side_effect=[
-            Exception("Bad Request: message thread not found"),
-            SimpleNamespace(message_id=3),
-        ])
+        bot.send_document = AsyncMock(
+            side_effect=Exception("Bad Request: message thread not found")
+        )
         _install_telegram_mock(monkeypatch, bot)
 
         # Create a test file
         test_file = tmp_path / "doc.txt"
         test_file.write_text("test content")
 
-        asyncio.run(
+        result = asyncio.run(
             _send_telegram(
                 "tok", "-1001234567890", "",
                 media_files=[(str(test_file), False)],
@@ -1041,13 +1443,10 @@ class TestSendTelegramThreadIdMapping:
             )
         )
 
-        assert bot.send_document.await_count == 2
-        # First call: should include message_thread_id=17585
+        assert "error" in result
+        assert bot.send_document.await_count == 1
         call1_kwargs = bot.send_document.await_args_list[0].kwargs
         assert call1_kwargs["message_thread_id"] == 17585
-        # Second call (retry): should NOT include message_thread_id
-        call2_kwargs = bot.send_document.await_args_list[1].kwargs
-        assert "message_thread_id" not in call2_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -2694,16 +3093,13 @@ class TestSendTelegramThreadNotFoundRetry:
         assert _is_telegram_thread_not_found(FakeError("parse error")) is False
         assert _is_telegram_thread_not_found(FakeError("")) is False
 
-    def test_text_send_retries_without_thread_id_on_thread_not_found(self):
-        """When thread is not found, the text send should retry without
-        message_thread_id."""
+    def test_group_text_send_does_not_retry_without_thread_id(self):
+        """A failed group-topic text send must not retry into General."""
         call_args = []
 
         async def fake_retry(bot, *, chat_id, text, parse_mode, **kwargs):
             call_args.append(dict(kwargs, chat_id=chat_id, text=text))
-            if len(call_args) == 1:
-                raise Exception("Bad Request: message thread not found")
-            return SimpleNamespace(message_id=42)
+            raise Exception("Bad Request: message thread not found")
 
         async def run_test():
             with patch(
@@ -2719,14 +3115,9 @@ class TestSendTelegramThreadNotFoundRetry:
                 )
 
         result = asyncio.run(run_test())
-        assert result["success"] is True
-        assert result["message_id"] == "42"
-        assert len(call_args) == 2, f"expected 2 calls, got {len(call_args)}"
-        # First call should have message_thread_id
+        assert "error" in result
+        assert len(call_args) == 1
         assert call_args[0].get("message_thread_id") is not None
-        # Second call (retry) should NOT have message_thread_id
-        assert "message_thread_id" not in call_args[1], \
-            "retry should drop message_thread_id after thread-not-found"
 
     def test_disable_web_page_preview_not_leaked_to_media_sends(self):
         """disable_web_page_preview should only appear in text send, not media sends."""

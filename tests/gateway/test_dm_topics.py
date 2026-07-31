@@ -542,7 +542,7 @@ def test_cache_dm_topic_from_message_no_overwrite():
 
 def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id=None,
                        user_id=42, user_name="Test User", forum_topic_created=None,
-                       is_topic_message=None, is_forum=None):
+                       forum_topic_edited=None, is_topic_message=None, is_forum=None):
     """Create a mock Telegram Message for _build_message_event tests."""
     chat = SimpleNamespace(
         id=chat_id,
@@ -573,6 +573,7 @@ def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id
         reply_to_message=None,
         date=None,
         forum_topic_created=forum_topic_created,
+        forum_topic_edited=forum_topic_edited,
     )
     return msg
 
@@ -782,6 +783,27 @@ def test_group_topic_unmapped_thread_id():
 
     assert event.auto_skill is None
     assert event.source.chat_topic is None
+
+
+def test_group_topic_name_discovered_from_service_message():
+    """New forum topics should provide context even before config is updated."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    msg = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=1255,
+        text="",
+        forum_topic_created=SimpleNamespace(name="Mario Odyssey"),
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.source.chat_topic == "Mario Odyssey"
+    assert adapter._get_cached_topic_name("-1001234567890", "1255") == "Mario Odyssey"
 
 
 def test_group_topic_unmapped_chat_id():

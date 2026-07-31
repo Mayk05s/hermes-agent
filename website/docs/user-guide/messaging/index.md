@@ -484,20 +484,20 @@ Once upstream is healthy, `/platform resume <name>` clears the breaker and re-ar
 
 ### Restart notifications
 
-When the gateway restarts (or is shut down with in-flight sessions), it can send a one-shot "the agent is back" / "the agent was interrupted" message to each platform's home channel. This is controlled per-platform by the `gateway_restart_notification` flag in `gateway-config.yaml`, which defaults to `true`:
+When the gateway restarts (or is shut down with in-flight sessions), it can send a one-shot "the agent is back" / "the agent was interrupted" message to each platform's home channel. This is controlled per-platform by the `gateway_restart_notification` flag in `gateway-config.yaml`, which defaults to `false`:
 
 ```yaml
 gateway:
   platforms:
     telegram:
       home_chat_id: "123456789"
-      gateway_restart_notification: false   # opt out for this platform
+      gateway_restart_notification: true   # explicitly opt in for this platform
     discord:
       home_chat_id: "987654321"
-      # gateway_restart_notification omitted → defaults to true
+      # gateway_restart_notification omitted → defaults to false
 ```
 
-Disable it on noisy or low-priority platforms while leaving it on for your primary chat. The notification is sent once per restart, regardless of how many sessions were in flight.
+Enable it only on an operator back-channel where lifecycle events are useful. The notification is sent once per restart, regardless of how many sessions were in flight.
 
 ### Session resume across gateway restarts
 
@@ -509,7 +509,7 @@ This behaviour is on by default and is logged at gateway start:
 Scheduled auto-resume for N restart-interrupted session(s)
 ```
 
-No configuration is required. If you don't want the heads-up, set `gateway_restart_notification: false` on the platform.
+No configuration is required to keep lifecycle messages silent. Set `gateway_restart_notification: true` only on an operator back-channel where the heads-up is wanted.
 
 ### Mobile-friendly progress defaults
 

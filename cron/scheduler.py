@@ -14,9 +14,11 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -42,6 +44,40 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+_MEME_TITLE_LINE_RE = re.compile(r"(?mi)^\s*MEME_TITLE:\s*(.+?)\s*$")
+
+
+def _record_meme_delivery(job: dict, response: str) -> str:
+    """Persist a meme job's canonical title and remove its internal marker.
+
+    This is opt-in per cron job. The model receives the rolling history at the
+    next run, so an already delivered meme cannot silently return tomorrow.
+    """
+    history_path = job.get("meme_history_path")
+    if not history_path:
+        return response
+    match = _MEME_TITLE_LINE_RE.search(response)
+    if not match:
+        logger.warning("Job '%s': meme response lacks MEME_TITLE marker", job.get("id", "?"))
+        return response
+    title = re.sub(r"\s+", " ", match.group(1)).strip()[:120]
+    cleaned_response = _MEME_TITLE_LINE_RE.sub("", response, count=1).lstrip()
+    if not title:
+        return cleaned_response
+    try:
+        path = Path(str(history_path)).expanduser()
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        delivered = data.get("delivered") if isinstance(data.get("delivered"), list) else []
+        normalized = title.casefold()
+        delivered = [item for item in delivered if str(item.get("title", "")).casefold() != normalized]
+        delivered.append({"title": title, "sent_at": _hermes_now().isoformat()})
+        data["delivered"] = delivered[-90:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("Job '%s': could not record delivered meme: %s", job.get("id", "?"), exc)
+    return cleaned_response
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -97,6 +133,9 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
+    if job.get("access_context") and "enabled_toolsets" in job:
+        return list(job.get("enabled_toolsets") or [])
+
     per_job = job.get("enabled_toolsets")
     if per_job:
         return per_job
@@ -567,6 +606,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
+    caption: str | None = None,
 ) -> None:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
@@ -580,18 +620,29 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
-    for media_path, _is_voice in media_files:
+    for index, (media_path, _is_voice) in enumerate(media_files):
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+            media_caption = caption if index == 0 else None
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
                 coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                coro = adapter.send_video(
+                    chat_id=chat_id,
+                    video_path=media_path,
+                    caption=media_caption,
+                    metadata=metadata,
+                )
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(
+                    chat_id=chat_id,
+                    image_path=media_path,
+                    caption=media_caption,
+                    metadata=metadata,
+                )
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, caption=media_caption, metadata=metadata)
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
@@ -637,28 +688,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
-    wrap_response = True
-    try:
-        user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
-
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    # A scheduled delivery is indistinguishable from a regular assistant
+    # reply to the recipient. Never expose scheduler framing or job IDs.
+    delivery_content = content
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -720,6 +752,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
+                media_caption = None
+                if text_to_send and media_files:
+                    media_ext = Path(media_files[0][0]).suffix.lower()
+                    if media_ext in (_IMAGE_EXTS | _VIDEO_EXTS) and len(text_to_send) <= 1024:
+                        media_caption = text_to_send
+                        text_to_send = ""
                 adapter_ok = True
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
@@ -766,6 +804,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        caption=media_caption,
                     )
 
                 if adapter_ok:
@@ -1024,13 +1063,20 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             success, script_output = _run_job_script(script_path)
         if success:
             if script_output:
-                prompt = (
+                script_context = (
                     "## Script Output\n"
                     "The following data was collected by a pre-run script. "
                     "Use it as context for your analysis.\n\n"
-                    f"```\n{script_output}\n```\n\n"
-                    f"{prompt}"
+                    f"```\n{script_output}\n```"
                 )
+                # Most scripts collect background data. A small class of
+                # policy scripts needs the final word over a legacy prompt;
+                # make that explicit and opt-in per job rather than relying
+                # on a model to resolve contradictory instructions by order.
+                if job.get("script_output_after_prompt"):
+                    prompt = f"{prompt}\n\n{script_context}"
+                else:
+                    prompt = f"{script_context}\n\n{prompt}"
             else:
                 # Script produced no output — nothing to report, skip AI call.
                 return None
@@ -1212,6 +1258,41 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
+    try:
+        from cron.access_control import CronAccessError, access_context_note, prepare_job_for_run
+
+        job = prepare_job_for_run(job)
+    except CronAccessError as exc:
+        job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+        error = str(exc)
+        logger.warning("Job '%s' blocked by cron access guard: %s", job_id, error)
+        doc = (
+            f"# Cron Job: {job_name} (BLOCKED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** BLOCKED\n\n"
+            "The cron access guard refused to run this job because its saved "
+            "profile, memory scope, skills, or toolsets no longer match the "
+            "chat/topic that created it.\n\n"
+            f"**Guard result:** {error}\n"
+        )
+        return False, doc, "", error
+    except Exception as exc:
+        job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+        error = f"{type(exc).__name__}: {exc}"
+        logger.exception("Job '%s' failed before cron access guard completed", job_id)
+        doc = (
+            f"# Cron Job: {job_name} (FAILED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** FAILED\n\n"
+            f"Failed to resolve cron access context: {error}\n"
+        )
+        return False, doc, "", error
+
+    access_context = job.get("access_context") or {}
+    if access_context:
+        logger.info("Job '%s': cron access context %s", job_id, access_context_note(access_context))
     with _job_profile_context(job_id, job.get("profile")):
         return _run_job_impl(job)
 
@@ -1434,10 +1515,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # Cron output delivery itself reads job["origin"] directly via
     # _resolve_origin(job) and the HERMES_CRON_AUTO_DELIVER_* vars set
     # below, so clearing HERMES_SESSION_* here does not affect delivery.
+    _access_context = job.get("access_context") or {}
     _ctx_tokens = set_session_vars(
         platform="",
         chat_id="",
         chat_name="",
+        allowed_skills=",".join(_access_context.get("allowed_skills") or []),
+        profile_name=str(_access_context.get("profile") or job.get("profile") or "default"),
+        scope_name=str(_access_context.get("scope") or "default"),
+        memory_scope=str(_access_context.get("memory_scope") or "default"),
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
@@ -1630,6 +1716,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
+        # Some image-hosts reject direct downloads while their rendered pages
+        # remain available to the browser. A narrow opt-in job flag lets a
+        # media-oriented cron job attach a screenshot created during its own
+        # run when the model forgets to echo the returned MEDIA path.
+        _browser_screenshot_started = time.time()
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -1657,7 +1749,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_memory=False,
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
@@ -1776,6 +1868,25 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
+        if job.get("attach_latest_browser_screenshot") and "MEDIA:" not in final_response:
+            screenshot_dir = _get_hermes_home() / "cache" / "screenshots"
+            try:
+                screenshots = [
+                    path
+                    for path in screenshot_dir.glob("browser_screenshot_*.png")
+                    if path.is_file() and path.stat().st_mtime >= _browser_screenshot_started
+                ]
+                if screenshots:
+                    latest_screenshot = max(screenshots, key=lambda path: path.stat().st_mtime)
+                    final_response = f"MEDIA:{latest_screenshot}\n{final_response.lstrip()}"
+                    logger.info(
+                        "Job '%s': attached browser screenshot created during this run: %s",
+                        job_id,
+                        latest_screenshot,
+                    )
+            except OSError as exc:
+                logger.warning("Job '%s': could not attach browser screenshot: %s", job_id, exc)
+        final_response = _record_meme_delivery(job, final_response)
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -1947,12 +2058,16 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
+                # output is already saved above). Failed jobs deliver a compact
+                # diagnostic to their origin so they cannot fail silently.
                 if success:
                     deliver_content = final_response
                 else:
-                    job_label = job.get('name', job['id'])
-                    deliver_content = f"⚠️ Cron job '{job_label}' failed (job_id: {job['id']}):\n{error}"
+                    job_label = job.get("name", job["id"])
+                    deliver_content = (
+                        f"⚠️ Запланированная задача «{job_label}» не выполнена. "
+                        f"Job ID: {job['id']}. Причина: {error}"
+                    )
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.

@@ -36,6 +36,12 @@ from gateway.platforms.base import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _busy_ack_enabled_by_default(monkeypatch):
+    """Keep acknowledgement tests isolated from the operator's live setting."""
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
+
+
 def _make_event(text="hello", chat_id="123", platform_val="telegram"):
     """Build a minimal MessageEvent."""
     source = SessionSource(
@@ -186,6 +192,50 @@ class TestBusySessionAck:
         assert "Queued for the next turn" in content
         assert "respond once the current task finishes" in content
         assert "Interrupting" not in content
+
+    @pytest.mark.asyncio
+    async def test_silent_queue_preserves_rapid_voice_burst(self, monkeypatch):
+        """A rapid voice burst is merged for the next turn without chat noise."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+        first = _make_event(text="")
+        first.message_type = MessageType.VOICE
+        first.media_urls = ["/tmp/voice-1.ogg"]
+        first.media_types = ["audio/ogg"]
+        sk = build_session_key(first.source)
+        runner.adapters[first.source.platform] = adapter
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        events = [first]
+        for index in (2, 3):
+            events.append(
+                MessageEvent(
+                    text="",
+                    message_type=MessageType.VOICE,
+                    source=first.source,
+                    message_id=f"msg{index}",
+                    media_urls=[f"/tmp/voice-{index}.ogg"],
+                    media_types=["audio/ogg"],
+                )
+            )
+
+        for event in events:
+            assert await runner._handle_active_session_busy_message(event, sk) is True
+
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+        pending = adapter._pending_messages[sk]
+        assert pending.media_urls == [
+            "/tmp/voice-1.ogg",
+            "/tmp/voice-2.ogg",
+            "/tmp/voice-3.ogg",
+        ]
+        assert pending.media_types == ["audio/ogg", "audio/ogg", "audio/ogg"]
 
     @pytest.mark.asyncio
     async def test_busy_text_mode_queue_delegates_to_adapter_handle_message(self):

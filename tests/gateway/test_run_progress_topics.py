@@ -58,6 +58,28 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class MediaProgressCaptureAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.image_batches = []
+
+    async def send_multiple_images(
+        self,
+        chat_id,
+        images,
+        metadata=None,
+        human_delay=0.0,
+    ) -> None:
+        self.image_batches.append(
+            {
+                "chat_id": chat_id,
+                "images": images,
+                "metadata": metadata,
+                "human_delay": human_delay,
+            }
+        )
+
+
 class SmallLimitProgressAdapter(ProgressCaptureAdapter):
     """Adapter with a tiny platform limit to exercise progress rollover."""
 
@@ -119,6 +141,35 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         raise AssertionError("non-editable adapters should not receive edit_message calls")
+
+
+class MiniappTrackingAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.miniapp_turns = []
+        self.miniapp_completions = []
+
+    def begin_miniapp_turn(self, chat_id, thread_id=None):
+        self.miniapp_turns.append((chat_id, thread_id))
+
+    def record_miniapp_tool_completion(
+        self,
+        chat_id,
+        thread_id,
+        tool_name,
+        *,
+        is_error=False,
+        result=None,
+    ):
+        self.miniapp_completions.append(
+            {
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "tool_name": tool_name,
+                "is_error": is_error,
+                "result": result,
+            }
+        )
 
 
 class FakeAgent:
@@ -197,6 +248,35 @@ class ManyProgressLinesAgent:
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
         time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class MiniappCompletionAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.completed",
+            "mcp_health_actions_create_planning_task",
+            duration=0.1,
+            is_error=False,
+            result='{"result":"{\\"ok\\":true}"}',
+        )
+        cb(
+            "tool.completed",
+            "mcp_google_calendar_create_event",
+            duration=0.1,
+            is_error=True,
+            result='{"error":"unavailable"}',
+        )
         return {
             "final_response": "done",
             "messages": [],
@@ -638,6 +718,29 @@ class QueuedCommentaryAgent:
         }
 
 
+class QueuedMediaAgent:
+    calls = 0
+    media_path = ""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            final_response = (
+                "Сделал первую карточку.\n\n"
+                f"MEDIA:{type(self).media_path}"
+            )
+        else:
+            final_response = "Обработал следующее сообщение."
+        return {
+            "final_response": final_response,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -767,6 +870,37 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert adapter.oversized_edits == []
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_forwards_completed_tools_to_miniapp_tracker(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MiniappCompletionAgent,
+        session_id="sess-miniapp-completion",
+        config_data={"display": {"tool_progress": "off"}},
+        adapter_cls=MiniappTrackingAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.miniapp_turns == [("-1001", "17585")]
+    assert adapter.miniapp_completions == [
+        {
+            "chat_id": "-1001",
+            "thread_id": "17585",
+            "tool_name": "mcp_health_actions_create_planning_task",
+            "is_error": False,
+            "result": '{"result":"{\\"ok\\":true}"}',
+        },
+        {
+            "chat_id": "-1001",
+            "thread_id": "17585",
+            "tool_name": "mcp_google_calendar_create_event",
+            "is_error": True,
+            "result": '{"error":"unavailable"}',
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -1014,6 +1148,45 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
     assert "final response 1" in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_run_agent_queued_message_delivers_first_response_media_natively(
+    monkeypatch,
+    tmp_path,
+):
+    """A queued follow-up must not leak the first response's MEDIA path as text."""
+    image_path = tmp_path / "generated-card.png"
+    image_path.write_bytes(b"fake png")
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+        (tmp_path,),
+    )
+    QueuedMediaAgent.calls = 0
+    QueuedMediaAgent.media_path = str(image_path)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedMediaAgent,
+        session_id="sess-queued-media",
+        pending_text="queued follow-up",
+        adapter_cls=MediaProgressCaptureAdapter,
+    )
+
+    sent_texts = [call["content"] for call in adapter.sent]
+    assert result["final_response"] == "Обработал следующее сообщение."
+    assert "Сделал первую карточку." in sent_texts
+    assert all("MEDIA:" not in text for text in sent_texts)
+    assert all(str(image_path) not in text for text in sent_texts)
+    assert adapter.image_batches == [
+        {
+            "chat_id": "-1001",
+            "images": [(image_path.as_uri(), "")],
+            "metadata": {"thread_id": "17585"},
+            "human_delay": 0.0,
+        }
+    ]
 
 
 @pytest.mark.asyncio

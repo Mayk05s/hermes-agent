@@ -31,12 +31,197 @@ support.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool
 # so they don't clutter the user's session history.
 _HIDDEN_SESSION_SOURCES = ("tool",)
+
+
+def _clean(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _truthy(value: Any) -> bool:
+    return _clean(value).lower() in {"1", "true", "yes", "y", "on", "enabled"}
+
+
+def _current_gateway_access_filter() -> Optional[Dict[str, str]]:
+    """Return the active gateway recall boundary.
+
+    CLI/local sessions intentionally remain global. Gateway sessions carry a
+    concrete platform + chat id; topic-isolated sessions stay in the current
+    topic, while non-isolated topics search within the resolved profile scope.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    platform = _clean(get_session_env("HERMES_SESSION_PLATFORM", ""))
+    chat_id = _clean(get_session_env("HERMES_SESSION_CHAT_ID", ""))
+    if not platform or not chat_id or platform in {"local", "cli"}:
+        return None
+
+    thread_id = _clean(get_session_env("HERMES_SESSION_THREAD_ID", ""))
+    profile_name = _clean(get_session_env("HERMES_SESSION_PROFILE_NAME", "")) or "default"
+    scope_name = _clean(get_session_env("HERMES_SESSION_SCOPE_NAME", "")) or "default"
+    memory_scope = _clean(get_session_env("HERMES_SESSION_MEMORY_SCOPE", "")) or scope_name
+    topic_isolation = _truthy(get_session_env("HERMES_SESSION_TOPIC_ISOLATION", ""))
+    mode = "topic" if thread_id and topic_isolation else "profile"
+    return {
+        "mode": mode,
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "profile_name": profile_name,
+        "scope_name": scope_name,
+        "memory_scope": memory_scope,
+    }
+
+
+def _current_gateway_access_filters() -> Optional[List[Dict[str, str]]]:
+    base = _current_gateway_access_filter()
+    if not base:
+        return None
+    filters = [base]
+    try:
+        from tools.recall_access_tool import get_granted_access_filters
+        filters.extend(get_granted_access_filters(base))
+    except Exception:
+        logging.debug("Failed to load recall access grants", exc_info=True)
+
+    seen = set()
+    unique = []
+    for item in filters:
+        if not item.get("mode"):
+            item = {**item, "mode": "topic"}
+        key = (
+            _clean(item.get("mode")),
+            _clean(item.get("platform")),
+            _clean(item.get("chat_id")),
+            _clean(item.get("thread_id")),
+            _clean(item.get("profile_name")),
+            _clean(item.get("memory_scope")),
+        )
+        if not key[1] or not key[2] or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _parse_access_scope(raw: Any) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _origin_matches_filter(origin: Dict[str, Any], access_filter: Dict[str, str]) -> bool:
+    if not isinstance(origin, dict):
+        return False
+    if access_filter.get("mode") == "profile":
+        wanted_profile = access_filter.get("profile_name") or "default"
+        origin_profile = _clean(origin.get("profile_name")) or "default"
+        if origin_profile != wanted_profile:
+            return False
+        wanted_memory = access_filter.get("memory_scope") or access_filter.get("scope_name") or "default"
+        origin_memory = _clean(origin.get("memory_scope")) or _clean(origin.get("scope_name")) or "default"
+        return origin_memory == wanted_memory
+
+    if access_filter.get("mode") == "chat":
+        if _clean(origin.get("platform")) != access_filter.get("platform", ""):
+            return False
+        if _clean(origin.get("chat_id")) != access_filter.get("chat_id", ""):
+            return False
+        wanted_profile = _clean(access_filter.get("profile_name"))
+        origin_profile = _clean(origin.get("profile_name")) or "default"
+        return not wanted_profile or origin_profile == wanted_profile
+
+    if _clean(origin.get("platform")) != access_filter.get("platform", ""):
+        return False
+    if _clean(origin.get("chat_id")) != access_filter.get("chat_id", ""):
+        return False
+
+    wanted_thread = access_filter.get("thread_id", "")
+    origin_thread = _clean(origin.get("thread_id"))
+    if wanted_thread:
+        return origin_thread == wanted_thread
+    return origin_thread == ""
+
+
+def _access_scope_matches_any_filter(raw_scope: Any, access_filters: Optional[List[Dict[str, str]]]) -> bool:
+    if not access_filters:
+        return True
+    scope = _parse_access_scope(raw_scope)
+    origin = scope.get("origin") if isinstance(scope, dict) else None
+    return any(_origin_matches_filter(origin, item) for item in access_filters)
+
+
+def _allowed_session_ids(db, access_filter: Optional[List[Dict[str, str]]]) -> Optional[Set[str]]:
+    """Build the set of sessions visible from the current gateway chat/thread.
+
+    Matching is based on the persisted origin access_scope. Descendants inherit
+    visibility so compression continuations and branches do not vanish when the
+    child row lacks its own access_scope.
+    """
+    if not access_filter:
+        return None
+
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return set()
+
+    try:
+        lock = getattr(db, "_lock", None)
+        if lock is not None:
+            with lock:
+                rows = conn.execute(
+                    "SELECT id, parent_session_id, access_scope FROM sessions"
+                ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, parent_session_id, access_scope FROM sessions"
+            ).fetchall()
+    except Exception as e:
+        logging.debug("session_search access-scope scan failed: %s", e, exc_info=True)
+        return set()
+
+    children: Dict[str, List[str]] = {}
+    allowed: Set[str] = set()
+    for row in rows:
+        data = dict(row)
+        sid = _clean(data.get("id"))
+        parent = _clean(data.get("parent_session_id"))
+        if parent:
+            children.setdefault(parent, []).append(sid)
+        if sid and _access_scope_matches_any_filter(data.get("access_scope"), access_filter):
+            allowed.add(sid)
+
+    queue = list(allowed)
+    while queue:
+        parent = queue.pop()
+        for child in children.get(parent, []):
+            if child not in allowed:
+                allowed.add(child)
+                queue.append(child)
+
+    return allowed
+
+
+def _session_allowed(session_id: str, allowed_session_ids: Optional[Set[str]]) -> bool:
+    if allowed_session_ids is None:
+        return True
+    return _clean(session_id) in allowed_session_ids
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -107,11 +292,20 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    access_filter: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
+        allowed_session_ids = _allowed_session_ids(db, access_filter)
+        fetch_limit = limit + 5
+        if allowed_session_ids is not None:
+            fetch_limit = max(fetch_limit, len(allowed_session_ids) + 5)
         sessions = db.list_sessions_rich(
-            limit=limit + 5,
+            limit=fetch_limit,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
         )  # fetch extra so we can skip current
@@ -122,6 +316,12 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
         for s in sessions:
             sid = s.get("id", "")
             if current_root and (sid == current_root or sid == current_session_id):
+                continue
+            lineage_root = s.get("_lineage_root_id") or sid
+            if not (
+                _session_allowed(sid, allowed_session_ids)
+                or _session_allowed(lineage_root, allowed_session_ids)
+            ):
                 continue
             # Skip child / delegation sessions
             if s.get("parent_session_id"):
@@ -138,13 +338,16 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
             if len(results) >= limit:
                 break
 
-        return json.dumps({
+        response = {
             "success": True,
             "mode": "browse",
             "results": results,
             "count": len(results),
             "message": f"Showing {len(results)} most recent sessions. Pass a query= to search, or session_id+around_message_id to scroll.",
-        }, ensure_ascii=False)
+        }
+        if access_filter and len(access_filter) > 1:
+            response["access_scope"] = {"base": access_filter[0], "grants": access_filter[1:]}
+        return json.dumps(response, ensure_ascii=False)
     except Exception as e:
         logging.error("Error listing recent sessions: %s", e, exc_info=True)
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
@@ -156,6 +359,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    access_filter: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -200,6 +404,13 @@ def _scroll(
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
+    allowed_session_ids = _allowed_session_ids(db, access_filter)
+    if not _session_allowed(session_id, allowed_session_ids):
+        return tool_error(
+            "scroll rejected: session is outside the current chat/topic access scope",
+            success=False,
+        )
+
     # Fetch the window
     try:
         view = db.get_messages_around(session_id, around_message_id, window=window)
@@ -243,6 +454,11 @@ def _scroll(
                             session_meta = db.get_session(owning) or session_meta
                         except Exception:
                             pass
+                        if not _session_allowed(owning, allowed_session_ids):
+                            return tool_error(
+                                "scroll rejected: rebound session is outside the current chat/topic access scope",
+                                success=False,
+                            )
                         session_id = owning
                 except Exception as e:
                     logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
@@ -271,6 +487,8 @@ def _scroll(
     }
     if rebind_warning:
         response["warning"] = rebind_warning
+    if access_filter and len(access_filter) > 1:
+        response["access_scope"] = {"base": access_filter[0], "grants": access_filter[1:]}
     return json.dumps(response, ensure_ascii=False)
 
 
@@ -281,15 +499,27 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    access_filter: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
+    allowed_session_ids = _allowed_session_ids(db, access_filter)
+    if allowed_session_ids == set():
+        return json.dumps({
+            "success": True,
+            "mode": "discover",
+            "query": query,
+            "results": [],
+            "count": 0,
+            "message": "No matching sessions found in the current chat/topic access scope.",
+        }, ensure_ascii=False)
 
     try:
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            session_id_filter=sorted(allowed_session_ids) if allowed_session_ids is not None else None,
             limit=50,  # widen so dedup-by-lineage can find distinct sessions
             offset=0,
             sort=sort,
@@ -317,6 +547,11 @@ def _discover(
     for r in raw_results:
         raw_sid = r["session_id"]
         resolved_sid = _resolve_to_parent(db, raw_sid)
+        if not (
+            _session_allowed(raw_sid, allowed_session_ids)
+            or _session_allowed(resolved_sid, allowed_session_ids)
+        ):
+            continue
         # Skip the current session lineage
         if current_lineage_root and resolved_sid == current_lineage_root:
             continue
@@ -365,14 +600,17 @@ def _discover(
             entry["parent_session_id"] = lineage_root
         results.append(entry)
 
-    return json.dumps({
+    response = {
         "success": True,
         "mode": "discover",
         "query": query,
         "results": results,
         "count": len(results),
         "sessions_searched": len(seen_sessions),
-    }, ensure_ascii=False)
+    }
+    if access_filter and len(access_filter) > 1:
+        response["access_scope"] = {"base": access_filter[0], "grants": access_filter[1:]}
+    return json.dumps(response, ensure_ascii=False)
 
 
 def session_search(
@@ -406,6 +644,8 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
+    access_filter = _current_gateway_access_filters()
+
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
         return _scroll(
@@ -414,6 +654,7 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            access_filter=access_filter,
         )
 
     # Limit clamp [1, 10]
@@ -426,7 +667,7 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(db, limit, current_session_id, access_filter=access_filter)
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -447,6 +688,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        access_filter=access_filter,
     )
 
 
@@ -504,7 +746,19 @@ SESSION_SEARCH_SCHEMA = {
         "  Reach for this on any \"what did we do about X\" / \"where did we leave Y\" / "
         "\"find the session where Z\" question — before gh, web search, or filesystem "
         "inspection. The session DB carries what was said when; external tools show "
-        "current world state."
+        "current world state.\n\n"
+        "ACCESS BOUNDARY\n\n"
+        "  In gateway chats, results are automatically limited to the active "
+        "boundary: the current topic when topic isolation is enabled, otherwise "
+        "the current profile/memory scope. A question about a previously shared "
+        "link, decision, or message must be searched here before claiming it is "
+        "unavailable. If the local topic has no result and a sibling topic may "
+        "contain it, call recall_access(target='other_topics') to ask permission; "
+        "after a grant, immediately retry the same session_search query. For any "
+        "other context outside the boundary, call recall_access first and wait "
+        "for the user's explicit grant. Do not treat this as global recall unless "
+        "the active surface is "
+        "CLI/local or the user explicitly moves to a global surface."
     ),
     "parameters": {
         "type": "object",

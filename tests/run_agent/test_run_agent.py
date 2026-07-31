@@ -2491,11 +2491,21 @@ class TestConcurrentToolExecution:
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
-            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+            messages = [
+                {"role": "user", "content": "Добавь встречу в календарь"},
+                {"role": "assistant", "content": None, "tool_calls": []},
+            ]
+            result = agent._invoke_tool(
+                "web_search",
+                {"q": "test"},
+                "task-1",
+                messages=messages,
+            )
             mock_hfc.assert_called_once_with(
                 "web_search", {"q": "test"}, "task-1",
                 tool_call_id=None,
                 session_id=agent.session_id,
+                user_task="Добавь встречу в календарь",
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
                 enabled_toolsets=agent.enabled_toolsets,
@@ -3099,6 +3109,120 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_false_tool_unavailability_forces_exact_live_tool(self, agent):
+        self._setup_agent(agent)
+        calendar_tool = _make_tool_defs("google_calendar")[0]
+        agent.tools.append(calendar_tool)
+        agent.valid_tool_names.add("google_calendar")
+
+        calendar_call = _mock_tool_call(
+            name="google_calendar",
+            arguments='{"operation":"list","time_min":"2026-08-04T10:00:00+02:00","time_max":"2026-08-04T15:00:00+02:00"}',
+            call_id="calendar-1",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="В текущей сессии нет доступного вызова Google Calendar.",
+                finish_reason="stop",
+            ),
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[calendar_call],
+            ),
+            _mock_response(
+                content="Проверил: в указанном окне событий нет.",
+                finish_reason="stop",
+            ),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"events":[]}') as call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("повтори")
+
+        assert result["final_response"] == "Проверил: в указанном окне событий нет."
+        assert result["api_calls"] == 3
+        assert call.call_args.args[0] == "google_calendar"
+
+        forced_request = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert forced_request["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "google_calendar"},
+        }
+        forced_messages = forced_request["messages"]
+        assert any(
+            "Runtime consistency correction" in str(message.get("content") or "")
+            for message in forced_messages
+        )
+        assert all(
+            "нет доступного вызова Google Calendar" not in str(message.get("content") or "")
+            for message in result["messages"]
+        )
+
+    def test_corrupted_response_switches_fallback_without_persisting_damage(self, agent):
+        self._setup_agent(agent)
+        damaged = (
+            "We need to answer.,im/data?][ayicalai_f/b/profile(--\n"
+            "//+$b FIRST false somev the/ [\ufffdical\n\n"
+            + "\n".join(["& & &", "[", "]", "==", "� ;"] * 20)
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=damaged, finish_reason="stop"),
+            _mock_response(content="Clean fallback answer.", finish_reason="stop"),
+        ]
+
+        def _activate_fallback():
+            agent.model = "clean-fallback"
+            agent.provider = "test-fallback"
+            return True
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent,
+                "_try_activate_fallback",
+                side_effect=_activate_fallback,
+            ) as fallback,
+        ):
+            result = agent.run_conversation("hello")
+
+        fallback.assert_called_once()
+        assert result["final_response"] == "Clean fallback answer."
+        assert result["api_calls"] == 2
+        assert all(
+            damaged not in str(message.get("content") or "")
+            for message in result["messages"]
+        )
+
+    def test_corrupted_response_without_fallback_persists_safe_failure(self, agent):
+        self._setup_agent(agent)
+        damaged = (
+            "We need to answer.,im/data?][ayicalai_f/b/profile(--\n"
+            + "\n".join(["& & &", "[", "]", "==", "\ufffd ;"] * 20)
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content=damaged,
+            finish_reason="stop",
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_activate_fallback", return_value=False),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert "corrupted response" in result["final_response"].lower()
+        assert damaged not in str(result["messages"])
+        assert result["messages"][-1]["finish_reason"] == "corrupted_response_blocked"
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)

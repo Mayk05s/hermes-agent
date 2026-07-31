@@ -183,7 +183,6 @@ class MemPalaceMemoryProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self._refresh_if_due(force=True)
         return None
 
 

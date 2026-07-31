@@ -23,11 +23,13 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    GOOGLE_CALENDAR_TOOL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -41,6 +43,36 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
 )
 from agent.runtime_cwd import resolve_context_cwd
+
+
+# Bump whenever stable system-prompt behavior changes in a way that must reach
+# already-persisted sessions.  The final stored signature also includes the
+# exact live tool-name surface (see ``bind_system_prompt_signature``).
+SYSTEM_PROMPT_CONTRACT_VERSION = "2"
+
+
+def bind_system_prompt_signature(
+    base_signature: str | None,
+    valid_tool_names: set[str] | list[str] | tuple[str, ...],
+) -> str | None:
+    """Bind a gateway/config signature to prompt code and live tools.
+
+    Persisted system prompts contain conditional tool guidance.  Reusing one
+    after a connector appears or disappears leaves the model with stale claims
+    about its own function interface even though the API payload has changed.
+    """
+    if not base_signature:
+        return None
+    payload = json.dumps(
+        [
+            SYSTEM_PROMPT_CONTRACT_VERSION,
+            str(base_signature),
+            sorted(str(name) for name in (valid_tool_names or [])),
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _ra():
@@ -113,6 +145,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+
+    # Connected-data tools need a system-authority statement because stale
+    # assistant turns can otherwise outweigh a skill loaded into user history.
+    # This remains model-owned routing: the gateway does not inspect Calendar
+    # phrases or invoke the connector.  The model sees the live function schema
+    # and decides when to call it.
+    if "google_calendar" in agent.valid_tool_names:
+        stable_parts.append(GOOGLE_CALENDAR_TOOL_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

@@ -3985,3 +3985,468 @@ class TestMcpParallelToolCalls:
             register_mcp_servers(config_off)
         with _lock:
             assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
+
+def test_chainremind_target_guard_blocks_other_telegram_target_from_topic():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        thread_id="1711",
+    )
+    try:
+        args = {"target": "179555559"}
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is not None
+    payload = json.loads(result)
+    assert "target blocked" in payload["error"]
+    assert "-1003735932411:1711" in payload["error"]
+    assert args["target"] == "179555559"
+
+
+def test_family_calendar_guard_blocks_personal_request_even_with_quoted_family_text():
+    from tools.mcp_tool import _guard_calendar_backend_routing
+
+    result = _guard_calendar_backend_routing(
+        "icloud-family-calendar",
+        "list_events",
+        user_task=(
+            "[Mikhail|179555559] Добавь в мой личный календарь "
+            "[forwarded] Да, в семейном календаре"
+        ),
+    )
+
+    assert result is not None
+    payload = json.loads(result)
+    assert payload["required_tool"] == "google_calendar"
+    assert payload["required_calendar_id"] == "primary"
+    assert "Direct user instructions override quoted" in payload["error"]
+
+
+def test_family_calendar_guard_allows_explicit_direct_family_request():
+    from tools.mcp_tool import _guard_calendar_backend_routing
+
+    result = _guard_calendar_backend_routing(
+        "icloud-family-calendar",
+        "list_events",
+        user_task="Покажи семейный iCloud-календарь на 17 августа",
+    )
+
+    assert result is None
+
+
+def test_family_calendar_guard_blocks_unspecified_calendar_request():
+    from tools.mcp_tool import _guard_calendar_backend_routing
+
+    result = _guard_calendar_backend_routing(
+        "icloud-family-calendar",
+        "list_events",
+        user_task="Что у меня в календаре 17 августа?",
+    )
+
+    assert result is not None
+    payload = json.loads(result)
+    assert payload["required_calendar_id"] == "primary"
+
+
+def test_chainremind_guard_blocks_calendar_write_substitution():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        thread_id="576",
+    )
+    try:
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            {"target": "-1003966683704:576"},
+            user_task="@TripiooBot добавь это в календарь",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is not None
+    payload = json.loads(result)
+    assert "explicitly requested a Calendar operation" in payload["error"]
+    assert "google_calendar" in payload["error"]
+
+
+def test_chainremind_guard_blocks_one_shot_globally():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(platform="cli")
+    try:
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            {
+                "schedule": {"times": ["09:30"], "days": "2026-08-07"},
+                "chain": [{"delay_min": 0, "text": "Стоматолог"}],
+                "target": "179555559",
+            },
+            user_task="напомни один раз о стоматологе",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is not None
+    payload = json.loads(result)
+    assert "not a long-running escalation chain" in payload["error"]
+    assert "Google Calendar" in payload["error"]
+
+
+def test_chainremind_guard_allows_delayed_escalation_without_telegram_origin():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(platform="cli")
+    try:
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            {
+                "schedule": {"times": ["21:00"], "days": "daily"},
+                "chain": [
+                    {"delay_min": 0, "text": "Прими лекарство"},
+                    {"delay_min": 15, "text": "Лекарство ещё не подтверждено"},
+                ],
+                "target": "179555559",
+            },
+            user_task="напоминай о лекарстве, пока я не подтвержу",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+
+
+def test_planning_action_origin_forces_family_group_source(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    monkeypatch.delenv("PLANNING_TELEGRAM_GROUP_CHAT_IDS", raising=False)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        chat_name="Семейный чат",
+        thread_id="1255",
+        chat_topic="Mario Odyssey",
+        user_id="179555559",
+        user_name="Mikhail",
+    )
+    try:
+        args = {
+            "telegramUserId": "wrong-user",
+            "scope": "personal",
+            "telegramChatId": "wrong-chat",
+            "title": "Сделать игровое поле",
+        }
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            "create-planning-task",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args == {
+        "telegramUserId": "179555559",
+        "scope": "shared",
+        "telegramChatId": "-1003966683704",
+        "telegramChatTitle": "Семейный чат",
+        "chatType": "supergroup",
+        "actorName": "Mikhail",
+        "title": "Сделать игровое поле",
+        "category": "Mario Odyssey",
+    }
+
+
+def test_planning_action_topic_overrides_generic_model_category(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    monkeypatch.delenv("PLANNING_TELEGRAM_GROUP_CHAT_IDS", raising=False)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        chat_name="Семейный чат",
+        thread_id="1255",
+        chat_topic="Mario Odyssey",
+        user_id="179555559",
+        user_name="Mikhail",
+    )
+    try:
+        args = {
+            "title": "Сделать игровое поле",
+            "category": "Работа",
+        }
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            "create-planning-task",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args["category"] == "Mario Odyssey"
+    assert args["scope"] == "shared"
+    assert args["telegramChatId"] == "-1003966683704"
+
+
+def test_planning_action_origin_forces_family_group_when_batched_sender_is_unknown(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    monkeypatch.delenv("PLANNING_TELEGRAM_GROUP_CHAT_IDS", raising=False)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        chat_name="Семейный чат",
+        thread_id="1255",
+        chat_topic="Mario Odyssey",
+        user_id="",
+        user_name="",
+    )
+    try:
+        args = {
+            "telegramUserId": "179555559",
+            "scope": "personal",
+            "title": "Распечатать 12 жизней",
+        }
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            "create-planning-task",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args == {
+        "telegramUserId": "179555559",
+        "scope": "shared",
+        "telegramChatId": "-1003966683704",
+        "telegramChatTitle": "Семейный чат",
+        "chatType": "supergroup",
+        "title": "Распечатать 12 жизней",
+        "category": "Mario Odyssey",
+    }
+
+
+def test_planning_action_origin_keeps_personal_topic_private():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        chat_name="Tripioo",
+        thread_id="313",
+        user_id="179555559",
+        user_name="Mikhail",
+    )
+    try:
+        args = {
+            "telegramUserId": "wrong-user",
+            "scope": "shared",
+            "telegramChatId": "-1000000000000",
+            "telegramChatTitle": "Wrong group",
+            "includeCompleted": True,
+        }
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            "list-planning-tasks",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args == {
+        "telegramUserId": "179555559",
+        "scope": "personal",
+        "includeCompleted": True,
+    }
+
+
+def test_planning_action_origin_ignores_unrelated_tools():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        user_id="179555559",
+    )
+    try:
+        args = {"telegramUserId": "original", "scope": "personal"}
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            "medication-list-due-today",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args == {"telegramUserId": "original", "scope": "personal"}
+
+
+def test_chainremind_target_guard_adds_current_thread_when_chat_matches():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        thread_id="1711",
+    )
+    try:
+        args = {"target": "-1003735932411"}
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert args["target"] == "-1003735932411:1711"
+
+
+def test_chainremind_target_guard_resolves_origin_to_current_topic():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        thread_id="1711",
+    )
+    try:
+        args = {"target": "origin"}
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert args["target"] == "-1003735932411:1711"
+
+
+def test_chainremind_target_guard_blocks_update_for_other_origin():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        thread_id="1711",
+    )
+    try:
+        with patch("tools.mcp_tool._chainremind_task_target", return_value="179555559"):
+            result = _guard_chainremind_origin_target(
+                "chainremind",
+                "update_reminder",
+                {"id": 40, "title": "changed"},
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is not None
+    payload = json.loads(result)
+    assert "access blocked" in payload["error"]
+    assert "179555559" in payload["error"]
+
+
+def test_chainremind_target_guard_allows_update_for_current_origin():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        thread_id="1711",
+    )
+    try:
+        with patch(
+            "tools.mcp_tool._chainremind_task_target",
+            return_value="-1003735932411:1711",
+        ):
+            args = {"id": 41, "title": "changed"}
+            result = _guard_chainremind_origin_target(
+                "chainremind",
+                "update_reminder",
+                args,
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert args == {"id": 41, "title": "changed"}
+
+
+def test_chainremind_target_guard_filters_list_to_current_origin():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    rows = [
+        {
+            "id": 1,
+            "title": "current",
+            "schedule": "{\"times\":[\"10:00\"],\"days\":\"daily\"}",
+            "chain": "[{\"delay_min\":0,\"text\":\"ping\"}]",
+            "tz": "Europe/Moscow",
+            "target": "-1003735932411:1711",
+            "is_active": 1,
+            "dismiss_keywords": None,
+            "max_repeats": None,
+        },
+        {
+            "id": 2,
+            "title": "other",
+            "schedule": "{\"times\":[\"10:00\"],\"days\":\"daily\"}",
+            "chain": "[{\"delay_min\":0,\"text\":\"ping\"}]",
+            "tz": "Europe/Moscow",
+            "target": "179555559",
+            "is_active": 1,
+            "dismiss_keywords": None,
+            "max_repeats": None,
+        },
+    ]
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        thread_id="1711",
+    )
+    try:
+        with patch("tools.mcp_tool._chainremind_db_fetchall", return_value=rows), \
+             patch("tools.mcp_tool._chainremind_open_instance_count", return_value=3):
+            result = _guard_chainremind_origin_target(
+                "chainremind",
+                "list_reminders",
+                {"active_only": True},
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is not None
+    payload = json.loads(result)
+    tasks = json.loads(payload["result"])
+    assert [task["title"] for task in tasks] == ["current"]
+    assert tasks[0]["open_instances"] == 3

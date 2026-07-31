@@ -99,6 +99,86 @@ class TestSessionSourceRoundtrip:
             SessionSource.from_dict({"platform": "nonexistent", "chat_id": "1"})
 
 
+def test_session_store_persists_origin_access_scope(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    with patch("hermes_state.SessionDB", return_value=db):
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_name="Work",
+        chat_type="group",
+        user_id="42",
+        user_name="Mikhail",
+        thread_id="777",
+        chat_topic="CV",
+        profile_name="default",
+        scope_name="cv",
+        memory_scope="cv",
+    )
+
+    entry = store.get_or_create_session(source)
+    row = db.get_session(entry.session_id)
+    payload = json.loads(row["access_scope"])
+
+    assert payload["session_key"] == build_session_key(source)
+    assert payload["origin"]["chat_id"] == "-1001"
+    assert payload["origin"]["thread_id"] == "777"
+    assert payload["origin"]["chat_topic"] == "CV"
+    assert payload["origin"]["memory_scope"] == "cv"
+
+
+def test_shared_topic_recall_keeps_topic_local_live_session(tmp_path):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    older = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_name="Product",
+        chat_type="group",
+        thread_id="35",
+        profile_name="boxmap",
+        scope_name="default",
+        memory_scope="default",
+        topic_isolation=True,
+    )
+    newer = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_name="Product",
+        chat_type="group",
+        thread_id="2",
+        profile_name="boxmap",
+        scope_name="default",
+        memory_scope="default",
+        topic_isolation=True,
+    )
+    older_entry = store.get_or_create_session(older)
+    newer_entry = store.get_or_create_session(newer)
+    shared = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_name="Product",
+        chat_type="group",
+        thread_id="35",
+        profile_name="boxmap",
+        scope_name="default",
+        memory_scope="default",
+        topic_isolation=False,
+    )
+    resolved = store.get_or_create_session(shared)
+
+    assert resolved.session_id == older_entry.session_id
+    assert resolved.session_id != newer_entry.session_id
+    assert resolved.session_key == build_session_key(shared)
+    assert resolved.origin.thread_id == "35"
+    # The persisted entry predates the recall-boundary change, but execution
+    # stays on the same topic-local transcript instead of adopting topic 2.
+    assert resolved.origin.topic_isolation is True
+
+
 class TestSessionSourceDescription:
     def test_local_cli(self):
         source = SessionSource(
@@ -193,6 +273,9 @@ class TestBuildSessionContextPrompt:
 
         assert "Telegram" in prompt
         assert "Home Chat" in prompt
+        assert "native message reactions" in prompt
+        assert "[[reaction:<emoji>]]" in prompt
+        assert "also send a textual answer" in prompt
 
     def test_bluebubbles_prompt_mentions_short_conversational_i_message_format(self):
         config = GatewayConfig(
@@ -570,6 +653,62 @@ class TestLoadTranscriptDBOnly:
         assert len(result) == 2
         assert result[0]["content"] == "db-q"
         assert result[1]["content"] == "db-a"
+
+    def test_previous_transcript_uses_exact_session_key(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(
+            hermes_state,
+            "DEFAULT_DB_PATH",
+            tmp_path / "state.db",
+        )
+        store = SessionStore(
+            sessions_dir=tmp_path / "sessions",
+            config=GatewayConfig(),
+        )
+        session_key = (
+            "agent:main:profile:personal:scope:default:"
+            "telegram:group:-1003735932411:313"
+        )
+        access_scope = json.dumps({"session_key": session_key})
+        store._db.create_session(
+            "previous",
+            "telegram",
+            access_scope=access_scope,
+        )
+        store._db.append_message(
+            "previous",
+            "user",
+            "Напоминания есть?",
+        )
+        store._db.create_session(
+            "other-topic",
+            "telegram",
+            access_scope=json.dumps({"session_key": f"{session_key}:999"}),
+        )
+        store._db.append_message(
+            "other-topic",
+            "user",
+            "Не должно утечь",
+        )
+        store._db.create_session(
+            "current",
+            "telegram",
+            access_scope=access_scope,
+        )
+
+        history = store.load_previous_transcript_for_session_key(
+            session_key,
+            "current",
+        )
+
+        assert [
+            item["content"] for item in history if item["role"] == "user"
+        ] == ["Напоминания есть?"]
 
 
 class TestSessionStoreSwitchSession:
@@ -1068,6 +1207,31 @@ class TestLastPromptTokens:
         restored = SessionEntry.from_dict(d)
         assert restored.last_prompt_tokens == 42000
 
+    def test_session_entry_auto_loaded_skills_roundtrip(self):
+        """Topic auto-skill injection markers should survive persistence."""
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            auto_loaded_skills=["telegram_boxmap/telegram_boxmap_context"],
+            auto_loaded_skill_versions={
+                "telegram_boxmap/telegram_boxmap_context": "abc123"
+            },
+        )
+        d = entry.to_dict()
+        assert d["auto_loaded_skills"] == ["telegram_boxmap/telegram_boxmap_context"]
+        assert d["auto_loaded_skill_versions"] == {
+            "telegram_boxmap/telegram_boxmap_context": "abc123"
+        }
+        restored = SessionEntry.from_dict(d)
+        assert restored.auto_loaded_skills == ["telegram_boxmap/telegram_boxmap_context"]
+        assert restored.auto_loaded_skill_versions == {
+            "telegram_boxmap/telegram_boxmap_context": "abc123"
+        }
+
     def test_session_entry_from_old_data(self):
         """Old session data without last_prompt_tokens should default to 0."""
         from gateway.session import SessionEntry
@@ -1083,6 +1247,8 @@ class TestLastPromptTokens:
         }
         entry = SessionEntry.from_dict(data)
         assert entry.last_prompt_tokens == 0
+        assert entry.auto_loaded_skills == []
+        assert entry.auto_loaded_skill_versions == {}
 
     def test_update_session_sets_last_prompt_tokens(self, tmp_path):
         """update_session should store the actual prompt token count."""

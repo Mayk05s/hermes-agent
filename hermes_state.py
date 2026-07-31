@@ -260,6 +260,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    access_scope TEXT,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -922,13 +923,14 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
+        access_scope: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, system_prompt_signature, parent_session_id, cwd, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, system_prompt_signature, parent_session_id, cwd, access_scope, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -939,6 +941,7 @@ class SessionDB:
                     system_prompt_signature,
                     parent_session_id,
                     cwd,
+                    access_scope,
                     time.time(),
                 ),
             )
@@ -1327,6 +1330,50 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def find_previous_session_id_for_access_key(
+        self,
+        access_session_key: str,
+        *,
+        exclude_session_id: str = "",
+    ) -> Optional[str]:
+        """Return the newest other session for an exact gateway access key.
+
+        Gateway resets replace the live ``session_key -> session_id`` index
+        entry, while the prior transcript remains in SQLite. Contextual
+        continuations may need that immediately preceding transcript without
+        crossing the profile/chat/topic boundary encoded by the access key.
+        """
+        wanted = str(access_session_key or "").strip()
+        if not wanted:
+            return None
+
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT
+                    s.id,
+                    s.access_scope,
+                    COALESCE(MAX(m.timestamp), s.started_at) AS last_active
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.id
+                WHERE s.id != ?
+                  AND s.access_scope IS NOT NULL
+                GROUP BY s.id
+                ORDER BY last_active DESC, s.started_at DESC, s.id DESC
+                """,
+                (str(exclude_session_id or ""),),
+            )
+            rows = cursor.fetchall()
+
+        for row in rows:
+            try:
+                access_scope = json.loads(row["access_scope"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if str(access_scope.get("session_key") or "") == wanted:
+                return str(row["id"])
+        return None
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
@@ -2714,6 +2761,7 @@ class SessionDB:
         source_filter: List[str] = None,
         exclude_sources: List[str] = None,
         role_filter: List[str] = None,
+        session_id_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
         sort: str = None,
@@ -2793,6 +2841,14 @@ class SessionDB:
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
 
+        if session_id_filter is not None:
+            session_ids = [str(sid) for sid in session_id_filter if str(sid)]
+            if not session_ids:
+                return []
+            session_placeholders = ",".join("?" for _ in session_ids)
+            where_clauses.append(f"m.session_id IN ({session_placeholders})")
+            params.extend(session_ids)
+
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
@@ -2867,6 +2923,12 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if session_id_filter is not None:
+                    session_ids = [str(sid) for sid in session_id_filter if str(sid)]
+                    if not session_ids:
+                        return []
+                    tri_where.append(f"m.session_id IN ({','.join('?' for _ in session_ids)})")
+                    tri_params.extend(session_ids)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -2922,6 +2984,12 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if session_id_filter is not None:
+                    session_ids = [str(sid) for sid in session_id_filter if str(sid)]
+                    if not session_ids:
+                        return []
+                    like_where.append(f"m.session_id IN ({','.join('?' for _ in session_ids)})")
+                    like_params.extend(session_ids)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,

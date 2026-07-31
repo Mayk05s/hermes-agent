@@ -1128,6 +1128,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = "bedrock_converse"
 
         old_model = agent.model
+        old_provider = agent.provider
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -1140,6 +1141,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        reason_value = getattr(reason, "value", None) or str(reason or "provider_failure")
+        agent._turn_fallback_activation = {
+            "primary_model": old_model,
+            "primary_provider": old_provider,
+            "fallback_model": fb_model,
+            "fallback_provider": fb_provider,
+            "reason": reason_value,
+        }
 
         # Clear the credential pool when the fallback provider doesn't match
         # the pool's provider.  The pool was seeded for the primary provider;

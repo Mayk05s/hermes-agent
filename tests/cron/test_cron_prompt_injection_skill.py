@@ -24,9 +24,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 def cron_env(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty skills tree.
 
-    `tools.skills_tool` snapshots `SKILLS_DIR` at module-import time, so
-    setting `HERMES_HOME` alone doesn't reach it. We also patch the
-    module-level constant so `skill_view()` finds the skills we plant.
+    Keep the module-level constants patched too because many legacy tests
+    still monkeypatch `tools.skills_tool.SKILLS_DIR` directly. Production
+    code resolves profile-scoped skills dynamically from `get_hermes_home()`.
 
     Note: `test_cron_no_agent.py` (and potentially others) do
     ``importlib.reload(cron.scheduler)`` in their fixtures. A plain
@@ -127,6 +127,42 @@ class TestBuildJobPromptScansSkillContent:
         assert prompt is not None
         assert "news-digest" in prompt
         assert "Fetch the top 5 headlines" in prompt
+
+    def test_profile_override_skill_dir_loaded_after_skills_tool_import(self, tmp_path, monkeypatch):
+        """Cron profile contexts must see skills from the active profile.
+
+        Regression: ``tools.skills_tool`` could be imported while the default
+        profile was active, caching the default ``SKILLS_DIR``. A later cron
+        job running under a profile override then failed to load skills that
+        existed only in that profile.
+        """
+        import tools.skills_tool  # noqa: F401 - intentionally import before override
+        import cron.scheduler as scheduler
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        profile_home = tmp_path / "family-chat"
+        (profile_home / "skills" / "telegram_family" / "profile-only").mkdir(parents=True)
+        (profile_home / "skills" / "telegram_family" / "profile-only" / "SKILL.md").write_text(
+            "---\nname: profile-only\ndescription: profile skill\n---\n\nProfile-only instructions.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("HERMES_SESSION_ALLOWED_SKILLS", raising=False)
+
+        token = set_hermes_home_override(profile_home)
+        try:
+            prompt = scheduler._build_job_prompt(
+                {
+                    "id": "job-profile-skill",
+                    "name": "profile skill",
+                    "prompt": "run it",
+                    "skills": ["telegram_family/profile-only"],
+                }
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "Skill(s) not found" not in prompt
+        assert "Profile-only instructions." in prompt
 
     def test_builtin_style_github_api_example_is_allowed(self, cron_env):
         hermes_home, scheduler = cron_env

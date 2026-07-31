@@ -408,14 +408,53 @@ def _resolve_config_gates() -> set[str]:
     return result
 
 
-def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
+_NON_DEFAULT_PROFILE_HIDDEN_COMMANDS: frozenset[str] = frozenset({
+    "approve",
+    "debug",
+    "deny",
+    "platform",
+    "reload-mcp",
+    "reload-skills",
+    "restart",
+    "sethome",
+    "stop",
+    "update",
+    "yolo",
+})
+
+
+def _surface_profile_name(profile_name: str | None = None) -> str:
+    """Return the profile name used for command surface filtering."""
+    if profile_name is not None:
+        value = str(profile_name or "").strip()
+        return value or "default"
+    return "default"
+
+
+def _visible_in_profile(cmd: CommandDef, profile_name: str | None = None) -> bool:
+    """Hide operator/diagnostic commands from named-profile command surfaces."""
+    profile = _surface_profile_name(profile_name)
+    if profile in {"default", "custom"}:
+        return True
+    return cmd.name not in _NON_DEFAULT_PROFILE_HIDDEN_COMMANDS
+
+
+def _is_gateway_available(
+    cmd: CommandDef,
+    config_overrides: set[str] | None = None,
+    profile_name: str | None = None,
+) -> bool:
     """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
 
     Unconditionally available when ``cli_only`` is False.  When ``cli_only``
     is True but ``gateway_config_gate`` is set, the command is available only
-    when the config value is truthy.  Pass *config_overrides* (from
+    when the config value is truthy. Named profiles hide host-level operator
+    commands from visible surfaces; the dispatch registry still recognizes
+    them when typed manually. Pass *config_overrides* (from
     ``_resolve_config_gates()``) to avoid re-reading config for every command.
     """
+    if not _visible_in_profile(cmd, profile_name):
+        return False
     if not cmd.cli_only:
         return True
     if cmd.gateway_config_gate:
@@ -429,12 +468,12 @@ def _requires_argument(args_hint: str) -> bool:
     return args_hint.strip().startswith("<")
 
 
-def gateway_help_lines() -> list[str]:
+def gateway_help_lines(profile_name: str | None = None) -> list[str]:
     """Generate gateway help text lines from the registry."""
     overrides = _resolve_config_gates()
     lines: list[str] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, profile_name=profile_name):
             continue
         args = f" {cmd.args_hint}" if cmd.args_hint else ""
         alias_parts: list[str] = []
@@ -480,7 +519,7 @@ def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
     return entries
 
 
-def telegram_bot_commands() -> list[tuple[str, str]]:
+def telegram_bot_commands(profile_name: str | None = None) -> list[tuple[str, str]]:
     """Return (command_name, description) pairs for Telegram setMyCommands.
 
     Telegram command names cannot contain hyphens, so they are replaced with
@@ -497,7 +536,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     overrides = _resolve_config_gates()
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, profile_name=profile_name):
             continue
         # Built-in arg-taking commands are included — their handlers show
         # usage text when invoked without arguments, and hiding them from
@@ -775,7 +814,10 @@ def _collect_gateway_skill_entries(
 # Platform-specific wrappers
 # ---------------------------------------------------------------------------
 
-def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
+def telegram_menu_commands(
+    max_commands: int = 100,
+    profile_name: str | None = None,
+) -> tuple[list[tuple[str, str]], int]:
     """Return Telegram menu commands capped to the Bot API limit.
 
     Priority order (higher priority = never bumped by overflow):
@@ -792,7 +834,9 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         (menu_commands, hidden_count) where hidden_count is the number of
         commands omitted due to the cap.
     """
-    core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
+    core_commands = _prioritize_telegram_menu_commands(
+        list(telegram_bot_commands(profile_name=profile_name))
+    )
     reserved_names = {n for n, _ in core_commands}
     all_commands = list(core_commands)
     hidden_core_count = max(0, len(all_commands) - max_commands)
@@ -1020,6 +1064,7 @@ _SLACK_RESERVED_COMMANDS = frozenset({
     "who", "collapse", "expand", "leave", "join", "open", "search",
     "topic", "mute", "pro", "shortcuts",
 })
+_SLACK_PRIORITY_ALIASES = ("btw", "bg", "reset", "q")
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1034,7 +1079,7 @@ def _sanitize_slack_name(raw: str) -> str:
     return name[:_SLACK_NAME_LIMIT]
 
 
-def slack_native_slashes() -> list[tuple[str, str, str]]:
+def slack_native_slashes(profile_name: str | None = None) -> list[tuple[str, str, str]]:
     """Return (slash_name, description, usage_hint) triples for Slack.
 
     Every gateway-available command in ``COMMAND_REGISTRY`` is surfaced as
@@ -1077,27 +1122,45 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, profile_name=profile_name):
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
+    # Second pass: high-value aliases that tests and users expect to survive
+    # Slack's 50-command cap.
+    for priority_alias in _SLACK_PRIORITY_ALIASES:
+        for cmd in COMMAND_REGISTRY:
+            if priority_alias not in cmd.aliases:
+                continue
+            if not _is_gateway_available(cmd, overrides, profile_name=profile_name):
+                continue
+            _add(
+                priority_alias,
+                f"Alias for /{cmd.name} — {cmd.description}",
+                cmd.args_hint or "",
+            )
+            break
+
+    # Third pass: aliases.
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, profile_name=profile_name):
             continue
         for alias in cmd.aliases:
             # Skip aliases that only differ from canonical by case/punctuation
             # normalization (already covered by _add dedup).
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
-    # Third pass: plugin commands.
+    # Fourth pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
 
     return entries
 
 
-def slack_app_manifest(request_url: str = "https://hermes-agent.local/slack/commands") -> dict[str, Any]:
+def slack_app_manifest(
+    request_url: str = "https://hermes-agent.local/slack/commands",
+    profile_name: str | None = None,
+) -> dict[str, Any]:
     """Generate a Slack app manifest with all gateway commands as slashes.
 
     ``request_url`` is required by Slack's manifest schema for every slash
@@ -1111,7 +1174,7 @@ def slack_app_manifest(request_url: str = "https://hermes-agent.local/slack/comm
     set up once in the Slack UI and rarely change.
     """
     slashes = []
-    for name, desc, usage in slack_native_slashes():
+    for name, desc, usage in slack_native_slashes(profile_name=profile_name):
         entry = {
             "command": f"/{name}",
             "description": desc or f"Run /{name}",
@@ -1124,7 +1187,7 @@ def slack_app_manifest(request_url: str = "https://hermes-agent.local/slack/comm
     return {"features": {"slash_commands": slashes}}
 
 
-def slack_subcommand_map() -> dict[str, str]:
+def slack_subcommand_map(profile_name: str | None = None) -> dict[str, str]:
     """Return subcommand -> /command mapping for Slack /hermes handler.
 
     Maps both canonical names and aliases so /hermes bg do stuff works
@@ -1136,7 +1199,7 @@ def slack_subcommand_map() -> dict[str, str]:
     overrides = _resolve_config_gates()
     mapping: dict[str, str] = {}
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, profile_name=profile_name):
             continue
         mapping[cmd.name] = f"/{cmd.name}"
         for alias in cmd.aliases:

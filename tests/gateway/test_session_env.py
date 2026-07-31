@@ -141,6 +141,7 @@ def test_set_session_env_handles_missing_optional_fields():
         chat_name=None,
         chat_type="private",
         thread_id=None,
+        chat_topic=None,
     )
     context = SessionContext(source=source, connected_platforms=[], home_channels={})
 
@@ -150,8 +151,78 @@ def test_set_session_env_handles_missing_optional_fields():
     assert get_session_env("HERMES_SESSION_CHAT_ID") == "-1001"
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
+    assert get_session_env("HERMES_SESSION_CHAT_TOPIC") == ""
 
     runner._clear_session_env(tokens)
+
+
+def test_set_session_env_includes_chat_topic():
+    """The trusted tool context should retain the Telegram topic name."""
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003966683704",
+        chat_name="Семейный чат",
+        chat_type="group",
+        thread_id="1255",
+        chat_topic="Mario Odyssey",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    tokens = runner._set_session_env(context)
+    assert get_session_env("HERMES_SESSION_CHAT_TOPIC") == "Mario Odyssey"
+
+    runner._clear_session_env(tokens)
+    assert get_session_env("HERMES_SESSION_CHAT_TOPIC") == ""
+
+
+def test_set_session_env_includes_verbatim_user_request_for_tool_provenance():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003938895426",
+        chat_type="group",
+        thread_id="2",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    tokens = runner._set_session_env(
+        context,
+        user_request_text="Отправь этот результат в Ассистент",
+    )
+    assert (
+        get_session_env("HERMES_SESSION_USER_REQUEST")
+        == "Отправь этот результат в Ассистент"
+    )
+
+    runner._clear_session_env(tokens)
+    assert get_session_env("HERMES_SESSION_USER_REQUEST") == ""
+
+
+def test_shared_group_session_keeps_per_turn_requester_identity():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003735932411",
+        chat_type="group",
+        thread_id="313",
+        user_id=None,
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    tokens = runner._set_session_env(
+        context,
+        user_request_text="[Mikhail|179555559]\nНапоминания есть?",
+    )
+
+    assert get_session_env("HERMES_SESSION_USER_ID") == ""
+    assert (
+        get_session_env("HERMES_SESSION_REQUESTER_USER_ID")
+        == "179555559"
+    )
+
+    runner._clear_session_env(tokens)
+    assert get_session_env("HERMES_SESSION_REQUESTER_USER_ID") == ""
 
 
 # ---------------------------------------------------------------------------

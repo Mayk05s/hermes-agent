@@ -434,6 +434,19 @@ class TestExtractCacheBustingConfig:
         )
 
 
+class TestCommunicationStyleRuntimeAddressing:
+    """Communication style is prompt content, not a gateway rewrite layer."""
+
+    def test_no_runtime_addressing_guard_exists(self):
+        from gateway.run import GatewayRunner
+
+        assert not hasattr(GatewayRunner, "_apply_communication_style_response_guard")
+        assert not hasattr(GatewayRunner, "_ensure_sir_in_final_response_text")
+        assert not hasattr(GatewayRunner, "_communication_style_addressing_prompt")
+        assert not hasattr(GatewayRunner, "_extract_addressing_preference_from_text")
+        assert not hasattr(GatewayRunner, "_maybe_record_addressing_preference")
+
+
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""
 

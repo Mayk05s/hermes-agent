@@ -74,6 +74,105 @@
     return s.length > max ? s.slice(0, max - 1) + "..." : s;
   }
 
+  function shortTime(value) {
+    const raw = String(value || "");
+    const match = raw.match(/T(\d{2}:\d{2}:\d{2})/);
+    if (match) return match[1];
+    return raw.replace("T", " ").replace(/(?:Z|\+00:00)$/, "").slice(0, 19) || "—";
+  }
+
+  function shortDateTime(value) {
+    const raw = String(value || "");
+    return raw.replace("T", " ").replace(/(?:Z|\+00:00)$/, "").slice(0, 19) || "—";
+  }
+
+  function relativeTime(value) {
+    const raw = String(value || "");
+    const ts = raw ? Date.parse(raw) : 0;
+    if (!ts) return "—";
+    const diffSeconds = Math.round((Date.now() - ts) / 1000);
+    const future = diffSeconds < 0;
+    const abs = Math.abs(diffSeconds);
+    let text;
+    if (abs < 60) {
+      text = future ? "in <1 min" : "<1 min ago";
+    } else if (abs < 3600) {
+      const mins = Math.max(1, Math.round(abs / 60));
+      text = future ? `in ${mins} min` : `${mins} min ago`;
+    } else if (abs < 86400) {
+      const hours = Math.max(1, Math.round(abs / 3600));
+      text = future ? `in ${hours} h` : `${hours} h ago`;
+    } else {
+      const days = Math.max(1, Math.round(abs / 86400));
+      text = future ? `in ${days} d` : `${days} d ago`;
+    }
+    return text;
+  }
+
+  function statusTone(status) {
+    const value = String(status || "").toLowerCase();
+    if (value.includes("error") || value.includes("fail") || value.includes("stale") || value.includes("stall")) return "error";
+    if (value.includes("pending") || value.includes("queue") || value.includes("resume") || value.includes("needed") || value.includes("warn")) return "pending";
+    if (value.includes("run") || value.includes("extract") || value.includes("validat")) return "running";
+    return "done";
+  }
+
+  function statusLabel(status) {
+    const tone = statusTone(status);
+    if (tone === "error") return "Error";
+    if (tone === "running") return "Running";
+    const value = String(status || "").toLowerCase();
+    if (value.includes("queue")) return "Queue";
+    if (tone === "pending") return value.includes("warn") ? "Warning" : "Pending";
+    if (value.includes("idle")) return "Idle";
+    if (value.includes("skip")) return "Skipped";
+    return "Done";
+  }
+
+  function isNoIssueValidationEvent(event) {
+    const message = String((event && event.message) || "").toLowerCase();
+    const task = String((event && event.model_task) || "").toLowerCase();
+    const candidates = Number((event && (event.candidates ?? event.total_candidates)) || 0);
+    return task === "mempalace_validator" && candidates === 0 && (message.includes("validation skipped") || message.includes("validation clean") || message.includes("no cleanup"));
+  }
+
+  function eventTone(event) {
+    const message = String((event && event.message) || "").toLowerCase();
+    const value = String((event && (event.status || event.level)) || "").toLowerCase();
+    if (isNoIssueValidationEvent(event)) return "done";
+    if (message.includes("error") || value.includes("error") || value.includes("fail")) return "error";
+    if (message.includes("warning") || value.includes("warning") || value.includes("warn")) return "pending";
+    if (message.includes("started")) return "running";
+    if (message.includes("finished") || message.includes("processed") || message.includes("skipped") || value.includes("success")) return "done";
+    return statusTone(value || "done");
+  }
+
+  function eventLabel(event) {
+    const message = String((event && event.message) || "").toLowerCase();
+    const value = String((event && (event.status || event.level)) || "").toLowerCase();
+    if (isNoIssueValidationEvent(event)) return "No issues";
+    if (message.includes("started")) return "Started";
+    if (message.includes("finished")) return "Finished";
+    if (message.includes("processed")) return "Batch";
+    if (message.includes("skipped")) return "Skipped";
+    if (value.includes("warning") || value.includes("warn")) return "Warning";
+    return statusLabel(value || "done");
+  }
+
+  function eventMessage(event) {
+    if (isNoIssueValidationEvent(event)) return "MemPalace validation clean: no cleanup candidates";
+    return (event && event.message) || "—";
+  }
+
+  function titleCaseWords(value) {
+    return String(value || "process")
+      .replace(/_/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((word) => word.slice(0, 1).toUpperCase() + word.slice(1))
+      .join(" ");
+  }
+
   function hashText(text) {
     let hash = 0;
     const value = String(text || "");
@@ -98,6 +197,7 @@
       telegram_planning: "Planning",
       telegram_system: "System",
       telegram_tripio: "Tripio",
+      telegram_cv: "CV",
     };
     if (aliases[raw]) return aliases[raw];
     return raw
@@ -122,7 +222,7 @@
         type: "profile",
         kind: "profile",
         degree: rows.length,
-        description: `${fmt(rows.length)} topics · ${fmt(totalEntities)} entities · ${fmt(totalTriples)} triples`,
+        description: `${fmt(rows.length)} palaces · ${fmt(totalEntities)} entities · ${fmt(totalTriples)} triples`,
         attributes: [],
       },
       ...rows.map((row) => ({
@@ -673,7 +773,7 @@
         "div",
         { className: "mp-graph-tools" },
         topicMode
-          ? h("span", { className: "mp-mode-chip" }, "Topics")
+          ? h("span", { className: "mp-mode-chip" }, "Palaces")
           : graph && graph.view_mode === "clusters"
             ? h("span", { className: "mp-mode-chip" }, "Areas")
           : h(
@@ -1087,6 +1187,12 @@
     const [message, setMessage] = useState("");
     const [error, setError] = useState("");
     const [noisePreview, setNoisePreview] = useState(null);
+    const [consolidator, setConsolidator] = useState(null);
+    const [profileStatuses, setProfileStatuses] = useState([]);
+    const [consolidatorPreview, setConsolidatorPreview] = useState(null);
+    const [jobs, setJobs] = useState([]);
+    const [route, setRoute] = useState(() => (window.location.hash === "#process" ? "process" : "graph"));
+    const [extractorConfig, setExtractorConfig] = useState(null);
 
     const loadProfiles = useCallback(async () => {
       const [profileData, matrixData] = await Promise.all([
@@ -1106,6 +1212,45 @@
         return "";
       });
     }, [profile]);
+
+    const loadConsolidator = useCallback(async () => {
+      const data = await fetchJSON(`${API}/consolidator/status?profile=${encodeURIComponent(profile)}`);
+      setConsolidator(data || null);
+    }, [profile]);
+
+    const loadProfileStatuses = useCallback(async () => {
+      const data = await fetchJSON(`${API}/consolidator/statuses`);
+      const rows = data.profiles || [];
+      setProfileStatuses(rows);
+      const selected = rows.find((row) => row.profile === profile);
+      if (selected) setConsolidator(selected);
+    }, [profile]);
+
+    const applyProfileStatuses = useCallback((data) => {
+      const rows = data && data.profiles ? data.profiles : data && data.profile ? [data] : [];
+      if (!rows.length) return;
+      setProfileStatuses((current) => {
+        const byProfile = new Map(current.map((row) => [row.profile, row]));
+        rows.forEach((row) => byProfile.set(row.profile, row));
+        return Array.from(byProfile.values());
+      });
+      const selected = rows.find((row) => row.profile === profile);
+      if (selected) {
+        setConsolidator(selected);
+      } else if (data && data.profile === profile) {
+        setConsolidator(data);
+      }
+    }, [profile]);
+
+    const loadJobs = useCallback(async () => {
+      const data = await fetchJSON(`${API}/consolidator/jobs`);
+      setJobs(data.jobs || []);
+    }, []);
+
+    const loadExtractorConfig = useCallback(async () => {
+      const data = await fetchJSON(`${API}/consolidator/config`);
+      setExtractorConfig(data || null);
+    }, []);
 
     const loadGraph = useCallback(async () => {
       const qs = new URLSearchParams({
@@ -1158,6 +1303,37 @@
     }, [loadPalaces]);
 
     useEffect(() => {
+      loadProfileStatuses().catch((err) => {
+        setError(parseError(err));
+        loadConsolidator().catch(() => {});
+      });
+    }, [loadProfileStatuses, loadConsolidator]);
+
+    useEffect(() => {
+      loadJobs().catch(() => {});
+    }, [loadJobs]);
+
+    useEffect(() => {
+      loadExtractorConfig().catch(() => {});
+    }, [loadExtractorConfig]);
+
+    useEffect(() => {
+      const syncRoute = () => setRoute(window.location.hash === "#process" ? "process" : "graph");
+      window.addEventListener("hashchange", syncRoute);
+      return () => window.removeEventListener("hashchange", syncRoute);
+    }, []);
+
+    useEffect(() => {
+      const timer = window.setInterval(() => {
+        loadProfileStatuses().catch(() => {
+          loadConsolidator().catch(() => {});
+        });
+        loadJobs().catch(() => {});
+      }, 5000);
+      return () => window.clearInterval(timer);
+    }, [loadProfileStatuses, loadConsolidator, loadJobs]);
+
+    useEffect(() => {
       setFocusStack([]);
       setActiveCluster("");
     }, [profile, palace, query]);
@@ -1208,13 +1384,14 @@
         setMessage(`Synced ${fmt(entries)} curated entry(s) from ${fmt(data.files)} memory file(s).${autoCleanText(data)}`);
         await loadProfiles();
         await loadPalaces();
+        await loadConsolidator();
         await loadGraph();
       } catch (err) {
         setError(parseError(err));
       } finally {
         setBusy(false);
       }
-    }, [profile, loadProfiles, loadPalaces, loadGraph]);
+    }, [profile, loadProfiles, loadPalaces, loadConsolidator, loadGraph]);
 
     const rebuildProfile = useCallback(async () => {
       setBusy(true);
@@ -1224,23 +1401,38 @@
         const data = await fetchJSON(`${API}/rebuild`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ profile, all_profiles: false, backup: true, auto_clean: true, clean_max_delete: 250 }),
+          body: JSON.stringify({
+            profile,
+            all_profiles: false,
+            backup: true,
+            auto_clean: true,
+            clean_max_delete: 250,
+            full: true,
+            workers: 5,
+            profile_workers: 2,
+          }),
         });
+        if (data && data.id && data.status) {
+          setMessage(`Full rebuild for ${profile} started as process ${data.id}.`);
+          await loadJobs();
+          await loadConsolidator();
+          return;
+        }
         const generated = data.generated || {};
-        const history = data.history || {};
         const entries = (generated.palaces || []).reduce((sum, item) => sum + Number(item.entries || 0), 0);
         setMessage(
-          `Rebuilt ${profile}: ${fmt(history.facts || 0)} history fact(s) from ${fmt(history.sessions || 0)} session(s), plus ${fmt(entries)} curated entry(s) from ${fmt(generated.files || 0)} memory file(s).${autoCleanText(data)}`,
+          `LLM rebuilt ${profile}: ${fmt(data.processed_messages || 0)} message(s), ${fmt(data.triples || 0)} graph triple(s), plus ${fmt(entries)} curated entry(s) from ${fmt(generated.files || 0)} memory file(s).${autoCleanText(data)}`,
         );
         await loadProfiles();
         await loadPalaces();
+        await loadConsolidator();
         await loadGraph();
       } catch (err) {
         setError(parseError(err));
       } finally {
         setBusy(false);
       }
-    }, [profile, loadProfiles, loadPalaces, loadGraph]);
+    }, [profile, loadProfiles, loadPalaces, loadConsolidator, loadJobs, loadGraph]);
 
     const rebuildAll = useCallback(async () => {
       setBusy(true);
@@ -1250,22 +1442,37 @@
         const data = await fetchJSON(`${API}/rebuild`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ all_profiles: true, backup: true, auto_clean: true, clean_max_delete: 250 }),
+          body: JSON.stringify({
+            all_profiles: true,
+            backup: true,
+            auto_clean: true,
+            clean_max_delete: 250,
+            full: true,
+            workers: 5,
+            profile_workers: 2,
+          }),
         });
+        if (data && data.id && data.status) {
+          setMessage(`Full rebuild for all profiles started as process ${data.id}.`);
+          await loadJobs();
+          await loadConsolidator();
+          return;
+        }
         const summary = (data.profiles || [])
-          .map((row) => `${row.profile}: ${fmt(((row.history || {}).facts || 0))} history fact(s)`)
+          .map((row) => `${row.profile}: ${fmt(row.processed_messages || 0)} msg / ${fmt(row.triples || 0)} triples`)
           .join(", ");
         setMatrix(data.matrix || null);
         setMessage(`Rebuilt all profiles: ${summary}.${autoCleanText(data)}`);
         await loadProfiles();
         await loadPalaces();
+        await loadConsolidator();
         await loadGraph();
       } catch (err) {
         setError(parseError(err));
       } finally {
         setBusy(false);
       }
-    }, [loadProfiles, loadPalaces, loadGraph]);
+    }, [loadProfiles, loadPalaces, loadConsolidator, loadJobs, loadGraph]);
 
     const previewNoise = useCallback(async () => {
       setBusy(true);
@@ -1289,7 +1496,7 @@
 
     const cleanNoise = useCallback(async () => {
       const count = noisePreview && Number(noisePreview.total_candidates || 0);
-      const ok = window.confirm(`Delete ${fmt(count)} low-signal MemPalace node(s) from ${palace || "all topics"}? A SQLite backup will be created first.`);
+      const ok = window.confirm(`Delete ${fmt(count)} low-signal MemPalace node(s) from ${palace || "all palaces"}? A SQLite backup will be created first.`);
       if (!ok) return;
       setBusy(true);
       setError("");
@@ -1304,17 +1511,570 @@
         setMessage(`Cleaned ${fmt(data.deleted_entities)} node(s), ${fmt(data.deleted_triples)} triple(s), ${fmt(data.deleted_orphans)} orphan literal(s). Backup: ${data.backup_root || "none"}`);
         await loadProfiles();
         await loadPalaces();
+        await loadConsolidator();
         await loadGraph();
       } catch (err) {
         setError(parseError(err));
       } finally {
         setBusy(false);
       }
-    }, [profile, palace, noisePreview, loadProfiles, loadPalaces, loadGraph]);
+    }, [profile, palace, noisePreview, loadProfiles, loadPalaces, loadConsolidator, loadGraph]);
+
+    const runValidator = useCallback(async (options = {}) => {
+      const allProfiles = Boolean(options.allProfiles);
+      setBusy(true);
+      setError("");
+      setMessage("");
+      try {
+        const data = await fetchJSON(`${API}/validate-clean`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ profile, all_profiles: allProfiles, palace: allProfiles ? "" : palace, dry_run: false, backup: true, max_candidates: 80 }),
+        });
+        setMessage(`${allProfiles ? "Validator for all profiles" : `Validator for ${profile}`} started as process ${data.id || "unknown"}.`);
+        await loadJobs();
+        await loadProfiles();
+        await loadPalaces();
+        await loadConsolidator();
+        await loadGraph();
+      } catch (err) {
+        setError(parseError(err));
+      } finally {
+        setBusy(false);
+      }
+    }, [profile, palace, loadJobs, loadProfiles, loadPalaces, loadConsolidator, loadGraph]);
+
+    const runConsolidator = useCallback(async (options = {}) => {
+      const dryRun = Boolean(options.dryRun);
+      const backfill = Boolean(options.backfill);
+      const allProfiles = Boolean(options.allProfiles);
+      if (backfill) {
+        const target = allProfiles ? "all profiles" : profile;
+        const ok = window.confirm(`Rebuild LLM history memory for ${target}? Existing history_* palaces will be backed up and replaced.`);
+        if (!ok) return;
+      }
+      setBusy(true);
+      setError("");
+      setMessage("");
+      setConsolidatorPreview(null);
+      try {
+        const data = await fetchJSON(`${API}/consolidator/run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            profile,
+            all_profiles: allProfiles,
+            dry_run: dryRun,
+            backfill,
+            reset_cursor: backfill,
+            clear_history: backfill,
+            backup: true,
+            limit: 25,
+            max_batches: backfill ? 10 : 1,
+            full: backfill,
+            workers: 5,
+            profile_workers: 2,
+            auto_clean: true,
+            clean_max_delete: 250,
+          }),
+        });
+        if (data && data.id && data.status) {
+          setMessage(`${allProfiles ? "Full rebuild for all profiles" : `Full rebuild for ${profile}`} started as process ${data.id}.`);
+          await loadJobs();
+          await loadConsolidator();
+          return;
+        }
+        if (dryRun) setConsolidatorPreview(data);
+        const processed = data.profiles
+          ? data.profiles.reduce((sum, row) => sum + Number(row.processed_messages || 0), 0)
+          : Number(data.processed_messages || 0);
+        const triples = data.profiles
+          ? data.profiles.reduce((sum, row) => sum + Number(row.triples || 0), 0)
+          : Number(data.triples || 0);
+        setMessage(`${dryRun ? "Previewed" : backfill ? "Backfilled" : "Consolidated"} ${fmt(processed)} message(s), ${fmt(triples)} graph triple(s).${autoCleanText(data)}`);
+        await loadProfiles();
+        await loadPalaces();
+        await loadConsolidator();
+        await loadGraph();
+      } catch (err) {
+        setError(parseError(err));
+      } finally {
+        setBusy(false);
+      }
+    }, [profile, loadProfiles, loadPalaces, loadConsolidator, loadJobs, loadGraph]);
+
+    const startExtractor = useCallback(async (options = {}) => {
+      const targetProfile = options.profile || profile;
+      const allProfiles = Boolean(options.allProfiles);
+      setBusy(true);
+      setError("");
+      setMessage("");
+      try {
+        const unpauseData = await fetchJSON(`${API}/consolidator/pause`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ profile: targetProfile, all_profiles: allProfiles, paused: false }),
+        });
+        applyProfileStatuses(unpauseData);
+        const data = await fetchJSON(`${API}/consolidator/run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            profile: targetProfile,
+            all_profiles: allProfiles,
+            resume: true,
+            dry_run: false,
+            backup: true,
+            limit: 25,
+            max_batches: 10,
+            workers: 5,
+            profile_workers: 2,
+            auto_clean: true,
+            clean_max_delete: 250,
+          }),
+        });
+        setMessage(`${allProfiles ? "Extractor for all profiles" : `Extractor for ${targetProfile}`} started as process ${data.id || "unknown"}.`);
+        await loadJobs();
+        await loadProfileStatuses();
+        await loadConsolidator();
+      } catch (err) {
+        setError(parseError(err));
+      } finally {
+        setBusy(false);
+      }
+    }, [profile, applyProfileStatuses, loadJobs, loadProfileStatuses, loadConsolidator]);
+
+    const setProfilePaused = useCallback(async (targetProfile, paused) => {
+      setBusy(true);
+      setError("");
+      setMessage("");
+      try {
+        const data = await fetchJSON(`${API}/consolidator/pause`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ profile: targetProfile, paused }),
+        });
+        applyProfileStatuses(data);
+        setMessage(paused ? `${targetProfile} paused after the current batch.` : `${targetProfile} resumed.`);
+        await loadProfileStatuses();
+        await loadConsolidator();
+      } catch (err) {
+        setError(parseError(err));
+      } finally {
+        setBusy(false);
+      }
+    }, [applyProfileStatuses, loadProfileStatuses, loadConsolidator]);
+
+    const setGlobalAuto = useCallback(async (enabled) => {
+      setBusy(true);
+      setError("");
+      setMessage("");
+      try {
+        const data = await fetchJSON(`${API}/consolidator/auto`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all_profiles: true, enabled, unpause: enabled }),
+        });
+        applyProfileStatuses(data);
+        setMessage(enabled ? "Automatic extraction enabled for all profiles." : "Automatic extraction disabled for all profiles.");
+        await loadProfileStatuses();
+        await loadConsolidator();
+      } catch (err) {
+        setError(parseError(err));
+      } finally {
+        setBusy(false);
+      }
+    }, [applyProfileStatuses, loadProfileStatuses, loadConsolidator]);
 
     const activeFocus = focusStack[focusStack.length - 1] || null;
     const selectedStats = (graph && graph.stats) || (palace ? palaces.find((row) => row.palace === palace) : {}) || {};
     const activeProfileTotal = matrix && matrix.totals ? matrix.totals[profile] : null;
+    const consolidatorTotal = Number((consolidator && consolidator.total_messages) || 0);
+    const consolidatorPending = Number((consolidator && consolidator.pending_messages) || 0);
+    const consolidatorProcessed = Math.max(0, consolidatorTotal - consolidatorPending);
+    const consolidatorProgress = consolidatorTotal ? Math.round((consolidatorProcessed / consolidatorTotal) * 100) : 0;
+    const lastBatch = (consolidator && consolidator.last_batch) || {};
+    const currentRun = (consolidator && consolidator.current) || {};
+    const recentEvents = (consolidator && consolidator.events) || [];
+    const scheduler = (consolidator && consolidator.scheduler) || {};
+    const activeJob =
+      (jobs || []).find((job) => job.status === "running") ||
+      (jobs || []).find((job) => job.status === "queued") ||
+      null;
+    const activeProgress = (activeJob && activeJob.progress) || {};
+    const activeStatus =
+      activeProgress.status ||
+      (activeProgress.profile_progress && activeProgress.profile_progress.status) ||
+      (activeProgress.profile_result && activeProgress.profile_result.status) ||
+      consolidator ||
+      {};
+    const activeCurrent =
+      activeProgress.current ||
+      (activeProgress.profile_progress && activeProgress.profile_progress.current) ||
+      (activeProgress.profile_result && activeProgress.profile_result.current) ||
+      activeStatus.current ||
+      currentRun ||
+      {};
+    const activeTotal = Number(activeStatus.total_messages || consolidatorTotal || 0);
+    const activePending = Number(activeStatus.pending_messages || consolidatorPending || 0);
+    const hasActiveRun = Boolean(activeJob || (consolidator && consolidator.running));
+    const autoGateText = !(consolidator && consolidator.auto_enabled)
+      ? "auto off"
+      : consolidator && consolidator.paused
+        ? "paused"
+        : hasActiveRun
+          ? "job running"
+          : activePending > 0
+            ? "waiting for tick"
+            : "no pending";
+    const autoSummaryText = `${consolidator && consolidator.auto_enabled ? "on" : "off"} / ${autoGateText}`;
+    const schedulerLastTick = scheduler.last_tick_at ? relativeTime(scheduler.last_tick_at) : "—";
+    const schedulerNextTick = scheduler.next_tick_at ? relativeTime(scheduler.next_tick_at) : "—";
+    const schedulerAction = scheduler.last_action || "—";
+    const activeProcessed = activeTotal
+      ? Math.max(0, activeTotal - activePending)
+      : Number(
+          (activeProgress.profile_progress && activeProgress.profile_progress.processed_messages) ||
+            activeProgress.processed_messages ||
+            consolidatorProcessed ||
+            0,
+        );
+    const activePercent = activeTotal ? Math.round((activeProcessed / activeTotal) * 100) : consolidatorProgress;
+    const heroMetricText = `${fmt(activePercent)}%`;
+    const heroStateText = hasActiveRun ? (activeJob ? activeJob.status : "running") : activePending > 0 ? "queue" : "done";
+    const heroBarWidth = activePercent;
+    const lastActivityAt =
+      activeCurrent.updated_at ||
+      (recentEvents && recentEvents.length ? recentEvents[recentEvents.length - 1].at : "") ||
+      (activeJob && activeJob.updated_at) ||
+      (consolidator && consolidator.last_finished_at) ||
+      "";
+    const lastActivityMs = lastActivityAt ? Date.parse(lastActivityAt) : 0;
+    const activityAgeSec = lastActivityMs ? Math.max(0, Math.round((Date.now() - lastActivityMs) / 1000)) : 0;
+    const isExtractorStalled = Boolean(
+      (activeJob && activeJob.status === "running") ||
+        (consolidator && consolidator.running)
+    ) && activityAgeSec > 360;
+    const activePhaseRaw = !hasActiveRun && activePending > 0
+      ? "waiting"
+      : activeCurrent.phase || activeStatus.phase || (activeJob && activeJob.status) || (consolidator && consolidator.phase) || "idle";
+    const activePhase = isExtractorStalled ? "stalled" : activePhaseRaw;
+    const activeProfileName = activeCurrent.profile || activeProgress.profile || activeJob && activeJob.profile || profile;
+    const activePalaceName =
+      activeCurrent.palace ||
+      (Array.isArray(activeCurrent.palaces) && activeCurrent.palaces.length ? activeCurrent.palaces.join(", ") : "—");
+    const activeBatch = activeCurrent.batch_index ? fmt(activeCurrent.batch_index) : "—";
+    const activeCursor = activeStatus.cursor_message_id || activeCurrent.cursor_message_id || consolidator && consolidator.cursor_message_id || 0;
+    const activeBatchMessages = hasActiveRun ? Number(activeCurrent.message_count || activeCurrent.messages || 0) : 0;
+    const activeBatchEntities = hasActiveRun ? Number(activeCurrent.batch_entities || activeCurrent.entities || 0) : 0;
+    const activeBatchTriples = hasActiveRun ? Number(activeCurrent.batch_triples || activeCurrent.triples || 0) : 0;
+    const activeBatchSkipped = hasActiveRun ? Number(activeCurrent.skipped_items || 0) : 0;
+    const activeLabel = activeJob
+      ? String(activeJob.kind || "").replace(/_/g, " ")
+      : hasActiveRun
+        ? "selected profile extractor"
+        : activePending > 0
+          ? "messages waiting for extractor"
+          : "profile memory is up to date";
+    const fallbackExtractorModels = [
+      { role: "Primary", provider: "openai-codex", model: "gpt-5.4-mini" },
+      { role: "Fallback", provider: "groq", model: "llama-3.3-70b-versatile" },
+      { role: "Fallback", provider: "nvidia", model: "nvidia/nemotron-3-super-120b-a12b" },
+      { role: "Fallback", provider: "auto", model: "main model fallback" },
+    ];
+    const extractorModels =
+      extractorConfig && Array.isArray(extractorConfig.models) && extractorConfig.models.length
+        ? extractorConfig.models
+        : fallbackExtractorModels;
+    const validatorModels =
+      extractorConfig && extractorConfig.validator && Array.isArray(extractorConfig.validator.models) && extractorConfig.validator.models.length
+        ? extractorConfig.validator.models
+        : [{ role: "Primary", provider: "auto", model: "main model" }];
+    const primaryModel = extractorModels.find((row) => String(row.role || "").toLowerCase() === "primary") || extractorModels[0] || {};
+    const validatorPrimaryModel = validatorModels.find((row) => String(row.role || "").toLowerCase() === "primary") || validatorModels[0] || {};
+    const fallbackModels = extractorModels.filter((row) => row !== primaryModel);
+    const configuredModelLabel = `${primaryModel.provider || "auto"} / ${primaryModel.model || "main model"}`;
+    const validatorModelLabel = `${validatorPrimaryModel.provider || "auto"} / ${validatorPrimaryModel.model || "main model"}`;
+    const activeModelLabel =
+      activeCurrent.model ||
+      activeStatus.model ||
+      lastBatch.model ||
+      configuredModelLabel;
+    const fallbackModelLabel = fallbackModels.length
+      ? fallbackModels.map((row) => `${row.provider || "auto"} / ${row.model || "main model"}`).join(" -> ")
+      : "none";
+    const extractorTask = (extractorConfig && extractorConfig.task) || (consolidator && consolidator.task) || "mempalace_extractor";
+    const extractorAdapter = (extractorConfig && extractorConfig.adapter) || (consolidator && consolidator.adapter) || "hermes_history_llm";
+    const allProfileStatuses = profileStatuses && profileStatuses.length ? profileStatuses : (consolidator ? [consolidator] : []);
+    const profileStatusCount = allProfileStatuses.length;
+    const autoEnabledCount = allProfileStatuses.filter((status) => status && status.auto_enabled).length;
+    const allAutoEnabled = profileStatusCount > 0 && autoEnabledCount === profileStatusCount;
+    const anyExtractorRunning = Boolean(activeJob || allProfileStatuses.some((status) => status && status.running));
+    const allRecentEvents = allProfileStatuses.flatMap((status) =>
+      ((status && status.events) || []).map((event) => ({ ...event, profile: event.profile || status.profile || profile })),
+    );
+    const jobRunId = (job) => {
+      const progress = (job && job.progress) || {};
+      const status =
+        progress.status ||
+        (progress.profile_progress && progress.profile_progress.status) ||
+        (progress.profile_result && progress.profile_result.status) ||
+        {};
+      const current =
+        progress.current ||
+        (progress.profile_progress && progress.profile_progress.current) ||
+        (progress.profile_result && progress.profile_result.current) ||
+        status.current ||
+        {};
+      const result = (job && job.result) || {};
+      const resultCurrent = result.current || (result.status && result.status.current) || {};
+      return current.run_id || resultCurrent.run_id || result.run_id || "";
+    };
+    const statusProcessRows = allProfileStatuses.flatMap((status) => {
+      if (!status) return [];
+      const profileName = status.profile || profile;
+      const events = status.events || [];
+      const startEvent = events.slice().reverse().find((event) => event && event.message === "Started MemPalace extraction") || {};
+      const finishEvent = events.slice().reverse().find((event) => event && /finished/i.test(String(event.message || ""))) || {};
+      const current = status.current || {};
+      const pending = Number(status.pending_messages || 0);
+      const running = Boolean(status.running);
+      const runId = current.run_id || status.current_run_id || startEvent.run_id || "";
+      const rows = [];
+      if (runId || startEvent.at || status.last_started_at || finishEvent.at || status.last_finished_at) {
+        rows.push({
+          id: runId || `profile:${profileName}:last`,
+          run_id: runId,
+          kind: running ? "extraction" : "last_extraction",
+          status: running ? "running" : status.stale ? "stale" : status.phase === "error" ? "error" : finishEvent.status || status.phase || "done",
+          profile: profileName,
+          all_profiles: false,
+          model: current.model || status.model || startEvent.model || activeModelLabel,
+          started_at: startEvent.at || status.last_started_at || "",
+          finished_at: running ? "" : finishEvent.at || status.last_finished_at || "",
+        });
+      }
+      return rows;
+    });
+    const rawProcessRows = [
+      ...(jobs || []).map((job) => ({ ...job, run_id: jobRunId(job), model: job.model || activeModelLabel })),
+      ...statusProcessRows,
+    ].filter((job) => job && job.id);
+    const processRows = rawProcessRows.filter((job, idx, rows) => {
+      const keys = [job.id, job.run_id].filter(Boolean);
+      return rows.findIndex((item) => {
+        const itemKeys = [item.id, item.run_id].filter(Boolean);
+        return itemKeys.some((key) => keys.includes(key));
+      }) === idx;
+    });
+    const profileStatusByName = new Map(allProfileStatuses.map((status) => [status.profile || profile, status]));
+    const eventMetaText = (event) => {
+      const eventPalaces = Array.isArray(event.palaces) ? event.palaces.join(", ") : event.palace || "";
+      return [
+        event.model ? `model ${event.model}` : `model ${activeModelLabel}`,
+        event.batch_index ? `batch ${fmt(event.batch_index)}` : "",
+        event.messages ? `${fmt(event.messages)} msg` : "",
+        event.triples ? `${fmt(event.triples)} triples` : "",
+        event.selected !== undefined ? `${fmt(event.selected)} selected` : "",
+        event.deleted_entities !== undefined ? `${fmt(event.deleted_entities)} deleted` : "",
+        event.cursor ? `cursor ${fmt(event.cursor)}` : "",
+        eventPalaces,
+      ].filter(Boolean).join(" | ");
+    };
+    const eventsByProcess = {};
+    allRecentEvents.forEach((event, idx) => {
+      const key =
+        event.run_id ||
+        (event.model_task === "mempalace_validator" ? `validator:${event.at || idx}` : "") ||
+        `event:${event.at || idx}`;
+      if (!eventsByProcess[key]) eventsByProcess[key] = [];
+      eventsByProcess[key].push(event);
+    });
+    const eventProcessRows = Object.keys(eventsByProcess).map((key) => {
+      const evs = eventsByProcess[key] || [];
+      const first = evs[0] || {};
+      const last = evs[evs.length - 1] || {};
+      const profileName = first.profile || last.profile || profile;
+      const profileStatus = profileStatusByName.get(profileName) || {};
+      const currentRunId =
+        profileStatus.current_run_id ||
+        (profileStatus.current && profileStatus.current.run_id) ||
+        "";
+      const isLiveRun = Boolean(profileStatus.running && currentRunId && currentRunId === key);
+      const hasError = evs.some((event) => event.level === "error" || event.status === "error");
+      const hasRunning = evs.some((event) => event.status === "running");
+      const hasSkipped = evs.some((event) => /skipped/i.test(String(event.message || "")) && !isNoIssueValidationEvent(event));
+      const isValidator = evs.some((event) => event.model_task === "mempalace_validator");
+      const finished = evs.slice().reverse().find((event) => /finished|skipped/i.test(String(event.message || "")) || event.status === "success" || event.status === "error") || last;
+      const unfinishedLiveRun = hasRunning && isLiveRun && !/finished|skipped/i.test(String(last.message || ""));
+      return {
+        id: key,
+        kind: isValidator ? "validator" : "extraction",
+        status: hasError ? "error" : unfinishedLiveRun ? "running" : hasSkipped ? "skipped" : finished.status || "done",
+        profile: profileName,
+        all_profiles: false,
+        model: first.model || last.model || activeModelLabel,
+        started_at: first.at || "",
+        finished_at: unfinishedLiveRun ? "" : finished.at || last.at || "",
+        events: evs,
+      };
+    });
+    const processRowKeys = new Set(processRows.flatMap((row) => [row.id, row.run_id].filter(Boolean)));
+    const processBlocks = [
+      ...processRows.map((row) => {
+        const rowEvents = eventsByProcess[row.run_id] || eventsByProcess[row.id] || [];
+        return { ...row, events: rowEvents };
+      }),
+      ...eventProcessRows.filter((row) => !processRowKeys.has(row.id)),
+    ].sort((a, b) => String(b.started_at || b.created_at || "").localeCompare(String(a.started_at || a.created_at || "")));
+    const processKindLabel = (job) => {
+      const value = String((job && job.kind) || "").toLowerCase();
+      if (value.includes("last_extraction")) return "Last extraction";
+      if (value.includes("validate")) return "Validation";
+      if (value.includes("auto")) return "Auto extraction";
+      if (value.includes("resume")) return "Resume extraction";
+      if (value.includes("full") || value.includes("rebuild") || value.includes("backfill")) return job && job.all_profiles ? "Full rebuild all profiles" : "Full rebuild profile";
+      if (value.includes("extract")) return "Extraction";
+      return titleCaseWords(value || "process");
+    };
+    const processTitle = (job) => {
+      const parts = [processKindLabel(job)];
+      if (job && job.all_profiles) {
+        parts.push("all profiles");
+      } else if (job && job.profile) {
+        parts.push(job.profile);
+      }
+      const when = relativeTime((job && (job.finished_at || job.started_at || job.created_at)) || "");
+      if (when !== "—") parts.push(when);
+      return parts.join(" · ");
+    };
+    const processTechnicalLabel = (job) => {
+      const id = String((job && job.id) || "");
+      if (!id || id === "persisted") return "persisted profile status";
+      if (id.startsWith("validator:") || id.startsWith("event:")) return "from persisted event log";
+      return `id ${shorten(id, 12)}`;
+    };
+    const isCurrentProcess = (job) => {
+      if (!job) return false;
+      if (statusTone(job.status) === "running") return true;
+      if (activeJob && job.id === activeJob.id) return true;
+      const activeRunId = activeCurrent.run_id || activeStatus.current_run_id || "";
+      return Boolean(activeRunId && (job.id === activeRunId || job.run_id === activeRunId));
+    };
+    const activeRunStateText = heroStateText;
+    const profileGroupNames = Array.from(new Set([
+      ...allProfileStatuses.map((status) => status.profile || profile),
+      ...processBlocks.map((row) => row.profile || profile),
+    ]));
+    const processGroups = profileGroupNames.map((profileName) => {
+      const status = profileStatusByName.get(profileName) || {};
+      const rows = processBlocks
+        .filter((row) => (row.profile || profile) === profileName)
+        .sort((a, b) => String(b.finished_at || b.started_at || b.created_at || "").localeCompare(String(a.finished_at || a.started_at || a.created_at || "")));
+      const pending = Number(status.pending_messages || 0);
+      const running = Boolean(status.running) || rows.some((row) => statusTone(row.status) === "running");
+      const paused = Boolean(status.paused);
+      const autoEnabled = Boolean(status.auto_enabled);
+      const errored = Boolean(status.stale || status.phase === "error") || rows.some((row) => statusTone(row.status) === "error");
+      const tone = errored ? "error" : running ? "running" : pending > 0 || paused ? "pending" : "done";
+      const autoText = paused ? "paused" : autoEnabled ? "auto on" : "auto off";
+      const queueText = pending > 0 ? `${fmt(pending)} messages waiting` : "up to date";
+      const lastAt =
+        (rows[0] && (rows[0].finished_at || rows[0].started_at || rows[0].created_at)) ||
+        status.last_finished_at ||
+        status.last_started_at ||
+        "";
+      return {
+        profile: profileName,
+        status,
+        rows,
+        pending,
+        running,
+        paused,
+        autoEnabled,
+        tone,
+        autoText,
+        queueText,
+        lastAt,
+      };
+    }).sort((a, b) => {
+      const toneRank = { running: 0, error: 1, pending: 2, done: 3 };
+      const rankDiff = (toneRank[a.tone] ?? 9) - (toneRank[b.tone] ?? 9);
+      if (rankDiff) return rankDiff;
+      if (a.profile === profile) return -1;
+      if (b.profile === profile) return 1;
+      return a.profile.localeCompare(b.profile);
+    });
+    const renderProcessBlock = (job, idx) => {
+      const tone = statusTone(job.status);
+      const current = isCurrentProcess(job);
+      const finishText = job.finished_at
+        ? `finished ${relativeTime(job.finished_at)}`
+        : tone === "running"
+          ? "running now"
+          : "finish not recorded";
+      return h(
+        "details",
+        {
+          className: `mp-process-block is-${tone} ${current ? "is-current" : ""}`,
+          key: job.id,
+          open: current || idx < 2 || tone === "error",
+        },
+        h(
+          "summary",
+          null,
+          h(
+            "div",
+            { className: "mp-process-row-main" },
+            h("span", { className: `mp-status-pill is-${tone}` }, statusLabel(job.status)),
+            h(
+              "div",
+              { className: "mp-process-title-stack" },
+              h("strong", null, processTitle(job)),
+              h("small", { title: job.id || "" }, processTechnicalLabel(job)),
+            ),
+          ),
+          h(
+            "div",
+            { className: "mp-process-row-meta" },
+            h("span", null, job.all_profiles ? "all profiles" : job.profile || "—"),
+            h("span", null, `model ${shorten(job.model || activeModelLabel, 64)}`),
+            h("span", { title: job.started_at || job.created_at ? shortDateTime(job.started_at || job.created_at) : "" }, `started ${relativeTime(job.started_at || job.created_at)}`),
+            h("span", { title: job.finished_at ? shortDateTime(job.finished_at) : "" }, finishText),
+            h("span", null, `${fmt((job.events || []).length)} events`),
+          ),
+        ),
+        job.events && job.events.length
+          ? h(
+              "div",
+              { className: "mp-process-block-events" },
+              job.events.slice().reverse().map((event, eventIdx) => {
+                const eventToneValue = eventTone(event);
+                return h(
+                  "div",
+                  { className: `mp-event-row is-${eventToneValue}`, key: `${event.at || eventIdx}:${eventIdx}` },
+                  h("div", { className: "mp-event-time", title: event.at ? shortDateTime(event.at) : "" }, relativeTime(event.at)),
+                  h("span", { className: `mp-status-pill is-${eventToneValue} is-small` }, eventLabel(event)),
+                  h(
+                    "div",
+                    { className: "mp-event-body" },
+                    h("strong", null, eventMessage(event)),
+                    h("span", null, eventMetaText(event) || "—"),
+                  ),
+                );
+              }),
+            )
+          : h("p", { className: "mp-muted" }, "No persisted events for this process."),
+      );
+    };
+    const processErrors = [
+      activeJob && activeJob.error ? { source: activeJob.id, message: activeJob.error } : null,
+      consolidator && consolidator.last_error ? { source: "selected profile", message: consolidator.last_error } : null,
+      scheduler && scheduler.last_error ? { source: "auto scheduler", message: scheduler.last_error } : null,
+      ...allRecentEvents
+        .filter((event) => event && event.level === "error")
+        .map((event) => ({ source: event.at || "event", message: event.message || "" })),
+    ].filter(Boolean);
     const displayGraph = useMemo(() => {
       if (!palace && !activeFocus && !query.trim()) {
         return buildTopicGraph(profile, palaces, selectedStats);
@@ -1356,6 +2116,296 @@
         return [...stack, { id: node.id, label: node.label || node.id, depth: 2 }];
       });
     };
+    const openProcessPage = () => {
+      window.location.hash = "process";
+      setRoute("process");
+    };
+    const closeProcessPage = () => {
+      if (window.location.hash === "#process") {
+        history.pushState("", document.title, window.location.pathname + window.location.search);
+      }
+      setRoute("graph");
+    };
+
+    if (route === "process") {
+      return h(
+        "div",
+        { className: "mp-root mp-process-page" },
+        h(
+          "section",
+          { className: "mp-process-page-head" },
+          h(
+            "div",
+            null,
+            h("h2", null, "MemPalace Process"),
+            h("p", null, `${activeJob ? `Process ${activeJob.id}` : `Profile ${profile}`} | model ${activeModelLabel}`),
+          ),
+          h("button", { className: "mp-process-back-button", onClick: closeProcessPage, type: "button" }, "Back to graph"),
+        ),
+        h(
+          "section",
+          { className: "mp-consolidator" },
+          h(
+            "div",
+            { className: "mp-process-hero" },
+            h(
+              "div",
+              { className: "mp-process-pct" },
+              h("strong", null, heroMetricText),
+              h("span", { className: `mp-status-pill is-${statusTone(activeRunStateText)}` }, statusLabel(activeRunStateText)),
+            ),
+            h(
+              "div",
+              { className: "mp-process-main" },
+              h(
+                "div",
+                { className: "mp-process-title" },
+                h("strong", null, activeLabel),
+                activeJob ? h("code", null, activeJob.id) : null,
+                h("span", { className: "mp-model-live" }, "Model ", h("b", null, activeModelLabel)),
+              ),
+              h(
+                "div",
+                { className: "mp-process-bar", title: hasActiveRun ? `${fmt(activeProcessed)} of ${fmt(activeTotal)} messages processed` : "No extractor job is running" },
+                h("span", { style: { width: `${Math.max(0, Math.min(100, heroBarWidth))}%` } }),
+              ),
+              h(
+                "div",
+                { className: "mp-process-grid" },
+                h("div", null, h("span", null, "Profile"), h("b", null, activeProfileName || "—")),
+                h("div", null, h("span", null, "Palace"), h("b", null, activePalaceName)),
+                h("div", null, h("span", null, "Phase"), h("b", null, activePhase)),
+                h("div", null, h("span", null, "Batch"), h("b", null, activeBatch)),
+                h("div", null, h("span", null, "Cursor"), h("b", null, fmt(activeCursor))),
+                h("div", null, h("span", null, "Messages"), h("b", null, `${fmt(activeProcessed)} / ${fmt(activeTotal)}`)),
+                h("div", null, h("span", null, "Pending"), h("b", null, fmt(activePending))),
+                h("div", null, h("span", null, "Current messages"), h("b", null, hasActiveRun && activeBatchMessages ? fmt(activeBatchMessages) : "—")),
+                h("div", null, h("span", null, "Entities"), h("b", null, hasActiveRun ? fmt(activeBatchEntities) : "—")),
+                h("div", null, h("span", null, "Triples"), h("b", null, hasActiveRun ? fmt(activeBatchTriples) : "—")),
+                h("div", null, h("span", null, "Skipped"), h("b", null, hasActiveRun ? fmt(activeBatchSkipped) : "—")),
+                h("div", null, h("span", null, "Last update"), h("b", { title: lastActivityAt ? shortDateTime(lastActivityAt) : "" }, lastActivityAt ? relativeTime(lastActivityAt) : "—")),
+                h("div", null, h("span", null, "Age"), h("b", null, activityAgeSec ? `${fmt(Math.floor(activityAgeSec / 60))} min ${fmt(activityAgeSec % 60)} sec` : "—")),
+                activeProgress.profile_index !== undefined
+                  ? h("div", null, h("span", null, "Profiles"), h("b", null, `${fmt(Number(activeProgress.profile_index) + 1)} / ${fmt(activeProgress.profiles_total || 0)}`))
+                  : null,
+              ),
+            ),
+          ),
+          h(
+            "div",
+            { className: "mp-model-strip" },
+            h(
+              "div",
+              { className: "mp-model-primary" },
+              h("span", null, hasActiveRun ? "Running model" : "Configured extractor model"),
+              h("strong", null, activeModelLabel),
+              h("em", null, `${extractorTask} / ${extractorAdapter}`),
+            ),
+            h(
+              "div",
+              { className: "mp-model-fallbacks" },
+              h("span", null, "Fallback chain"),
+              h("strong", null, fallbackModelLabel),
+            ),
+            h(
+              "div",
+              { className: "mp-model-validator" },
+              h("span", null, "Validation model"),
+              h("strong", null, validatorModelLabel),
+            ),
+          ),
+          h(
+            "div",
+            { className: "mp-process-page-actions" },
+            h("button", { className: "mp-action-primary", onClick: () => startExtractor({ allProfiles: true }), disabled: busy || anyExtractorRunning, type: "button" }, anyExtractorRunning ? "Running" : "Start"),
+            h("button", { onClick: () => runConsolidator({ dryRun: true, allProfiles: true }), disabled: busy, type: "button" }, "Preview all"),
+            h("button", { onClick: () => runConsolidator({ backfill: true, allProfiles: true }), disabled: busy, type: "button" }, "Full rebuild all"),
+            h("button", { onClick: () => runValidator({ allProfiles: true }), disabled: busy, type: "button" }, "Run validator"),
+            h(
+              "button",
+              {
+                className: `mp-auto-switch ${allAutoEnabled ? "is-on" : "is-off"}`,
+                role: "switch",
+                "aria-checked": allAutoEnabled ? "true" : "false",
+                onClick: () => setGlobalAuto(!allAutoEnabled),
+                disabled: busy,
+                type: "button",
+              },
+              h("span", { "aria-hidden": "true" }),
+              h("strong", null, allAutoEnabled ? "Auto on" : "Auto off"),
+              h("small", null, `${fmt(autoEnabledCount)} / ${fmt(profileStatusCount)} profiles`),
+            ),
+          ),
+          h(
+            "div",
+            { className: "mp-process-details is-page" },
+            h(
+              "div",
+              { className: "mp-process-details-head" },
+              h("h3", null, "Extractor details"),
+              h("span", null, activeJob ? `process ${activeJob.id}` : `profile ${profile}`),
+            ),
+            h(
+              "div",
+              { className: "mp-detail-grid" },
+              h("div", null, h("span", null, "Task"), h("b", null, extractorTask)),
+              h("div", null, h("span", null, "Adapter"), h("b", null, extractorAdapter)),
+              h("div", null, h("span", null, "Started"), h("b", { title: shortDateTime((activeJob && activeJob.started_at) || (consolidator && consolidator.last_started_at)) }, relativeTime((activeJob && activeJob.started_at) || (consolidator && consolidator.last_started_at)))),
+              h("div", null, h("span", null, "Updated"), h("b", { title: shortDateTime((activeJob && activeJob.updated_at) || (consolidator && consolidator.last_finished_at)) }, relativeTime((activeJob && activeJob.updated_at) || (consolidator && consolidator.last_finished_at)))),
+              h("div", null, h("span", null, "Stalled"), h("b", null, isExtractorStalled ? "yes" : "no")),
+              h("div", null, h("span", null, "Workers"), h("b", null, `${fmt((extractorConfig && extractorConfig.workers) || 5)} palace / 2 profile`)),
+              h("div", null, h("span", null, "Mode"), h("b", null, activeJob && activeJob.all_profiles ? "all profiles" : "selected profile")),
+              h("div", null, h("span", null, "Auto"), h("b", null, autoSummaryText)),
+              h("div", null, h("span", null, "Scheduler tick"), h("b", { title: scheduler.last_tick_at ? shortDateTime(scheduler.last_tick_at) : "" }, schedulerLastTick)),
+              h("div", null, h("span", null, "Next tick"), h("b", { title: scheduler.next_tick_at ? shortDateTime(scheduler.next_tick_at) : "" }, schedulerNextTick)),
+              h("div", null, h("span", null, "Scheduler action"), h("b", null, schedulerAction)),
+            ),
+            h(
+              "div",
+              { className: "mp-detail-section" },
+              h("strong", null, "Models"),
+              h(
+                "div",
+                { className: "mp-model-stack" },
+                extractorModels.map((row, idx) =>
+                  h(
+                    "div",
+                    { className: `mp-model-card ${idx === 0 ? "is-primary" : ""}`, key: `${row.role}:${row.provider}:${row.model}` },
+                    h("span", null, idx === 0 ? (hasActiveRun ? "Running now" : "Primary extractor") : row.role || "Fallback"),
+                    h("strong", null, `${row.provider || "auto"} / ${row.model || "main model"}`),
+                  ),
+                ),
+              ),
+            ),
+            h(
+              "div",
+              { className: "mp-detail-section" },
+              h("strong", null, "Process history"),
+              processGroups && processGroups.length
+                ? h(
+                    "div",
+                    { className: "mp-profile-groups" },
+                    processGroups.map((group) => {
+                      const status = group.status || {};
+                      const open = group.profile === profile || group.tone !== "done";
+                      return h(
+                        "details",
+                        {
+                          className: `mp-profile-group is-${group.tone}`,
+                          key: group.profile,
+                          open,
+                        },
+                        h(
+                          "summary",
+                          null,
+                          h(
+                            "div",
+                            { className: "mp-profile-group-main" },
+                            h("span", { className: `mp-status-pill is-${group.tone}` }, group.tone === "pending" ? "Queue" : statusLabel(group.tone)),
+                            h(
+                              "div",
+                              null,
+                              h("strong", null, group.profile),
+                              h("small", null, `${group.queueText} · ${group.autoText}`),
+                            ),
+                          ),
+                          h(
+                            "div",
+                            { className: "mp-profile-group-meta" },
+                            h("span", null, `${fmt(status.total_messages || 0)} total`),
+                            h("span", null, `${fmt(status.cursor_message_id || 0)} cursor`),
+                            h("span", null, `${fmt(status.max_message_id || 0)} latest`),
+                            h("span", { title: group.lastAt ? shortDateTime(group.lastAt) : "" }, group.lastAt ? `last ${relativeTime(group.lastAt)}` : "no runs"),
+                            h("span", null, `${fmt(group.rows.length)} runs`),
+                          ),
+                          h(
+                            "div",
+                            {
+                              className: "mp-profile-group-actions",
+                              onClick: (event) => event.stopPropagation(),
+                            },
+                            h(
+                              "button",
+                              {
+                                className: group.running ? "is-pause" : "is-start",
+                                disabled: busy || (!group.running && !group.paused && group.pending <= 0),
+                                onClick: (event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  if (group.running) {
+                                    setProfilePaused(group.profile, true);
+                                  } else {
+                                    startExtractor({ profile: group.profile });
+                                  }
+                                },
+                                type: "button",
+                              },
+                              group.running ? "Pause" : "Start",
+                            ),
+                          ),
+                        ),
+                        group.rows.length
+                          ? h("div", { className: "mp-process-blocks" }, group.rows.slice(0, 8).map((job, idx) => renderProcessBlock(job, idx)))
+                          : h("p", { className: "mp-muted" }, "No process history recorded for this profile."),
+                      );
+                    }),
+                  )
+                : h("p", null, "No process history recorded yet."),
+            ),
+            h(
+              "div",
+              { className: "mp-detail-section" },
+              h("strong", null, "Errors"),
+              processErrors.length
+                ? h(
+                    "div",
+                    { className: "mp-error-list" },
+                    processErrors.map((row, idx) =>
+                      h(
+                        "div",
+                        { className: "mp-error-row", key: `${row.source}:${idx}` },
+                        h("span", null, row.source),
+                        h("strong", null, row.message),
+                      ),
+                    ),
+                  )
+                : h("p", null, "No errors recorded."),
+            ),
+          ),
+          palaces && palaces.length
+            ? h(
+                "div",
+                { className: "mp-process-palaces" },
+                h(
+                  "div",
+                  { className: "mp-process-palaces-head" },
+                  h("strong", null, `Profile palaces: ${profile}`),
+                  h("span", null, `${fmt(palaces.length)} palace(s)`),
+                ),
+                h(
+                  "table",
+                 null,
+                  h("thead", null, h("tr", null, h("th", null, "Palace"), h("th", null, "Entities"), h("th", null, "Triples"), h("th", null, "Last update"))),
+                  h(
+                    "tbody",
+                    null,
+                    palaces.slice(0, 20).map((row) =>
+                      h(
+                        "tr",
+                        { key: row.palace },
+                        h("td", null, row.palace),
+                        h("td", null, fmt(row.entity_count || 0)),
+                        h("td", null, fmt(row.triple_count || 0)),
+                        h("td", null, row.modified_at ? String(row.modified_at).replace("T", " ").slice(0, 16) : "—"),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            : null,
+        ),
+      );
+    }
 
     return h(
       "div",
@@ -1367,7 +2417,7 @@
           "div",
           { className: "mp-title" },
           h("h2", null, "MemPalace"),
-          h("p", null, palace ? `Topic filter: ${palace}` : "All profile memory from chat history + curated notes"),
+          h("p", null, palace ? `Palace filter: ${palace}` : "All profile memory from chat history + curated notes"),
         ),
         h(
           "div",
@@ -1379,7 +2429,7 @@
           ),
           h(
             NativeSelect,
-            { label: "Topic", value: palace, onChange: changeTopic },
+            { label: "Palace", value: palace, onChange: changeTopic },
             [
               h("option", { key: "__all", value: "" }, "All profile memory"),
               ...palaces.map((row) => h("option", { key: row.palace, value: row.palace }, row.palace)),
@@ -1430,8 +2480,59 @@
         : null,
       h(
         "section",
+        { className: "mp-consolidator" },
+        h(
+          "div",
+          { className: "mp-process-hero" },
+          h(
+            "div",
+            { className: "mp-process-pct" },
+            h("strong", null, heroMetricText),
+            h("span", { className: `mp-status-pill is-${statusTone(activeRunStateText)}` }, statusLabel(activeRunStateText)),
+          ),
+          h(
+            "div",
+            { className: "mp-process-main" },
+            h(
+              "div",
+              { className: "mp-process-title" },
+              h("strong", null, activeLabel),
+              activeJob ? h("code", null, activeJob.id) : null,
+              h("span", { className: "mp-model-live" }, "Model ", h("b", null, activeModelLabel)),
+              h(
+                "button",
+                {
+                  className: "mp-process-open-button",
+                  onClick: openProcessPage,
+                  type: "button",
+                },
+                "Open process page",
+              ),
+            ),
+            h(
+              "div",
+              { className: "mp-process-bar", title: hasActiveRun ? `${fmt(activeProcessed)} of ${fmt(activeTotal)} messages processed` : "No extractor job is running" },
+              h("span", { style: { width: `${Math.max(0, Math.min(100, heroBarWidth))}%` } }),
+            ),
+            h(
+              "div",
+              { className: "mp-process-grid is-summary" },
+              h("div", null, h("span", null, "Profile"), h("b", null, activeProfileName || "—")),
+              h("div", null, h("span", null, "Model"), h("b", null, activeModelLabel)),
+              h("div", null, h("span", null, "Auto"), h("b", null, autoSummaryText)),
+              h("div", null, h("span", null, "Phase"), h("b", null, activePhase)),
+              h("div", null, h("span", null, "Messages"), h("b", null, `${fmt(activeProcessed)} / ${fmt(activeTotal)}`)),
+              h("div", null, h("span", null, "Pending"), h("b", null, fmt(activePending))),
+              h("div", null, h("span", null, "Last update"), h("b", { title: lastActivityAt ? shortDateTime(lastActivityAt) : "" }, lastActivityAt ? relativeTime(lastActivityAt) : "—")),
+              h("div", null, h("span", null, "Next auto tick"), h("b", { title: scheduler.next_tick_at ? shortDateTime(scheduler.next_tick_at) : "" }, schedulerNextTick)),
+            ),
+          ),
+        ),
+      ),
+      h(
+        "section",
         { className: "mp-stats" },
-        h(StatCell, { label: "Topics", value: palace ? 1 : (selectedStats.topic_count || palaces.length) }),
+        h(StatCell, { label: "Palaces", value: palace ? 1 : (selectedStats.topic_count || palaces.length) }),
         h(StatCell, { label: "Entities", value: selectedStats.entity_count }),
         h(StatCell, { label: "Triples", value: selectedStats.triple_count }),
         h(StatCell, { label: "Nodes", value: selectedStats.node_count }),
@@ -1446,7 +2547,7 @@
             className: !palace && !activeFocus ? "is-active" : "",
             onClick: () => changeTopic(""),
           },
-          "Topics",
+          "Palaces",
         ),
         palace
           ? h(
@@ -1492,7 +2593,7 @@
         { className: "mp-profile-strip" },
         h("span", null, profile),
         activeProfileTotal
-          ? h("strong", null, `${fmt(activeProfileTotal.palaces)} topics · ${fmt(activeProfileTotal.entities)} entities · ${fmt(activeProfileTotal.triples)} triples`)
+          ? h("strong", null, `${fmt(activeProfileTotal.palaces)} palaces · ${fmt(activeProfileTotal.entities)} entities · ${fmt(activeProfileTotal.triples)} triples`)
           : null,
         h(
           "button",

@@ -523,6 +523,211 @@ _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stal
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
+_SPECIALIST_CONTRACTS: Dict[str, Dict[str, Any]] = {
+    "fitness": {
+        "skill": "telegram_health/fitness",
+        "memory": "~/tenants/telegram_health/memory/fitness.md",
+        "required_toolsets": ["skills", "file", "health-actions", "health-db"],
+        "label": "🏋️ *Фитнес*",
+    },
+    "nutrition": {
+        "skill": "telegram_health/nutrition",
+        "memory": "~/tenants/telegram_health/memory/nutrition.md",
+        "required_toolsets": ["skills", "file", "health-actions", "health-db"],
+        "label": "🥗 *Питание*",
+    },
+    "medical": {
+        "skill": "telegram_health/medical",
+        "memory": "~/tenants/telegram_health/memory/medical/",
+        "required_toolsets": ["skills", "file", "health-actions", "health-db"],
+        "label": "🩺 *Медик*",
+    },
+    "miniapp": {
+        "skill": "telegram_health/miniapp",
+        "memory": "~/tenants/telegram_health/memory/miniapp.md",
+        "required_toolsets": ["skills", "file", "health-actions", "health-db", "terminal"],
+        "label": "🧩 *Mini App*",
+    },
+    "miniapp_builder": {
+        "skill": "telegram_family/miniapp-builder",
+        "memory": (
+            "/home/hermes/.hermes/profiles/family-chat/tenants/"
+            "telegram_family/memory/miniapp_builder.md"
+        ),
+        "required_toolsets": ["skills", "file", "terminal", "web"],
+        "label": "🧩 *Mini App Builder*",
+    },
+}
+
+# Backwards-compatible name for tests/plugins that still import the old
+# health-only constant.
+_HEALTH_SPECIALIST_CONTRACTS = _SPECIALIST_CONTRACTS
+
+_SPECIALIST_ALIASES = {
+    "fit": "fitness",
+    "training": "fitness",
+    "workout": "fitness",
+    "telegram_health/fitness": "fitness",
+    "food": "nutrition",
+    "diet": "nutrition",
+    "telegram_health/nutrition": "nutrition",
+    "med": "medical",
+    "medicine": "medical",
+    "telegram_health/medical": "medical",
+    "app": "miniapp",
+    "apps": "miniapp",
+    "mini-app": "miniapp",
+    "mini_app": "miniapp",
+    "miniapps": "miniapp",
+    "mini-apps": "miniapp",
+    "telegram mini app": "miniapp",
+    "telegram_health/miniapp": "miniapp",
+    "miniapp-builder": "miniapp_builder",
+    "miniapp builder": "miniapp_builder",
+    "mini app builder": "miniapp_builder",
+    "miniapp_creator": "miniapp_builder",
+    "miniapp creator": "miniapp_builder",
+    "mini app creator": "miniapp_builder",
+    "miniapp specialist": "miniapp_builder",
+    "mini app specialist": "miniapp_builder",
+    "telegram miniapp builder": "miniapp_builder",
+    "telegram mini app builder": "miniapp_builder",
+    "telegram_family/miniapp-builder": "miniapp_builder",
+    "миниапп": "miniapp_builder",
+    "миниаппы": "miniapp_builder",
+    "миниапов": "miniapp_builder",
+    "миниаппов": "miniapp_builder",
+    "создание миниаппов": "miniapp_builder",
+}
+
+
+def _normalize_specialist_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().strip("'\"").lower().replace("\\", "/")
+    if not text:
+        return None
+    if text in _SPECIALIST_CONTRACTS:
+        return text
+    return _SPECIALIST_ALIASES.get(text)
+
+
+def _infer_specialist_from_goal(goal: Any) -> Optional[str]:
+    if not isinstance(goal, str):
+        return None
+    text = goal.lower().replace("\\", "/")
+    for specialist in _SPECIALIST_CONTRACTS:
+        contract = _SPECIALIST_CONTRACTS[specialist]
+        skill = str(contract.get("skill") or "").lower()
+        if skill and skill in text:
+            return specialist
+        if f"telegram_health/{specialist}" in text:
+            return specialist
+        if f"{specialist}-специалист" in text:
+            return specialist
+        if f"{specialist} specialist" in text:
+            return specialist
+    return None
+
+
+def _merge_toolsets(existing: Any, required: List[str]) -> List[str]:
+    if isinstance(existing, str):
+        merged = [existing]
+    elif isinstance(existing, list):
+        merged = [str(item) for item in existing if str(item).strip()]
+    elif existing:
+        merged = [str(existing)]
+    else:
+        merged = []
+    seen = set(merged)
+    for toolset in required:
+        if toolset not in seen:
+            merged.append(toolset)
+            seen.add(toolset)
+    return merged
+
+
+def _toolset_satisfied(required: str, granted: List[str]) -> bool:
+    granted_set = set(granted or [])
+    if required in granted_set:
+        return True
+    if required in {"health-db", "mcp-health-db"}:
+        return bool({"health-db", "mcp-health-db"} & granted_set)
+    try:
+        from tools.registry import registry
+
+        alias_target = registry.get_toolset_alias_target(required)
+        if alias_target and alias_target in granted_set:
+            return True
+        for granted_name in granted_set:
+            if registry.get_toolset_alias_target(granted_name) == required:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _missing_required_toolsets(required: List[str], granted: List[str]) -> List[str]:
+    return [
+        toolset
+        for toolset in required
+        if not _toolset_satisfied(toolset, granted)
+    ]
+
+
+def _apply_specialist_contract(
+    task: Dict[str, Any],
+    fallback_specialist: Optional[str] = None,
+) -> Dict[str, Any]:
+    specialist = _normalize_specialist_id(
+        task.get("specialist")
+        or fallback_specialist
+        or _infer_specialist_from_goal(task.get("goal"))
+    )
+    if not specialist:
+        return task
+
+    contract = _SPECIALIST_CONTRACTS.get(specialist)
+    if not contract:
+        return task
+
+    goal = str(task.get("goal") or "").strip()
+    if "SPECIALIST CONTRACT" not in goal:
+        contract_goal = (
+            "SPECIALIST CONTRACT\n"
+            f"- specialist: {specialist}\n"
+            f"- visible_label: {contract['label']}\n"
+            "- You are a delegated, isolated specialist. You do not see the "
+            "parent chat history, shared memory, or other specialists' memory "
+            "unless the coordinator explicitly passed it in context.\n"
+            f"- First call skill_view(name=\"{contract['skill']}\") and follow it.\n"
+            f"- Then read only your private specialist memory: {contract['memory']}.\n"
+            "- Do not use the shared memory tool. If a required tool, database, "
+            "or memory file is unavailable, say so explicitly instead of "
+            "pretending the specialist completed the work.\n"
+            "- Return a clear SpecialistResult with status/message/artifacts "
+            "when the task changes data or publishes an artifact.\n\n"
+            "ORIGINAL TASK\n"
+            f"{goal}"
+        )
+        task["goal"] = contract_goal
+
+    required_toolsets = list(contract.get("required_toolsets") or [])
+    task["toolsets"] = _merge_toolsets(task.get("toolsets"), required_toolsets)
+    task["_specialist"] = specialist
+    task["_specialist_label"] = contract.get("label")
+    task["_specialist_required_toolsets"] = required_toolsets
+    # Operators can reserve a stronger model for selected specialists without
+    # changing the model inherited by ordinary delegated tasks.  This is kept
+    # in the delegation config rather than hard-coded into the health contract
+    # so model rollouts remain an operational setting.
+    specialist_models = _load_config().get("specialist_models") or {}
+    if isinstance(specialist_models, dict):
+        specialist_model = str(specialist_models.get(specialist) or "").strip()
+        if specialist_model:
+            task["_specialist_model"] = specialist_model
+    return task
+
 
 # ---------------------------------------------------------------------------
 # Delegation progress event types
@@ -691,6 +896,7 @@ def _build_child_progress_callback(
     depth: Optional[int] = None,
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
+    specialist: Optional[str] = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -738,6 +944,8 @@ def _build_child_progress_callback(
             kw["model"] = model
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
+        if specialist is not None:
+            kw["specialist"] = specialist
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -888,6 +1096,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    specialist: Optional[str] = None,
+    specialist_label: Optional[str] = None,
+    specialist_required_toolsets: Optional[List[str]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -942,6 +1153,7 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
+    requested_toolsets = [str(t) for t in toolsets] if toolsets else []
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
@@ -966,6 +1178,17 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+
+    granted_toolsets = list(child_toolsets)
+    dropped_toolsets = [
+        requested
+        for requested in requested_toolsets
+        if not _toolset_satisfied(requested, granted_toolsets)
+    ]
+    missing_required_toolsets = _missing_required_toolsets(
+        specialist_required_toolsets or [],
+        granted_toolsets,
+    )
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
@@ -997,6 +1220,7 @@ def _build_child_agent(
         depth=tui_depth,
         model=effective_model_for_cb,
         toolsets=child_toolsets,
+        specialist=specialist,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -1146,6 +1370,12 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_specialist = specialist
+    child._delegate_specialist_label = specialist_label
+    child._delegate_requested_toolsets = requested_toolsets
+    child._delegate_granted_toolsets = granted_toolsets
+    child._delegate_dropped_toolsets = dropped_toolsets
+    child._delegate_missing_required_toolsets = missing_required_toolsets
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1602,6 +1832,7 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                **_child_delegate_metadata(child),
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -1715,6 +1946,7 @@ def _run_single_child(
                 )
                 else 0.0
             ),
+            **_child_delegate_metadata(child),
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
@@ -1837,6 +2069,7 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            **_child_delegate_metadata(child),
         }
 
     finally:
@@ -1915,10 +2148,34 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _child_delegate_metadata(child: Any) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "effective_role": getattr(child, "_delegate_role", None),
+        "timeout_seconds": _get_child_timeout(),
+    }
+    specialist = getattr(child, "_delegate_specialist", None)
+    if specialist:
+        metadata["specialist"] = specialist
+        label = getattr(child, "_delegate_specialist_label", None)
+        if label:
+            metadata["specialist_label"] = label
+    for attr, key in (
+        ("_delegate_requested_toolsets", "requested_toolsets"),
+        ("_delegate_granted_toolsets", "granted_toolsets"),
+        ("_delegate_dropped_toolsets", "dropped_toolsets"),
+        ("_delegate_missing_required_toolsets", "missing_required_toolsets"),
+    ):
+        value = getattr(child, attr, None)
+        if value:
+            metadata[key] = list(value)
+    return metadata
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
+    specialist: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
@@ -1930,8 +2187,8 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, toolsets, role, specialist)
+      - Batch:  provide tasks array [{goal, context, toolsets, role, specialist}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -1954,6 +2211,7 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    top_specialist = _normalize_specialist_id(specialist)
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -2017,7 +2275,16 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            _apply_specialist_contract(
+                {
+                    "goal": goal,
+                    "context": context,
+                    "toolsets": toolsets,
+                    "role": top_role,
+                    "specialist": top_specialist,
+                },
+                top_specialist,
+            )
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2025,7 +2292,7 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate each task has a goal before adding specialist contracts.
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2033,6 +2300,11 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    task_list = [
+        _apply_specialist_contract(dict(task), top_specialist)
+        for task in task_list
+    ]
 
     overall_start = time.monotonic()
     results = []
@@ -2063,7 +2335,7 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=t.get("_specialist_model") or creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -2080,6 +2352,9 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                specialist=t.get("_specialist"),
+                specialist_label=t.get("_specialist_label"),
+                specialist_required_toolsets=t.get("_specialist_required_toolsets"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2087,6 +2362,31 @@ def delegate_task(
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+    missing_specialist_toolsets = [
+        (
+            getattr(child, "_delegate_specialist", None),
+            getattr(child, "_delegate_missing_required_toolsets", None),
+            getattr(child, "_delegate_granted_toolsets", None),
+        )
+        for _, _, child in children
+        if getattr(child, "_delegate_missing_required_toolsets", None)
+    ]
+    if missing_specialist_toolsets:
+        for _, _, child in children:
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                pass
+        details = "; ".join(
+            f"{specialist or 'specialist'} missing {missing} (granted: {granted})"
+            for specialist, missing, granted in missing_specialist_toolsets
+        )
+        return tool_error(
+            "Cannot spawn specialist subagent because required toolsets were "
+            f"dropped by parent-scope filtering: {details}."
+        )
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
@@ -2536,7 +2836,7 @@ def _build_top_level_description() -> str:
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-        "1. Single task: provide 'goal' (+ optional context, toolsets)\n"
+        "1. Single task: provide 'goal' (+ optional context, toolsets, specialist)\n"
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). "
@@ -2559,6 +2859,11 @@ def _build_top_level_description() -> str:
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
+        "- For health specialists, set specialist='fitness', 'nutrition', "
+        "'medical', or 'miniapp'. For Telegram Mini App creation/deploy work "
+        "outside health, set specialist='miniapp_builder'. Hermes will enforce "
+        "an isolated specialist contract, add the needed toolsets, and return "
+        "granted/dropped toolsets in the result.\n"
         "- If the user is writing in a non-English language, or asked for "
         "output in a specific language / tone / style, say so in 'context' "
         "(e.g. \"respond in Chinese\", \"return output in Japanese\"). "
@@ -2703,6 +3008,22 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "specialist": {
+                "type": "string",
+                "enum": [
+                    "fitness",
+                    "nutrition",
+                    "medical",
+                    "miniapp",
+                    "miniapp_builder",
+                ],
+                "description": (
+                    "Optional first-class specialist label. Use health labels "
+                    "for telegram_health work, or miniapp_builder for Telegram "
+                    "Mini App creation/deploy work. Hermes adds the specialist "
+                    "skill/memory contract and required toolsets automatically."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2717,6 +3038,22 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                        },
+                        "specialist": {
+                            "type": "string",
+                            "enum": [
+                                "fitness",
+                                "nutrition",
+                                "medical",
+                                "miniapp",
+                                "miniapp_builder",
+                            ],
+                            "description": (
+                                "Optional first-class specialist label "
+                                "for this task. Adds the specialist skill, "
+                                "private file-memory contract, and required "
+                                "toolsets automatically."
+                            ),
                         },
                         "acp_command": {
                             "type": "string",
@@ -2788,6 +3125,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         toolsets=args.get("toolsets"),
+        specialist=args.get("specialist"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),

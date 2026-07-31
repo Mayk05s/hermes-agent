@@ -17,6 +17,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const CREATE_NEW_PROFILE = "__create_new__";
+type PairingApprovalScope = "chat" | "topic";
 
 function getUserKey(user: PairingUser): string {
   return `${user.platform}:${user.entry_id || user.user_id}`;
@@ -53,6 +54,7 @@ export default function PairingPage() {
   const [rejecting, setRejecting] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
   const [profileChoice, setProfileChoice] = useState<Record<string, string>>({});
+  const [approvalScope, setApprovalScope] = useState<Record<string, PairingApprovalScope>>({});
   const [newProfileName, setNewProfileName] = useState<Record<string, string>>({});
   const [cloneFromDefault, setCloneFromDefault] = useState<Record<string, boolean>>({});
   const { toast, showToast } = useToast();
@@ -87,6 +89,16 @@ export default function PairingPage() {
           }
           return next;
         });
+        setApprovalScope((current) => {
+          const next = { ...current };
+          for (const item of res.pending) {
+            const key = getUserKey(item);
+            if (isChatPairing(item) && item.thread_id && !next[key]) {
+              next[key] = "chat";
+            }
+          }
+          return next;
+        });
       })
       .catch(() => showToast("Failed to load pairing requests", "error"))
       .finally(() => setLoading(false));
@@ -116,6 +128,7 @@ export default function PairingPage() {
       code: user.entry_id ? undefined : user.code,
     };
     if (isChatPairing(user)) {
+      body.approval_scope = user.thread_id ? approvalScope[key] || "chat" : "chat";
       const choice = profileChoice[key] || "default";
       if (choice === CREATE_NEW_PROFILE) {
         const name = (newProfileName[key] || "").trim();
@@ -284,6 +297,7 @@ export default function PairingPage() {
           const key = getUserKey(user);
           const chatRequest = isChatPairing(user);
           const choice = profileChoice[key] || "default";
+          const scope = approvalScope[key] || "chat";
           return (
             <Card key={key}>
               <CardContent className="flex flex-col gap-4 py-4 md:flex-row md:items-start">
@@ -297,6 +311,9 @@ export default function PairingPage() {
                     <span className="truncate">{getUserLabel(user)}</span>
                     {chatRequest && user.chat_id && (
                       <span className="truncate">{user.chat_id}</span>
+                    )}
+                    {chatRequest && user.thread_id && (
+                      <span className="truncate">topic id: {user.thread_id}</span>
                     )}
                     {!chatRequest && user.user_name && (
                       <span className="truncate">{user.user_name}</span>
@@ -326,6 +343,29 @@ export default function PairingPage() {
                         ))}
                         <option value={CREATE_NEW_PROFILE}>Create new profile...</option>
                       </select>
+                      {user.thread_id && (
+                        <div className="grid grid-cols-2 gap-1 rounded border border-border bg-muted/20 p-1 text-xs">
+                          {(["chat", "topic"] as const).map((value) => (
+                            <button
+                              key={value}
+                              type="button"
+                              aria-pressed={scope === value}
+                              className={[
+                                "h-8 rounded px-3 font-medium transition-colors",
+                                scope === value
+                                  ? "bg-primary text-primary-foreground"
+                                  : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                              ].join(" ")}
+                              onClick={() => setApprovalScope((current) => ({
+                                ...current,
+                                [key]: value,
+                              }))}
+                            >
+                              {value === "chat" ? "Whole chat" : "This topic"}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                       {choice === CREATE_NEW_PROFILE && (
                         <div className="flex flex-col gap-2">
                           <Input

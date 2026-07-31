@@ -49,6 +49,7 @@ _ensure_telegram_mock()
 
 from gateway.platforms.telegram import TelegramAdapter
 from gateway.config import PlatformConfig
+from gateway.run import _gateway_turn_requester_user_id
 
 
 def _make_adapter(extra=None):
@@ -65,6 +66,26 @@ def _clear_clarify_state():
         cm._entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+
+
+def test_group_turn_requester_comes_from_gateway_sender_attribution():
+    source = MagicMock()
+    source.user_id = None
+
+    assert _gateway_turn_requester_user_id(
+        source,
+        "[Mikhail|179555559] @TripiooBot перенеси контекст",
+    ) == "179555559"
+
+
+def test_direct_turn_requester_prefers_source_user_id():
+    source = MagicMock()
+    source.user_id = "111"
+
+    assert _gateway_turn_requester_user_id(
+        source,
+        "[Other|222] stale injected text",
+    ) == "111"
 
 
 # ===========================================================================
@@ -188,6 +209,31 @@ class TestTelegramSendClarify:
         # Must NOT contain raw <script> — html.escape should have neutralized
         assert "<script>" not in kwargs["text"]
         assert "&lt;script&gt;" in kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_stores_requester_binding_from_gateway_metadata(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 104
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        await adapter.send_clarify(
+            chat_id="-100",
+            question="Allow cross-topic recall?",
+            choices=["Grant once", "Deny"],
+            clarify_id="cid-requester",
+            session_key="sk-requester",
+            metadata={
+                "thread_id": "35",
+                "gateway_requester_user_id": "111",
+            },
+        )
+
+        assert adapter._clarify_requester_state["cid-requester"] == {
+            "user_id": "111",
+            "chat_id": "-100",
+            "thread_id": "35",
+        }
 
 
 # ===========================================================================
@@ -382,6 +428,119 @@ class TestTelegramClarifyCallback:
         assert not entry.event.is_set()
         query.answer.assert_called_once()
         assert "invalid" in query.answer.call_args[1]["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_group_requester_can_answer_own_prompt(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "222")
+        adapter = _make_adapter()
+        cm.register("cidRequester", "sk-requester", "Allow?", ["Grant once", "Deny"])
+        adapter._clarify_state["cidRequester"] = "sk-requester"
+        adapter._clarify_requester_state["cidRequester"] = {
+            "user_id": "111",
+            "chat_id": "-100",
+            "thread_id": "35",
+        }
+        adapter._is_callback_user_authorized = MagicMock(return_value=True)
+
+        query = AsyncMock()
+        query.data = "cl:cidRequester:0"
+        query.message = MagicMock()
+        query.message.chat_id = -100
+        query.message.chat.type = "supergroup"
+        query.message.message_thread_id = 35
+        query.message.text = "Allow?"
+        query.from_user = MagicMock()
+        query.from_user.id = 111
+        query.from_user.first_name = "Requester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        with cm._lock:
+            entry = cm._entries["cidRequester"]
+        assert entry.response == "Grant once"
+        assert "cidRequester" not in adapter._clarify_state
+        assert "cidRequester" not in adapter._clarify_requester_state
+
+    @pytest.mark.asyncio
+    async def test_group_other_participant_cannot_answer_bound_prompt(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "222")
+        adapter = _make_adapter()
+        cm.register("cidBound", "sk-bound", "Allow?", ["Grant once", "Deny"])
+        adapter._clarify_state["cidBound"] = "sk-bound"
+        adapter._clarify_requester_state["cidBound"] = {
+            "user_id": "111",
+            "chat_id": "-100",
+            "thread_id": "35",
+        }
+
+        query = AsyncMock()
+        query.data = "cl:cidBound:0"
+        query.message = MagicMock()
+        query.message.chat_id = -100
+        query.message.chat.type = "supergroup"
+        query.message.message_thread_id = 35
+        query.from_user = MagicMock()
+        query.from_user.id = 333
+        query.from_user.first_name = "Other"
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_awaited_once_with(
+            text="⛔ Controls are owner-only outside private chat."
+        )
+        with cm._lock:
+            entry = cm._entries["cidBound"]
+        assert not entry.event.is_set()
+        assert adapter._clarify_state["cidBound"] == "sk-bound"
+
+    @pytest.mark.asyncio
+    async def test_group_owner_can_answer_requesters_prompt(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "222")
+        adapter = _make_adapter()
+        cm.register("cidOwner", "sk-owner", "Allow?", ["Grant once", "Deny"])
+        adapter._clarify_state["cidOwner"] = "sk-owner"
+        adapter._clarify_requester_state["cidOwner"] = {
+            "user_id": "111",
+            "chat_id": "-100",
+            "thread_id": "35",
+        }
+
+        query = AsyncMock()
+        query.data = "cl:cidOwner:0"
+        query.message = MagicMock()
+        query.message.chat_id = -100
+        query.message.chat.type = "supergroup"
+        query.message.message_thread_id = 35
+        query.message.text = "Allow?"
+        query.from_user = MagicMock()
+        query.from_user.id = 222
+        query.from_user.first_name = "Owner"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        with cm._lock:
+            entry = cm._entries["cidOwner"]
+        assert entry.response == "Grant once"
 
 
 # ===========================================================================

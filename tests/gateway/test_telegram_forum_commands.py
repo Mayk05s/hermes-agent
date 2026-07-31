@@ -1,4 +1,4 @@
-"""Tests for lazy forum command registration in TelegramAdapter."""
+"""Tests for Telegram chat-scoped command menu maintenance."""
 
 import asyncio
 from types import SimpleNamespace
@@ -21,12 +21,15 @@ def _make_test_adapter():
     adapter._bot.set_my_commands = AsyncMock()
     adapter._forum_command_registered = set()
     adapter._forum_lock = asyncio.Lock()
+    adapter._typing_paused = set()
     return adapter
 
 
-def _forum_message(chat_id=-100, is_forum=True):
+def _forum_message(chat_id=-100, is_forum=True, chat_type=None):
+    if chat_type is None:
+        chat_type = "supergroup" if is_forum else "private"
     return SimpleNamespace(
-        chat=SimpleNamespace(id=chat_id, is_forum=is_forum),
+        chat=SimpleNamespace(id=chat_id, is_forum=is_forum, type=chat_type),
     )
 
 
@@ -48,9 +51,34 @@ async def test_ensure_forum_commands_skips_already_registered():
 
 
 @pytest.mark.asyncio
-async def test_ensure_forum_commands_registers_once():
+async def test_ensure_forum_commands_clears_group_scope_once():
     adapter = _make_test_adapter()
     msg = _forum_message(chat_id=-123, is_forum=True)
+
+    with patch("telegram.BotCommandScopeChat") as MockScope:
+        # Track the chat_id passed to the BotCommandScopeChat constructor
+        # so the assertions below see an int instead of a bare MagicMock.
+        def _make_scope(chat_id):
+            s = MagicMock()
+            s.chat_id = chat_id
+            return s
+        MockScope.side_effect = _make_scope
+        await adapter._ensure_forum_commands(msg)
+
+    assert -123 in adapter._forum_command_registered
+    adapter._bot.set_my_commands.assert_awaited_once()
+    args, kwargs = adapter._bot.set_my_commands.call_args
+    assert args[0] == []
+    assert kwargs["scope"] is not None
+    assert isinstance(kwargs["scope"].chat_id, int)
+    assert kwargs["scope"].chat_id == -123
+
+
+@pytest.mark.asyncio
+async def test_ensure_forum_commands_registers_named_profile_private_menu():
+    adapter = _make_test_adapter()
+    adapter._command_surface_profile_for_message = MagicMock(return_value="family-chat")
+    msg = _forum_message(chat_id=111, is_forum=False, chat_type="private")
 
     with patch("hermes_cli.commands.telegram_menu_commands") as mock_menu:
         mock_menu.return_value = ([("new", "Start new session"), ("help", "Show help")], 0)
@@ -66,8 +94,6 @@ async def test_ensure_forum_commands_registers_once():
 
             MockBotCommand.side_effect = _make_cmd
             with patch("telegram.BotCommandScopeChat") as MockScope:
-                # Track the chat_id passed to the BotCommandScopeChat constructor
-                # so the assertions below see an int instead of a bare MagicMock.
                 def _make_scope(chat_id):
                     s = MagicMock()
                     s.chat_id = chat_id
@@ -75,13 +101,13 @@ async def test_ensure_forum_commands_registers_once():
                 MockScope.side_effect = _make_scope
                 await adapter._ensure_forum_commands(msg)
 
-    assert -123 in adapter._forum_command_registered
+    mock_menu.assert_called_once()
+    assert mock_menu.call_args.kwargs["profile_name"] == "family-chat"
+    assert 111 in adapter._forum_command_registered
     adapter._bot.set_my_commands.assert_awaited_once()
     args, kwargs = adapter._bot.set_my_commands.call_args
-    assert len(args[0]) == 2  # two BotCommand instances
-    assert kwargs["scope"] is not None
-    assert isinstance(kwargs["scope"].chat_id, int)
-    assert kwargs["scope"].chat_id == -123
+    assert len(args[0]) == 2
+    assert kwargs["scope"].chat_id == 111
 
 
 @pytest.mark.asyncio
@@ -90,8 +116,7 @@ async def test_ensure_forum_commands_handles_set_failure():
     msg = _forum_message(chat_id=-456, is_forum=True)
     adapter._bot.set_my_commands.side_effect = Exception("Telegram API error")
 
-    with patch("hermes_cli.commands.telegram_menu_commands") as mock_menu:
-        mock_menu.return_value = ([("new", "Start new session")], 0)
+    with patch("telegram.BotCommandScopeChat"):
         # Should NOT raise despite the API error
         await adapter._ensure_forum_commands(msg)
 
@@ -106,13 +131,65 @@ async def test_ensure_forum_commands_race_safety():
     adapter = _make_test_adapter()
     msg = _forum_message(chat_id=-789, is_forum=True)
 
-    with patch("hermes_cli.commands.telegram_menu_commands") as mock_menu:
-        mock_menu.return_value = ([("new", "Start new session")], 0)
-        with patch("telegram.BotCommand"):
-            with patch("telegram.BotCommandScopeChat"):
-                coro1 = adapter._ensure_forum_commands(msg)
-                coro2 = adapter._ensure_forum_commands(msg)
-                await asyncio.gather(coro1, coro2)
+    with patch("telegram.BotCommandScopeChat"):
+        coro1 = adapter._ensure_forum_commands(msg)
+        coro2 = adapter._ensure_forum_commands(msg)
+        await asyncio.gather(coro1, coro2)
 
     # The lock should make this exactly 1 call, not 2.
     assert adapter._bot.set_my_commands.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_controls_blocked_for_non_owner_outside_private_chat(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "222")
+    adapter = _make_test_adapter()
+    query = SimpleNamespace(
+        data="ea:once:1",
+        message=SimpleNamespace(
+            chat_id=-100,
+            chat=SimpleNamespace(type="supergroup"),
+            message_thread_id=None,
+        ),
+        from_user=SimpleNamespace(id=111, first_name="Alice"),
+        answer=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query)
+
+    await adapter._handle_callback_query(update, SimpleNamespace())
+
+    query.answer.assert_awaited_once_with(
+        text="⛔ Controls are owner-only outside private chat."
+    )
+
+
+@pytest.mark.asyncio
+async def test_callback_approval_allowed_for_owner_outside_private_chat(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    adapter = _make_test_adapter()
+    adapter._approval_state = {1: "telegram-group-session"}
+    query = SimpleNamespace(
+        data="ea:once:1",
+        message=SimpleNamespace(
+            chat_id=-100,
+            chat=SimpleNamespace(type="supergroup"),
+            message_thread_id=None,
+        ),
+        from_user=SimpleNamespace(id=111, first_name="Alice"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query)
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolved:
+        await adapter._handle_callback_query(update, SimpleNamespace())
+
+    query.answer.assert_awaited_once_with(text="✅ Approved once")
+    resolved.assert_called_once_with("telegram-group-session", "once")
+    assert 1 not in adapter._approval_state
+
+
+def test_callback_authorization_fails_closed_outside_private_chat():
+    adapter = _make_test_adapter()
+
+    assert adapter._is_callback_user_authorized("111", chat_type="supergroup") is False

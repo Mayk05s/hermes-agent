@@ -77,6 +77,18 @@ def test_apply_pricing_nous_paid_tier_no_gating(monkeypatch):
     assert rows[0]["unavailable_models"] == []
 
 
+def test_apply_pricing_marks_openai_codex_as_included(monkeypatch):
+    """Codex OAuth models are subscription-included, so the picker should say so."""
+    _patch_pricing(monkeypatch, free_tier=False, pricing={})
+    rows = [{"slug": "openai-codex", "models": ["gpt-5.4", "gpt-5.4-mini"]}]
+    inv._apply_pricing(rows)
+
+    pricing = rows[0]["pricing"]
+    assert pricing["gpt-5.4"]["included"] is True
+    assert pricing["gpt-5.4"]["input"] == "free"
+    assert pricing["gpt-5.4-mini"]["free"] is True
+
+
 def test_apply_pricing_skips_providers_without_pricing(monkeypatch):
     """A provider with no live pricing simply gets no pricing key."""
     _patch_pricing(monkeypatch, free_tier=False, pricing={})

@@ -6,18 +6,30 @@ import {
   useState,
 } from "react";
 import {
+  Brain,
   ClipboardCopy,
+  FileText,
   Pencil,
+  Palette,
   Plus,
+  Save,
   Settings,
   Trash2,
   Users,
+  UserRound,
   X,
 } from "lucide-react";
 import spinners from "unicode-animations";
 import { H2 } from "@nous-research/ui/ui/components/typography/h2";
 import { api } from "@/lib/api";
-import type { ProfileCommunicationStyle, ProfileCommunicationStyleOption, ProfileInfo, ProfileSkillInfo } from "@/lib/api";
+import type {
+  ProfileCommunicationStyle,
+  ProfileCommunicationStyleOption,
+  ProfileInfo,
+  ProfileMemoryFile,
+  ProfileMemoryFileId,
+  ProfileSkillInfo,
+} from "@/lib/api";
 import { writeClipboardText } from "@/lib/clipboard";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { ProfileRouteEditor } from "@/components/ProfileRouteEditor";
@@ -38,6 +50,51 @@ import { cn, themedBody } from "@/lib/utils";
 // Mirrors hermes_cli/profiles.py::_PROFILE_ID_RE so we can reject obviously
 // invalid names (uppercase, spaces, …) before round-tripping a doomed POST.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+type ProfilePromptFileId = "soul" | ProfileMemoryFileId | "style";
+
+type ProfilePromptDrafts = Record<ProfilePromptFileId, string>;
+
+interface ProfilePromptFileInfo {
+  label: string;
+  description: string;
+  file: string;
+  exists: boolean;
+  shared?: boolean;
+}
+
+const PROMPT_FILE_ORDER: ProfilePromptFileId[] = ["soul", "user", "memory", "style"];
+
+const PROMPT_FILE_META: Record<ProfilePromptFileId, Omit<ProfilePromptFileInfo, "file" | "exists">> = {
+  soul: {
+    label: "SOUL.md",
+    description: "Primary identity and base system prompt for this profile.",
+  },
+  user: {
+    label: "USER.md",
+    description: "User preferences, addressing rules, and communication corrections.",
+  },
+  memory: {
+    label: "MEMORY.md",
+    description: "Profile facts, chat lore, routing context, and durable notes.",
+  },
+  style: {
+    label: "Style file",
+    description: "Shared communication-style markdown selected by this profile.",
+    shared: true,
+  },
+};
+
+function emptyPromptDrafts(): ProfilePromptDrafts {
+  return { soul: "", user: "", memory: "", style: "" };
+}
+
+function PromptFileIcon({ id, className }: { id: ProfilePromptFileId; className?: string }) {
+  if (id === "user") return <UserRound className={className} />;
+  if (id === "memory") return <Brain className={className} />;
+  if (id === "style") return <Palette className={className} />;
+  return <FileText className={className} />;
+}
 
 /** Braille unicode spinner (`unicode-animations`); static first frame when reduced motion is preferred. */
 function ProfilesLoadingSpinner() {
@@ -90,8 +147,10 @@ export default function ProfilesPage() {
   const [renamingFrom, setRenamingFrom] = useState<string | null>(null);
   const [renameTo, setRenameTo] = useState("");
 
-  const [soulText, setSoulText] = useState("");
-  const [soulSaving, setSoulSaving] = useState(false);
+  const [promptDraftsByProfile, setPromptDraftsByProfile] = useState<Record<string, ProfilePromptDrafts>>({});
+  const [promptFileInfoByProfile, setPromptFileInfoByProfile] = useState<Record<string, Partial<Record<ProfilePromptFileId, ProfilePromptFileInfo>>>>({});
+  const [activePromptFileByProfile, setActivePromptFileByProfile] = useState<Record<string, ProfilePromptFileId>>({});
+  const [promptSavingKey, setPromptSavingKey] = useState<string | null>(null);
   const [profileSettingsFor, setProfileSettingsFor] = useState<string | null>(null);
   const [settingsLoadingFor, setSettingsLoadingFor] = useState<string | null>(null);
   const activeSettingsRequest = useRef<string | null>(null);
@@ -231,17 +290,57 @@ export default function ProfilesPage() {
       }
       setProfileSettingsFor(name);
       setSettingsLoadingFor(name);
-      setSoulText("");
       setSkillSearch("");
+      setActivePromptFileByProfile((current) => ({ ...current, [name]: "soul" }));
       activeSettingsRequest.current = name;
       try {
-        const [soul, style, skills] = await Promise.all([
+        const [soul, memoryFiles, style, skills] = await Promise.all([
           api.getProfileSoul(name),
+          api.getProfileMemoryFiles(name),
           api.getProfileCommunicationStyle(name),
           api.getProfileSkills(name),
         ]);
         if (activeSettingsRequest.current === name) {
-          setSoulText(soul.content);
+          const profilePath = profiles.find((profile) => profile.name === name)?.path || "";
+          const memoryById = Object.fromEntries(
+            memoryFiles.files.map((file) => [file.id, file] as const),
+          ) as Partial<Record<ProfileMemoryFileId, ProfileMemoryFile>>;
+          setPromptDraftsByProfile((current) => ({
+            ...current,
+            [name]: {
+              soul: soul.content,
+              user: memoryById.user?.content || "",
+              memory: memoryById.memory?.content || "",
+              style: style.content || "",
+            },
+          }));
+          setPromptFileInfoByProfile((current) => ({
+            ...current,
+            [name]: {
+              soul: {
+                ...PROMPT_FILE_META.soul,
+                file: soul.file || (profilePath ? `${profilePath}/SOUL.md` : "SOUL.md"),
+                exists: soul.exists,
+              },
+              user: {
+                ...PROMPT_FILE_META.user,
+                file: memoryById.user?.file || (profilePath ? `${profilePath}/memories/USER.md` : "memories/USER.md"),
+                exists: memoryById.user?.exists || false,
+              },
+              memory: {
+                ...PROMPT_FILE_META.memory,
+                file: memoryById.memory?.file || (profilePath ? `${profilePath}/memories/MEMORY.md` : "memories/MEMORY.md"),
+                exists: memoryById.memory?.exists || false,
+              },
+              style: {
+                ...PROMPT_FILE_META.style,
+                label: style.label ? `${style.label}` : PROMPT_FILE_META.style.label,
+                file: style.file || "No style selected",
+                exists: style.exists,
+                shared: true,
+              },
+            },
+          }));
           setStylesByProfile((current) => ({ ...current, [name]: style }));
           setStyleDrafts((current) => ({ ...current, [name]: style.style }));
           setProfileSkills((current) => ({ ...current, [name]: skills.skills }));
@@ -256,18 +355,94 @@ export default function ProfilesPage() {
         }
       }
     },
-    [profileSettingsFor, showToast, t.status.error],
+    [profileSettingsFor, profiles, showToast, t.status.error],
   );
 
-  const handleSaveSoul = async (name: string) => {
-    setSoulSaving(true);
+  const handleSavePromptFile = async (name: string, fileId: ProfilePromptFileId) => {
+    const drafts = promptDraftsByProfile[name] || emptyPromptDrafts();
+    const content = drafts[fileId] || "";
+    const key = `${name}:${fileId}`;
+    setPromptSavingKey(key);
     try {
-      await api.updateProfileSoul(name, soulText);
-      showToast(`${t.profiles.soulSaved}: ${name}`, "success");
+      if (fileId === "soul") {
+        await api.updateProfileSoul(name, content);
+        setPromptFileInfoByProfile((current) => ({
+          ...current,
+          [name]: {
+            ...(current[name] || {}),
+            soul: {
+              ...(current[name]?.soul || PROMPT_FILE_META.soul),
+              file: current[name]?.soul?.file || "SOUL.md",
+              exists: true,
+            },
+          },
+        }));
+      } else if (fileId === "user" || fileId === "memory") {
+        const file = await api.updateProfileMemoryFile(name, fileId, content);
+        setPromptDraftsByProfile((current) => ({
+          ...current,
+          [name]: {
+            ...emptyPromptDrafts(),
+            ...(current[name] || {}),
+            [fileId]: file.content,
+          },
+        }));
+        setPromptFileInfoByProfile((current) => ({
+          ...current,
+          [name]: {
+            ...(current[name] || {}),
+            [fileId]: {
+              ...PROMPT_FILE_META[fileId],
+              file: file.file,
+              exists: file.exists,
+            },
+          },
+        }));
+      } else {
+        const styleName = stylesByProfile[name]?.style;
+        if (!styleName) {
+          showToast("Select and save a communication style first.", "error");
+          return;
+        }
+        const style = await api.updateCommunicationStyle(styleName, content);
+        setPromptDraftsByProfile((current) => ({
+          ...current,
+          [name]: {
+            ...emptyPromptDrafts(),
+            ...(current[name] || {}),
+            style: style.content,
+          },
+        }));
+        setPromptFileInfoByProfile((current) => ({
+          ...current,
+          [name]: {
+            ...(current[name] || {}),
+            style: {
+              ...PROMPT_FILE_META.style,
+              label: style.label || PROMPT_FILE_META.style.label,
+              file: style.file,
+              exists: style.exists,
+              shared: true,
+            },
+          },
+        }));
+        setStylesByProfile((current) => ({
+          ...current,
+          [name]: { ...(current[name] || style), ...style },
+        }));
+        setStyleOptions((current) =>
+          current.map((option) =>
+            option.style === style.style
+              ? { ...option, label: style.label, file: style.file, exists: style.exists }
+              : option,
+          ),
+        );
+      }
+      showToast(`Saved ${PROMPT_FILE_META[fileId].label}: ${name}`, "success");
     } catch (e) {
       showToast(`${t.status.error}: ${e}`, "error");
     } finally {
-      setSoulSaving(false);
+      setPromptSavingKey(null);
     }
   };
 
@@ -277,6 +452,27 @@ export default function ProfilesPage() {
       const style = await api.updateProfileCommunicationStyle(name, styleDrafts[name] || "");
       setStylesByProfile((current) => ({ ...current, [name]: style }));
       setStyleDrafts((current) => ({ ...current, [name]: style.style }));
+      setPromptDraftsByProfile((current) => ({
+        ...current,
+        [name]: {
+          ...emptyPromptDrafts(),
+          ...(current[name] || {}),
+          style: style.content || "",
+        },
+      }));
+      setPromptFileInfoByProfile((current) => ({
+        ...current,
+        [name]: {
+          ...(current[name] || {}),
+          style: {
+            ...PROMPT_FILE_META.style,
+            label: style.label || PROMPT_FILE_META.style.label,
+            file: style.file || "No style selected",
+            exists: style.exists,
+            shared: true,
+          },
+        },
+      }));
       showToast(`Communication style saved: ${name}`, "success");
     } catch (e) {
       showToast(`${t.status.error}: ${e}`, "error");
@@ -311,6 +507,33 @@ export default function ProfilesPage() {
             : option,
         ),
       );
+      setPromptDraftsByProfile((current) => {
+        const next = { ...current };
+        for (const [profileName, currentStyle] of Object.entries(stylesByProfile)) {
+          if (currentStyle.style === style.style && next[profileName]) {
+            next[profileName] = { ...next[profileName], style: style.content };
+          }
+        }
+        return next;
+      });
+      setPromptFileInfoByProfile((current) => {
+        const next = { ...current };
+        for (const [profileName, currentStyle] of Object.entries(stylesByProfile)) {
+          if (currentStyle.style === style.style && next[profileName]) {
+            next[profileName] = {
+              ...next[profileName],
+              style: {
+                ...PROMPT_FILE_META.style,
+                label: style.label || PROMPT_FILE_META.style.label,
+                file: style.file,
+                exists: style.exists,
+                shared: true,
+              },
+            };
+          }
+        }
+        return next;
+      });
       showToast(`Communication style file saved: ${style.label || style.style}`, "success");
     } catch (e) {
       showToast(`${t.status.error}: ${e}`, "error");
@@ -586,6 +809,16 @@ export default function ProfilesPage() {
           const profileSkillList = profileSkills[p.name] || [];
           const enabledSkills = profileSkillList.filter((skill) => skill.enabled).length;
           const groupedSkills = groupedSkillsForProfile(p.name);
+          const promptDrafts = promptDraftsByProfile[p.name] || emptyPromptDrafts();
+          const promptInfos = promptFileInfoByProfile[p.name] || {};
+          const activePromptFile = activePromptFileByProfile[p.name] || "soul";
+          const activePromptInfo = promptInfos[activePromptFile] || {
+            ...PROMPT_FILE_META[activePromptFile],
+            file: activePromptFile === "soul" ? `${p.path}/SOUL.md` : "",
+            exists: false,
+          };
+          const activePromptText = promptDrafts[activePromptFile] || "";
+          const activePromptSaving = promptSavingKey === `${p.name}:${activePromptFile}`;
           return (
             <Card key={p.name}>
               <CardContent className="flex items-start gap-4 py-4">
@@ -744,11 +977,11 @@ export default function ProfilesPage() {
                       <ProfilesLoadingSpinner />
                       Loading profile settings...
                     </div>
-                  ) : (
-                    <div className="grid gap-5">
-                      <section className="grid gap-3">
-                        <div className="flex flex-wrap items-end gap-3">
-                          <Label
+	                  ) : (
+		                    <div className="grid gap-5">
+		                      <section className="grid gap-3">
+	                        <div className="flex flex-wrap items-end gap-3">
+	                          <Label
                             htmlFor={`style-selector-${p.name}`}
                             className="grid min-w-[260px] max-w-sm gap-1 text-xs text-muted-foreground"
                           >
@@ -779,29 +1012,118 @@ export default function ProfilesPage() {
                       </section>
 
                       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,0.9fr)]">
-                        <section className="grid min-w-0 content-start gap-2">
-                          <Label
-                            htmlFor={`soul-editor-${p.name}`}
-                            className="font-mondwest text-display text-xs tracking-wider text-muted-foreground"
-                          >
-                            SOUL.md
-                          </Label>
+                        <section className="grid min-w-0 content-start gap-3">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                              <div className="font-mondwest text-display text-xs tracking-wider text-muted-foreground">
+                                Prompt files
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                Identity, memory, and style layers injected into this profile.
+                              </div>
+                            </div>
+                            <span className="text-xs text-muted-foreground">
+                              {activePromptText.length.toLocaleString()} chars
+                            </span>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                            {PROMPT_FILE_ORDER.map((fileId) => {
+                              const info = promptInfos[fileId] || {
+                                ...PROMPT_FILE_META[fileId],
+                                file: "",
+                                exists: false,
+                              };
+                              const active = activePromptFile === fileId;
+                              return (
+                                <button
+                                  key={fileId}
+                                  type="button"
+                                  className={cn(
+                                    "flex min-h-14 items-start gap-2 border px-2.5 py-2 text-left transition-colors",
+                                    active
+                                      ? "border-ring bg-muted/30 text-foreground"
+                                      : "border-border bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
+                                  )}
+                                  onClick={() =>
+                                    setActivePromptFileByProfile((current) => ({
+                                      ...current,
+                                      [p.name]: fileId,
+                                    }))
+                                  }
+                                  title={info.description}
+                                >
+                                  <PromptFileIcon id={fileId} className="mt-0.5 h-4 w-4 shrink-0" />
+                                  <span className="min-w-0">
+                                    <span className="block truncate text-sm font-medium">
+                                      {PROMPT_FILE_META[fileId].label}
+                                    </span>
+                                    <span
+                                      className={cn(
+                                        "block text-xs",
+                                        info.exists ? "text-success" : "text-warning",
+                                      )}
+                                    >
+                                      {info.exists ? "available" : "missing"}
+                                      {info.shared ? " · shared" : ""}
+                                    </span>
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          <div className="border border-border bg-muted/10 px-3 py-2">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2 text-sm font-medium">
+                                  <PromptFileIcon id={activePromptFile} className="h-4 w-4" />
+                                  {activePromptInfo.label}
+                                </div>
+                                <div className="mt-0.5 font-mono text-xs text-muted-foreground truncate">
+                                  {activePromptInfo.file || "No file selected"}
+                                </div>
+                              </div>
+                              <span
+                                className={cn(
+                                  "text-xs",
+                                  activePromptInfo.exists ? "text-success" : "text-warning",
+                                )}
+                              >
+                                {activePromptInfo.exists ? "available" : "will be created on save"}
+                              </span>
+                            </div>
+                            <div className="mt-2 text-xs text-muted-foreground">
+                              {activePromptInfo.description}
+                            </div>
+                          </div>
+
                           <textarea
-                            id={`soul-editor-${p.name}`}
+                            id={`prompt-file-editor-${p.name}-${activePromptFile}`}
                             className="min-h-[420px] w-full resize-y border border-input bg-transparent px-3 py-2 text-sm font-mono leading-relaxed shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                             rows={18}
-                            placeholder={t.profiles.soulPlaceholder}
-                            value={soulText}
-                            onChange={(e) => setSoulText(e.target.value)}
+                            placeholder={activePromptFile === "style" ? "Select a communication style to edit its markdown." : t.profiles.soulPlaceholder}
+                            value={activePromptText}
+                            onChange={(e) =>
+                              setPromptDraftsByProfile((current) => ({
+                                ...current,
+                                [p.name]: {
+                                  ...emptyPromptDrafts(),
+                                  ...(current[p.name] || {}),
+                                  [activePromptFile]: e.target.value,
+                                },
+                              }))
+                            }
                           />
-                          <div>
+                          <div className="flex justify-end">
                             <Button
                               size="sm"
-                              className="uppercase"
-                              onClick={() => handleSaveSoul(p.name)}
-                              disabled={soulSaving}
+                              className="uppercase gap-2"
+                              onClick={() => handleSavePromptFile(p.name, activePromptFile)}
+                              disabled={activePromptSaving}
                             >
-                              {soulSaving ? t.common.saving : t.common.save}
+                              <Save className="h-4 w-4" />
+                              {activePromptSaving ? t.common.saving : `Save ${PROMPT_FILE_META[activePromptFile].label}`}
                             </Button>
                           </div>
                         </section>

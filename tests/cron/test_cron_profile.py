@@ -127,7 +127,7 @@ class TestCronjobToolProfile:
         listing = json.loads(cronjob(action="list"))
         assert listing["jobs"][0]["profile"] == "support"
 
-    def test_update_clears_profile_with_empty_string(self, isolated_cron_profile_home):
+    def test_update_rejects_profile_change(self, isolated_cron_profile_home):
         from tools.cronjob_tools import cronjob
 
         created = json.loads(
@@ -142,8 +142,8 @@ class TestCronjobToolProfile:
             cronjob(action="update", job_id=created["job_id"], profile="")
         )
 
-        assert updated["success"] is True
-        assert "profile" not in updated["job"]
+        assert updated["success"] is False
+        assert "profile is bound" in updated["error"]
 
     def test_schema_advertises_profile(self):
         from tools.cronjob_tools import CRONJOB_SCHEMA
@@ -153,8 +153,8 @@ class TestCronjobToolProfile:
         desc_lower = desc.lower()
         assert "hermes profile" in desc_lower
         assert "context-local" in desc_lower
-        assert "subprocess" in desc_lower
         assert "temporarily sets hermes_home" not in desc_lower
+        assert "cannot be changed on update" in desc_lower
 
 
 class TestRunJobProfileContext:

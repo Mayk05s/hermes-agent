@@ -17,6 +17,8 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
         self._busy_text_mode = ""
         self.sent = []
+        self.sent_image_files = []
+        self.sent_images = []
         self.typing = []
         self.processing_hooks = []
 
@@ -37,6 +39,45 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id="1")
 
+    async def send_image_file(
+        self,
+        chat_id,
+        image_path,
+        caption=None,
+        reply_to=None,
+        metadata=None,
+        **_kwargs,
+    ) -> SendResult:
+        self.sent_image_files.append(
+            {
+                "chat_id": chat_id,
+                "image_path": image_path,
+                "caption": caption,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="img-1")
+
+    async def send_image(
+        self,
+        chat_id,
+        image_url,
+        caption=None,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        self.sent_images.append(
+            {
+                "chat_id": chat_id,
+                "image_url": image_url,
+                "caption": caption,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="img-1")
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         self.typing.append({"chat_id": chat_id, "metadata": metadata})
         return None
@@ -51,7 +92,13 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         self.processing_hooks.append(("complete", event.message_id, outcome))
 
 
-def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageEvent:
+def _make_event(
+    chat_id: str,
+    thread_id: str,
+    message_id: str = "1",
+    *,
+    topic_isolation: bool = True,
+) -> MessageEvent:
     return MessageEvent(
         text="hello",
         source=SessionSource(
@@ -59,6 +106,10 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
             chat_id=chat_id,
             chat_type="group",
             thread_id=thread_id,
+            profile_name="boxmap",
+            scope_name="default",
+            memory_scope="default",
+            topic_isolation=topic_isolation,
         ),
         message_id=message_id,
     )
@@ -84,6 +135,43 @@ class TestBasePlatformTopicSessions:
 
         await adapter.handle_message(_make_event("-1001", "11"))
 
+        assert len(scheduled) == 1
+        assert adapter._pending_messages == {}
+
+    @pytest.mark.asyncio
+    async def test_shared_recall_topics_still_run_in_parallel(self, monkeypatch):
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+
+        active_event = _make_event(
+            "-1001",
+            "2",
+            topic_isolation=False,
+        )
+        sibling_event = _make_event(
+            "-1001",
+            "35",
+            message_id="2",
+            topic_isolation=False,
+        )
+        active_key = build_session_key(active_event.source)
+        sibling_key = build_session_key(sibling_event.source)
+        adapter._active_sessions[active_key] = asyncio.Event()
+
+        scheduled = []
+
+        def fake_create_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return SimpleNamespace()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        await adapter.handle_message(sibling_event)
+
+        assert active_key != sibling_key
+        assert active_key.endswith(":2")
+        assert sibling_key.endswith(":35")
         assert len(scheduled) == 1
         assert adapter._pending_messages == {}
 
@@ -147,6 +235,68 @@ class TestBasePlatformTopicSessions:
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.SUCCESS),
         ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_uses_telegram_caption_for_single_image_post(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter._keep_typing = hold_typing
+        image_path = tmp_path / "post.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        post_text = "WITH SUGAR ON TOP\n\nused to make a request sweeter."
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return f"{post_text}\nMEDIA:{image_path}"
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == []
+        assert adapter.sent_image_files == [
+            {
+                "chat_id": "-1001",
+                "image_path": str(image_path),
+                "caption": post_text,
+                "reply_to": None,
+                "metadata": {"thread_id": "17585", "notify": True},
+            }
+        ]
+        assert adapter.processing_hooks[-1] == ("complete", "1", ProcessingOutcome.SUCCESS)
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_keeps_long_telegram_text_out_of_caption(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter._keep_typing = hold_typing
+        image_path = tmp_path / "post.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        long_text = "x" * 1025
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return f"{long_text}\nMEDIA:{image_path}"
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": long_text,
+                "reply_to": None,
+                "metadata": {"thread_id": "17585", "notify": True},
+            }
+        ]
+        assert adapter.sent_image_files[0]["caption"] is None
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_total_send_failure_unsuccessful(self):

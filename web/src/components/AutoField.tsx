@@ -1,5 +1,5 @@
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
-import { Switch } from "@nous-research/ui/ui/components/switch";
+import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 
@@ -103,13 +103,13 @@ export function AutoField({
 
   if (schema.type === "boolean") {
     return (
-      <div className="flex items-center justify-between gap-4">
+      <label className="flex cursor-pointer items-start justify-between gap-4">
         <div className="flex flex-col gap-0.5">
-          <Label className="text-sm">{label}</Label>
+          <span className="text-sm">{label}</span>
           <FieldHint schema={schema} schemaKey={schemaKey} />
         </div>
-        <Switch checked={!!value} onCheckedChange={onChange} />
-      </div>
+        <Checkbox checked={!!value} onCheckedChange={(checked) => onChange(checked === true)} />
+      </label>
     );
   }
 

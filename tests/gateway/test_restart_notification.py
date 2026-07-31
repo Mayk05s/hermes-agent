@@ -555,16 +555,18 @@ async def test_send_home_channel_startup_notification_skipped_when_flag_disabled
 
 
 @pytest.mark.asyncio
-async def test_send_home_channel_startup_notification_default_flag_true(
+async def test_send_home_channel_startup_notification_default_flag_false(
     tmp_path, monkeypatch
 ):
-    """Default behavior is unchanged: missing flag means notifications still fire."""
+    """Missing flag is fail-closed: lifecycle notifications stay silent."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     runner, adapter = make_restart_runner()
-    # Sanity-check the dataclass default — guards against future refactors
-    # silently flipping the default to False.
-    assert runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification is True
+    runner.config.platforms[Platform.TELEGRAM] = gateway_run.PlatformConfig(
+        enabled=True,
+        token="***",
+    )
+    assert runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification is False
 
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,
@@ -575,8 +577,8 @@ async def test_send_home_channel_startup_notification_default_flag_true(
 
     delivered = await runner._send_home_channel_startup_notifications()
 
-    assert delivered == {("telegram", "home-42", None)}
-    adapter.send.assert_called_once()
+    assert delivered == set()
+    adapter.send.assert_not_called()
 
 
 @pytest.mark.asyncio

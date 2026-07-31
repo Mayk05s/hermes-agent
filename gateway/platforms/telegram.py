@@ -17,11 +17,12 @@ import html as _html
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -44,6 +45,7 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    WebAppInfo = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -66,6 +68,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    AgentControlResponse,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -86,7 +89,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
-from utils import atomic_replace
+from utils import atomic_replace, is_truthy_value
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -106,6 +109,150 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
 
 
 MAX_COMMANDS_PER_SCOPE = 30
+_GROUP_OPERATOR_CALLBACK_PREFIXES: tuple[str, ...] = ("ea:", "sc:", "cl:")
+_GROUP_GATED_CALLBACK_PREFIXES: tuple[str, ...] = (
+    "mp:",
+    "mpg:",
+    "mm:",
+    "mb",
+    "mx",
+    "mg:",
+    "gt:",
+    "ea:",
+    "sc:",
+    "cl:",
+    "update_prompt:",
+)
+_MINIAPP_START_LINK_RE = re.compile(
+    r"(?P<url>https://t\.me/(?P<bot>[A-Za-z0-9_]{3,32})\?startapp=(?P<param>[A-Za-z0-9_-]+))",
+    re.IGNORECASE,
+)
+_MINIAPP_WORD_MARKERS: tuple[str, ...] = (
+    "miniapp",
+    "mini app",
+    "mini-app",
+    "миниап",
+    "миниапп",
+    "мини ап",
+    "мини апп",
+    "мини-ап",
+    "мини-апп",
+    "миниприлож",
+    "мини прилож",
+    "мини-прилож",
+    "приложение",
+)
+_MINIAPP_OPEN_MARKERS: tuple[str, ...] = (
+    "открой",
+    "открыть",
+    "покажи",
+    "показать",
+    "дай",
+    "скинь",
+    "пришли",
+    "ссылка",
+    "ссылку",
+    "линк",
+    "кнопк",
+    "запусти",
+    "button",
+    "launch",
+    "open",
+    "show",
+    "link",
+)
+_MINIAPP_EDIT_MARKERS: tuple[str, ...] = (
+    "исправ",
+    "почин",
+    "измени",
+    "изменить",
+    "обнов",
+    "добав",
+    "сделай",
+    "настрой",
+    "deploy",
+    "деплой",
+    "проверь",
+)
+_SUPPORTED_INLINE_MINIAPP_PARAMS: tuple[str, ...] = (
+    "health",
+    "fitness",
+    "fitness_day",
+    "fitness_week",
+    "fitness_history",
+    "fitness_planning",
+    "nutrition",
+    "nutrition_history",
+    "stats",
+    "meds",
+    "medications",
+    "planning",
+    "todo",
+    "tasks",
+    "boxmap",
+    "scenarios",
+    "menu",
+    "meals",
+    "family_menu",
+    "family-menu",
+    "dishes",
+    "recipes",
+    "shopping",
+    "groceries",
+    "social",
+    "posts",
+    "publishing",
+)
+_MINIAPP_BUTTON_LABELS: dict[str, str] = {
+    "health": "Открыть здоровье",
+    "fitness": "Открыть тренировки",
+    "fitness_day": "Открыть день",
+    "fitness_week": "Открыть неделю",
+    "fitness_history": "Открыть историю",
+    "fitness_planning": "Открыть план",
+    "nutrition": "Открыть питание",
+    "nutrition_history": "Открыть историю питания",
+    "stats": "Открыть статистику",
+    "meds": "Открыть лекарства",
+    "medications": "Открыть лекарства",
+    "planning": "Открыть планирование",
+    "todo": "Открыть задачи",
+    "tasks": "Открыть задачи",
+    "boxmap": "Открыть сценарии",
+    "scenarios": "Открыть сценарии",
+    "menu": "Открыть меню",
+    "meals": "Открыть меню",
+    "family_menu": "Открыть меню",
+    "family-menu": "Открыть меню",
+    "dishes": "Открыть блюда",
+    "recipes": "Открыть блюда",
+    "shopping": "Открыть покупки",
+    "groceries": "Открыть покупки",
+    "social": "Открыть публикации",
+    "posts": "Открыть публикации",
+    "publishing": "Открыть публикации",
+}
+# Mini App tools should return the generic mutation contract
+# `_miniapp: {changed: true, start_param: "..."}`.  Keep this legacy mapping
+# for the already-deployed health-actions server while older processes drain;
+# read tools and unrelated integrations must always fail closed.
+_MINIAPP_MUTATING_MCP_TOOL_PARAMS: dict[str, str] = {
+    "mcp_health_actions_create_workout_slots": "fitness",
+    "mcp_health_actions_materialize_gtg_day": "fitness",
+    "mcp_health_actions_record_completed_set": "fitness",
+    "mcp_health_actions_restore_cancelled_workout_slot": "fitness",
+    "mcp_health_actions_repair_workout_history_facts": "fitness",
+    "mcp_health_actions_move_workout_slot": "fitness",
+    "mcp_health_actions_cancel_workout_slot": "fitness",
+    "mcp_health_actions_cleanup_cancelled_workout_slots": "fitness",
+    "mcp_health_actions_create_planning_task": "planning",
+    "mcp_health_actions_update_planning_task": "planning",
+    "mcp_health_actions_delete_planning_task": "planning",
+    "mcp_health_actions_add_shopping_items": "shopping",
+    "mcp_health_actions_add_menu_entries": "menu",
+    "mcp_health_actions_replace_menu_entries": "menu",
+}
+_MINIAPP_WEBAPP_BASE_URL = "https://miniapp.mayk05.pro/"
 
 
 def check_telegram_requirements() -> bool:
@@ -117,7 +264,7 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, WebAppInfo, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
@@ -130,6 +277,7 @@ def check_telegram_requirements() -> bool:
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
         from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+        from telegram import WebAppInfo as _WAI
         try:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
@@ -149,6 +297,7 @@ def check_telegram_requirements() -> bool:
     Message = _Message
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
+    WebAppInfo = _WAI
     LinkPreviewOptions = _LPO
     Application = _App
     CommandHandler = _CH
@@ -437,6 +586,11 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Successful Mini App MCP writes register the sections that must be
+        # attached to the final response. This is deliberately tool-driven:
+        # user/assistant text never guesses that a Mini App was changed.
+        self._pending_miniapp_buttons: Dict[tuple[str, str], list[str]] = {}
+        self._processing_reaction_visible: Set[tuple[str, str]] = set()
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
@@ -450,9 +604,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_path_degraded: bool = False
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
-        # Track forum chats where we've already registered bot commands
+        # Track chats where we've already touched chat-scoped bot commands.
+        # Group chats need one-time cleanup of old menus; named-profile private
+        # chats need a scoped menu so operator-only commands stay hidden.
         self._forum_command_registered: set[int] = set()
-        # Lock per la registrazione sicura dei comandi nei forum supergroup
+        # Lock per la registrazione sicura dei comandi chat-scoped
         self._forum_lock = asyncio.Lock()
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
@@ -478,6 +634,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Clarify prompts in shared chats are bound to the user who triggered
+        # the current agent turn. Owners/operators may still answer them, but
+        # another participant must not be able to approve on their behalf.
+        self._clarify_requester_state: Dict[str, Dict[str, Optional[str]]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -525,23 +685,17 @@ class TelegramAdapter(BasePlatformAdapter):
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
-                from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
-
-                source = SessionSource(
-                    platform=Platform.TELEGRAM,
-                    chat_id=str(chat_id or normalized_user_id),
-                    chat_type=normalized_chat_type,
-                    user_id=normalized_user_id,
-                    user_name=str(user_name).strip() if user_name else None,
-                    thread_id=str(thread_id) if thread_id is not None else None,
+                return bool(
+                    auth_fn(
+                        self._callback_session_source(
+                            normalized_user_id,
+                            chat_id=chat_id,
+                            chat_type=chat_type,
+                            thread_id=thread_id,
+                            user_name=user_name,
+                        )
+                    )
                 )
-                return bool(auth_fn(source))
             except Exception:
                 logger.debug(
                     "[Telegram] Falling back to env-only callback auth for user %s",
@@ -558,6 +712,113 @@ class TelegramAdapter(BasePlatformAdapter):
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
+
+    @staticmethod
+    def _is_private_callback_chat_type(chat_type: Optional[str]) -> bool:
+        if chat_type is None:
+            return True
+        raw = getattr(chat_type, "value", chat_type)
+        if not isinstance(raw, str):
+            return True
+        raw_lower = raw.strip().lower()
+        if "magicmock" in raw_lower or "mock" in raw_lower:
+            return True
+        normalized = raw_lower.split(".")[-1]
+        return normalized in {"", "dm", "direct", "private"}
+
+    @staticmethod
+    def _normalize_callback_chat_type(chat_type: Optional[str], thread_id: Optional[str] = None) -> str:
+        raw = getattr(chat_type, "value", chat_type)
+        normalized = str(raw or "dm").split(".")[-1].strip().lower() or "dm"
+        if normalized == "private":
+            return "dm"
+        if normalized == "supergroup":
+            return "forum" if thread_id is not None else "group"
+        return normalized
+
+    def _callback_session_source(
+        self,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ):
+        from gateway.session import SessionSource
+
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=str(chat_id or user_id),
+            chat_type=self._normalize_callback_chat_type(chat_type, thread_id),
+            user_id=str(user_id),
+            user_name=str(user_name).strip() if user_name else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+        )
+
+    def _is_callback_operator(
+        self,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ) -> bool:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return False
+        source = self._callback_session_source(
+            normalized_user_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            thread_id=thread_id,
+            user_name=user_name,
+        )
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        config = getattr(runner, "config", None)
+        if config is not None:
+            try:
+                from gateway.slash_access import is_operator_for_source
+                return bool(is_operator_for_source(config, source))
+            except Exception:
+                logger.debug("[Telegram] callback operator check failed", exc_info=True)
+        allowed_ids = {
+            part.strip()
+            for part in os.getenv("TELEGRAM_ALLOWED_USERS", "").split(",")
+            if part.strip() and part.strip() != "*"
+        }
+        allowed_ids.update(
+            part.strip()
+            for part in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
+            if part.strip() and part.strip() != "*"
+        )
+        return normalized_user_id in allowed_ids
+
+    @staticmethod
+    def _callback_matches_requester(
+        requester_state: Optional[Dict[str, Optional[str]]],
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> bool:
+        """Return True when a callback comes from its bound prompt requester."""
+        if not requester_state:
+            return False
+        expected_user_id = str(requester_state.get("user_id") or "").strip()
+        expected_chat_id = str(requester_state.get("chat_id") or "").strip()
+        expected_thread_id = requester_state.get("thread_id")
+        actual_user_id = str(user_id or "").strip()
+        actual_chat_id = str(chat_id or "").strip()
+        actual_thread_id = str(thread_id) if thread_id is not None else None
+        return bool(
+            expected_user_id
+            and expected_chat_id
+            and actual_user_id == expected_user_id
+            and actual_chat_id == expected_chat_id
+            and expected_thread_id == actual_thread_id
+        )
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1727,9 +1988,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     error_callback=_polling_error_callback,
                 )
             
-            # Register bot commands so Telegram shows a hint menu when users type /
-            # List is derived from the central COMMAND_REGISTRY — adding a new
-            # gateway command there automatically adds it to the Telegram menu.
+            # Register bot commands so Telegram shows a hint menu in private
+            # chats. Group scopes are cleared because slash command execution is
+            # intentionally limited to private chats.
             try:
                 from telegram import (
                     BotCommand,
@@ -1743,20 +2004,25 @@ class TelegramAdapter(BasePlatformAdapter):
                 # to stay well under the threshold while covering all categories.
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
-                # Register for all scopes independently — Telegram picks the
-                # narrowest matching scope per chat type (forum topics fall
-                # through to AllGroupChats or Default).
-                for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
+                scope_payloads = (
+                    (BotCommandScopeDefault, []),
+                    (BotCommandScopeAllPrivateChats, bot_commands),
+                    (BotCommandScopeAllGroupChats, []),
+                )
+                for scope_cls, commands_for_scope in scope_payloads:
                     scope_name = scope_cls.__name__
                     try:
-                        await self._bot.set_my_commands(bot_commands, scope=scope_cls())
-                        logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(bot_commands))
+                        await self._bot.set_my_commands(commands_for_scope, scope=scope_cls())
+                        logger.info(
+                            "[%s] set_my_commands OK for scope %s (%d cmds)",
+                            self.name,
+                            scope_name,
+                            len(commands_for_scope),
+                        )
                     except Exception as scope_err:
                         logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
-                # Forum topics don't inherit AllGroupChats — Telegram resolves
-                # commands via BotCommandScopeChat(chat_id) for forum groups.
-                # Lazy registration happens in _ensure_forum_commands on first
-                # message from a forum topic (see _handle_text_message).
+                # Chat-scoped group command menus may exist from older runs.
+                # _ensure_forum_commands clears them on first group message.
                 if hidden_count:
                     logger.info(
                         "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
@@ -1822,6 +2088,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
 
+        if hasattr(self, "_processing_reaction_visible"):
+            self._processing_reaction_visible.clear()
+
         self._mark_disconnected()
         self._app = None
         self._bot = None
@@ -1867,6 +2136,40 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            thread_id = self._metadata_thread_id(metadata)
+            pending_key = self._miniapp_pending_key(chat_id, thread_id)
+            pending_buttons = getattr(self, "_pending_miniapp_buttons", {})
+            inline_miniapp_buttons_enabled = self._inline_miniapp_buttons_enabled_for_chat(chat_id)
+            pending_miniapp_params = (
+                self._coerce_pending_miniapp_params(pending_buttons.get(pending_key))
+                if inline_miniapp_buttons_enabled
+                else []
+            )
+            if not inline_miniapp_buttons_enabled and isinstance(pending_buttons, dict):
+                # Do not carry a stale Mini App action into a later reply if this chat
+                # deliberately suppresses inline buttons.
+                pending_buttons.pop(pending_key, None)
+            is_progress_message = self._is_miniapp_progress_message(content)
+            is_turn_final = bool(
+                (metadata or {}).get("hermes_turn_final")
+                or (metadata or {}).get("notify")
+            )
+            miniapp_reply_markup = None
+            fulfills_pending_miniapp = False
+            if inline_miniapp_buttons_enabled:
+                content, miniapp_reply_markup = self._extract_miniapp_buttons_from_content(
+                    content,
+                    use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
+                )
+                if pending_miniapp_params and is_turn_final and not is_progress_message:
+                    # A verified MCP mutation is authoritative. Even if the
+                    # model emitted another Mini App link, show only the app
+                    # section(s) that the completed tool actually changed.
+                    miniapp_reply_markup = self._miniapp_keyboard(
+                        pending_miniapp_params,
+                        use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
+                    )
+                    fulfills_pending_miniapp = miniapp_reply_markup is not None
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(
@@ -1882,7 +2185,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             
             message_ids = []
-            thread_id = self._metadata_thread_id(metadata)
             reply_to_mode = self._metadata_reply_to_mode(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
@@ -1944,6 +2246,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_kwargs = dict(thread_kwargs)
                     thread_kwargs["message_thread_id"] = None
                 effective_thread_id = thread_kwargs.get("message_thread_id")
+                reply_markup_kwargs = (
+                    {"reply_markup": miniapp_reply_markup}
+                    if miniapp_reply_markup is not None and i == 0
+                    else {}
+                )
 
                 msg = None
                 for _send_attempt in range(3):
@@ -1956,6 +2263,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
+                                **reply_markup_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
@@ -1970,6 +2278,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
+                                    **reply_markup_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
@@ -2003,8 +2312,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                     )
                                     continue
                                 # Second failure: the thread is genuinely gone.
-                                # Retry without ``message_thread_id`` so the
-                                # message still reaches the chat.
+                                # A forum-group send must fail closed; dropping
+                                # message_thread_id would leak it into General.
+                                if str(chat_id).startswith("-"):
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        retryable=False,
+                                    )
+                                # Private-chat DM topic fallback only.
                                 logger.warning(
                                     "[%s] Thread %s not found, retrying without message_thread_id",
                                     self.name, effective_thread_id,
@@ -2093,6 +2409,11 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass  # Typing failures are non-fatal
 
+            if fulfills_pending_miniapp:
+                current = getattr(self, "_pending_miniapp_buttons", {}).get(pending_key)
+                if self._coerce_pending_miniapp_params(current) == pending_miniapp_params:
+                    self._pending_miniapp_buttons.pop(pending_key, None)
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -2123,7 +2444,17 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
-            return SendResult(success=False, error=str(e), retryable=(is_connect_timeout or is_pool_timeout or not is_timeout))
+            retry_after = getattr(e, "retry_after", None)
+            try:
+                retry_after = float(retry_after) if retry_after is not None else None
+            except (TypeError, ValueError):
+                retry_after = None
+            return SendResult(
+                success=False,
+                error=str(e),
+                retryable=(retry_after is not None or is_connect_timeout or is_pool_timeout or not is_timeout),
+                retry_after=retry_after,
+            )
 
     async def send_or_update_status(
         self,
@@ -2181,12 +2512,59 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        pending_key = None
+        pending_miniapp_params: list[str] = []
+        miniapp_reply_markup = None
+        fulfills_pending_miniapp = False
+        if finalize and (metadata or {}).get("hermes_turn_final"):
+            thread_id = self._metadata_thread_id(metadata)
+            pending_key = self._miniapp_pending_key(chat_id, thread_id)
+            pending_buttons = getattr(self, "_pending_miniapp_buttons", {})
+            inline_miniapp_buttons_enabled = self._inline_miniapp_buttons_enabled_for_chat(chat_id)
+            if inline_miniapp_buttons_enabled:
+                pending_miniapp_params = self._coerce_pending_miniapp_params(
+                    pending_buttons.get(pending_key)
+                )
+                content, miniapp_reply_markup = self._extract_miniapp_buttons_from_content(
+                    content,
+                    use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
+                )
+                if pending_miniapp_params:
+                    miniapp_reply_markup = self._miniapp_keyboard(
+                        pending_miniapp_params,
+                        use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
+                    )
+                    fulfills_pending_miniapp = miniapp_reply_markup is not None
+            elif isinstance(pending_buttons, dict):
+                pending_buttons.pop(pending_key, None)
+
+        def _consume_pending_miniapp() -> None:
+            if not fulfills_pending_miniapp or pending_key is None:
+                return
+            current = getattr(self, "_pending_miniapp_buttons", {}).get(pending_key)
+            if self._coerce_pending_miniapp_params(current) == pending_miniapp_params:
+                self._pending_miniapp_buttons.pop(pending_key, None)
+
+        reply_markup_kwargs = (
+            {"reply_markup": miniapp_reply_markup}
+            if miniapp_reply_markup is not None
+            else {}
+        )
+
         # Pre-flight: if content already exceeds the limit, split-and-deliver
         # without round-tripping a doomed edit.
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
-            return await self._edit_overflow_split(
-                chat_id, message_id, content, finalize=finalize, metadata=metadata,
+            result = await self._edit_overflow_split(
+                chat_id,
+                message_id,
+                content,
+                finalize=finalize,
+                metadata=metadata,
+                reply_markup=miniapp_reply_markup,
             )
+            if result.success:
+                _consume_pending_miniapp()
+            return result
 
         try:
             if not finalize:
@@ -2204,22 +2582,27 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    **reply_markup_kwargs,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
+                    _consume_pending_miniapp()
                     return SendResult(success=True, message_id=message_id)
                 # Fallback: retry without markdown formatting
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=content,
+                    **reply_markup_kwargs,
                 )
+            _consume_pending_miniapp()
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
             # "Message is not modified" — content identical, treat as success
             if "not modified" in err_str:
+                _consume_pending_miniapp()
                 return SendResult(success=True, message_id=message_id)
             # Reactive split-and-deliver: parse_mode formatting can inflate
             # the payload past the limit even when the raw text was under
@@ -2229,9 +2612,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] edit_message overflow (%d UTF-16 > %d), splitting",
                     self.name, utf16_len(content), self.MAX_MESSAGE_LENGTH,
                 )
-                return await self._edit_overflow_split(
-                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                result = await self._edit_overflow_split(
+                    chat_id,
+                    message_id,
+                    content,
+                    finalize=finalize,
+                    metadata=metadata,
+                    reply_markup=miniapp_reply_markup,
                 )
+                if result.success:
+                    _consume_pending_miniapp()
+                return result
             # Flood control / RetryAfter — short waits are retried inline,
             # long waits return a failure immediately so streaming can fall back
             # to a normal final send instead of leaving a truncated partial.
@@ -2250,7 +2641,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=int(chat_id),
                         message_id=int(message_id),
                         text=content,
+                        **reply_markup_kwargs,
                     )
+                    _consume_pending_miniapp()
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     logger.error(
@@ -2302,6 +2695,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         finalize: bool,
         metadata: Optional[Dict[str, Any]] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
     ) -> SendResult:
         """Split an oversized edit across the existing message + continuations.
 
@@ -2338,6 +2732,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         message_id=int(message_id),
                         text=formatted,
                         parse_mode=ParseMode.MARKDOWN_V2,
+                        **({"reply_markup": reply_markup} if reply_markup is not None else {}),
                     )
                 except Exception as fmt_err:
                     if "not modified" not in str(fmt_err).lower():
@@ -2345,6 +2740,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_id=int(chat_id),
                             message_id=int(message_id),
                             text=first_chunk,
+                            **({"reply_markup": reply_markup} if reply_markup is not None else {}),
                         )
             else:
                 await self._bot.edit_message_text(
@@ -2580,14 +2976,12 @@ class TelegramAdapter(BasePlatformAdapter):
         return SendResult(success=False, error="draft_rejected")
 
     async def _send_message_with_thread_fallback(self, **kwargs):
-        """Send a Telegram message, retrying once without message_thread_id
-        if Telegram returns 'Message thread not found'.
+        """Send a Telegram control message with a private-chat fallback.
 
         Used for control-style sends (approval prompts, model picker,
-        update prompts) that can carry a stale thread_id from a DM
-        reply chain.  The streaming send loop has its own equivalent
-        (PR #3390) at the body of ``send``; this helper applies the
-        same retry pattern to the non-streaming control paths.
+        update prompts) that can carry a stale thread_id from a DM reply
+        chain. Group-topic sends fail closed because dropping the thread id
+        would route private topic content into the forum's General topic.
         """
         if not self._bot:
             raise RuntimeError("Not connected")
@@ -2601,6 +2995,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 and self._is_bad_request_error(send_err)
                 and self._is_thread_not_found_error(send_err)
             ):
+                if str(kwargs.get("chat_id", "")).startswith("-"):
+                    raise
                 logger.warning(
                     "[%s] Thread %s not found for control message, retrying without message_thread_id",
                     self.name,
@@ -2669,8 +3065,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
+            approval_title = (
+                "Cross-chat Send Approval Required"
+                if command.startswith("send_message cross-chat")
+                else "Command Approval Required"
+            )
             text = (
-                f"⚠️ <b>Command Approval Required</b>\n\n"
+                f"⚠️ <b>{approval_title}</b>\n\n"
                 f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
                 f"Reason: {_html.escape(description)}"
             )
@@ -2851,6 +3252,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._clarify_state[clarify_id] = session_key
+            requester_user_id = str(
+                (metadata or {}).get("gateway_requester_user_id") or ""
+            ).strip()
+            if requester_user_id:
+                self._clarify_requester_state[clarify_id] = {
+                    "user_id": requester_user_id,
+                    "chat_id": str(chat_id),
+                    "thread_id": str(thread_id) if thread_id is not None else None,
+                }
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
@@ -3251,6 +3661,34 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+        if (
+            not self._is_private_callback_chat_type(query_chat_type)
+            and data.startswith(_GROUP_GATED_CALLBACK_PREFIXES)
+        ):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            operator_allowed = (
+                data.startswith(_GROUP_OPERATOR_CALLBACK_PREFIXES)
+                and self._is_callback_operator(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=query_chat_type,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                )
+            )
+            requester_allowed = False
+            if data.startswith("cl:"):
+                parts = data.split(":", 2)
+                if len(parts) == 3:
+                    requester_allowed = self._callback_matches_requester(
+                        self._clarify_requester_state.get(parts[1]),
+                        caller_id,
+                        chat_id=query_chat_id,
+                        thread_id=query_thread_id,
+                    )
+            if not (operator_allowed or requester_allowed):
+                await query.answer(text="⛔ Controls are owner-only outside private chat.")
+                return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
@@ -3462,6 +3900,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 session_key = self._clarify_state.get(clarify_id)
                 if not session_key:
+                    self._clarify_requester_state.pop(clarify_id, None)
                     await query.answer(text="This prompt has already been resolved.")
                     return
 
@@ -3518,6 +3957,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # Pop state and resolve
                 self._clarify_state.pop(clarify_id, None)
+                self._clarify_requester_state.pop(clarify_id, None)
                 try:
                     from tools.clarify_gateway import resolve_gateway_clarify
                     resolved = resolve_gateway_clarify(clarify_id, resolved_text)
@@ -4541,9 +4981,33 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to resolve Telegram chat setting %s: %s", self.name, key, exc)
             return None
 
-    def _telegram_transcribe_audio_for_chat(self, chat_id: str) -> str:
-        value = str(self._telegram_chat_setting_for_chat(chat_id, "transcribe_audio") or "default").lower()
+    def _telegram_chat_tristate_for_chat(self, chat_id: str, key: str) -> str:
+        value = str(self._telegram_chat_setting_for_chat(chat_id, key) or "default").lower()
         return value if value in {"default", "on", "off"} else "default"
+
+    def _telegram_audio_trigger_for_chat(self, chat_id: str) -> str:
+        value = self._telegram_chat_tristate_for_chat(chat_id, "audio_trigger")
+        if value != "default":
+            return value
+        legacy = self._telegram_chat_tristate_for_chat(chat_id, "transcribe_audio")
+        if legacy != "default":
+            return legacy
+        configured = self.config.extra.get("audio_trigger")
+        if configured is not None:
+            return "on" if is_truthy_value(configured, default=False) else "off"
+        return "default"
+
+    def _telegram_show_transcription_for_chat(self, chat_id: str) -> str:
+        value = self._telegram_chat_tristate_for_chat(chat_id, "show_transcription")
+        if value != "default":
+            return value
+        configured = self.config.extra.get("show_transcription")
+        if configured is not None:
+            return "on" if is_truthy_value(configured, default=False) else "off"
+        env_value = os.getenv("TELEGRAM_SHOW_TRANSCRIPTION")
+        if env_value is not None:
+            return "on" if is_truthy_value(env_value, default=False) else "off"
+        return "default"
 
     def _telegram_require_mention_for_message(self, message: Message) -> bool:
         chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
@@ -4557,10 +5021,10 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
 
-        When enabled with ``require_mention``, Telegram matches the Yuanbao /
-        OpenClaw-style group UX: observe ordinary group chatter in the session
-        transcript, but only dispatch the agent when the bot is explicitly
-        addressed.
+        Telegram's mention-gated group UX is "listen, but do not speak": store
+        ordinary group chatter in the transcript and dispatch the agent only
+        when the bot is explicitly addressed.  Operators can still disable this
+        with ``observe_unmentioned_group_messages: false``.
         """
         configured = self.config.extra.get("observe_unmentioned_group_messages")
         if configured is None:
@@ -4569,7 +5033,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+        env_value = os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES")
+        if env_value is not None:
+            return env_value.lower() in {"true", "1", "yes", "on"}
+        return True
 
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
@@ -4621,21 +5088,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
-    def _telegram_observe_allowed_chats(self) -> set[str]:
-        """Chats where observed group context may use a shared source.
-
-        ``group_allowed_chats`` is the gateway authorization allowlist for
-        user-less group sources.  ``allowed_chats`` remains an optional response
-        gate; when set, observed context must satisfy both lists.
-        """
-        group_allowed = self._telegram_group_allowed_chats()
-        if not group_allowed:
-            return set()
-        response_allowed = self._telegram_allowed_chats()
-        if response_allowed:
-            return group_allowed & response_allowed
-        return group_allowed
-
     def _telegram_allowed_topics(self) -> set[str]:
         """Return the whitelist of Telegram forum topic IDs this bot handles.
 
@@ -4672,6 +5124,77 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Ignoring invalid Telegram thread id: %r", self.name, value)
         return ignored
 
+    @staticmethod
+    def _coerce_trigger_values(raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, dict):
+            values: List[str] = []
+            for item in raw.values():
+                values.extend(TelegramAdapter._coerce_trigger_values(item))
+            return values
+        if isinstance(raw, str):
+            parts = [part.strip() for part in re.split(r"[\n,]+", raw) if part.strip()]
+            return parts or ([raw.strip()] if raw.strip() else [])
+        elif isinstance(raw, (list, tuple, set)):
+            values: List[str] = []
+            for item in raw:
+                values.extend(TelegramAdapter._coerce_trigger_values(item))
+            return values
+        text = str(raw).strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _normalize_trigger_text(value: Any) -> str:
+        text = str(value or "").casefold().replace("ё", "е")
+        text = re.sub(r"(?iu)[^\w]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _telegram_text_trigger_values(self) -> List[str]:
+        """Mirror Telegram voice/STT wake words into text/caption triggers."""
+        triggers: List[str] = []
+        seen: set[str] = set()
+        for key in (
+            "voice_trigger_keywords",
+            "transcription_trigger_keywords",
+            "trigger_keywords",
+            "voice_trigger_aliases",
+            "transcription_trigger_aliases",
+            "trigger_aliases",
+            "trigger_keyword_aliases",
+        ):
+            for trigger in self._coerce_trigger_values(self.config.extra.get(key)):
+                if trigger and trigger not in seen:
+                    triggers.append(trigger)
+                    seen.add(trigger)
+        return triggers
+
+    def _telegram_text_matches_trigger(self, text: str) -> bool:
+        """Use the same wake-word matching shape as passive audio/STT."""
+        triggers = self._telegram_text_trigger_values()
+        if not triggers:
+            return False
+
+        text_folded = str(text or "").casefold()
+        text_normalized = f" {self._normalize_trigger_text(text)} "
+        for trigger in triggers:
+            trigger_text = str(trigger or "").strip()
+            if not trigger_text:
+                continue
+            if trigger_text.startswith("re:"):
+                try:
+                    if re.search(trigger_text[3:], text, re.IGNORECASE):
+                        return True
+                except re.error:
+                    logger.debug("[%s] Ignoring invalid Telegram text trigger regex: %r", self.name, trigger_text)
+                continue
+            normalized_trigger = self._normalize_trigger_text(trigger_text)
+            if normalized_trigger and f" {normalized_trigger} " in text_normalized:
+                return True
+            if len(normalized_trigger) >= 4 and trigger_text.casefold() in text_folded:
+                return True
+        return False
+
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
         patterns = self.config.extra.get("mention_patterns")
@@ -4686,17 +5209,17 @@ class TelegramAdapter(BasePlatformAdapter):
                         loaded = [part.strip() for part in raw.split(",") if part.strip()]
                 patterns = loaded
 
-        if patterns is None:
-            return []
         if isinstance(patterns, str):
             patterns = [patterns]
-        if not isinstance(patterns, list):
+        elif patterns is None:
+            patterns = []
+        elif not isinstance(patterns, list):
             logger.warning(
                 "[%s] telegram mention_patterns must be a list or string; got %s",
                 self.name,
                 type(patterns).__name__,
             )
-            return []
+            patterns = []
 
         compiled: List[re.Pattern] = []
         for pattern in patterns:
@@ -4707,7 +5230,9 @@ class TelegramAdapter(BasePlatformAdapter):
             except re.error as exc:
                 logger.warning("[%s] Invalid Telegram mention pattern %r: %s", self.name, pattern, exc)
         if compiled:
-            logger.info("[%s] Loaded %d Telegram mention pattern(s)", self.name, len(compiled))
+            platform = getattr(self, "platform", None)
+            adapter_name = str(getattr(platform, "value", "") or "Telegram").title()
+            logger.info("[%s] Loaded %d Telegram mention pattern(s)", adapter_name, len(compiled))
         return compiled
 
     def _is_group_chat(self, message: Message) -> bool:
@@ -4858,14 +5383,14 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(mentioned_bot_usernames) and bot_username not in mentioned_bot_usernames
 
     def _message_matches_mention_patterns(self, message: Message) -> bool:
-        if not self._mention_patterns:
-            return False
         for candidate in (getattr(message, "text", None), getattr(message, "caption", None)):
             if not candidate:
                 continue
             for pattern in self._mention_patterns:
                 if pattern.search(candidate):
                     return True
+            if self._telegram_text_matches_trigger(candidate):
+                return True
         return False
 
     def _is_guest_mention(self, message: Message) -> bool:
@@ -4877,11 +5402,11 @@ class TelegramAdapter(BasePlatformAdapter):
         return self._telegram_guest_mode() and self._message_mentions_bot(message)
 
     def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
-        if not text or not self._bot or not getattr(self._bot, "username", None):
-            return text
-        username = re.escape(self._bot.username)
-        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
-        return cleaned or text
+        # Keep the visible bot mention in the user turn.  The mention gate has
+        # already decided whether the message should reach the agent, and the
+        # mention itself is meaningful context: stripping it can make an
+        # addressed group question look like passive chatter.
+        return text
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
@@ -4908,15 +5433,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
-        allowed = self._telegram_observe_allowed_chats()
-        # Observed context is shared at chat/topic scope so a later trigger from
-        # another user can see it.  Require an explicit chat allowlist; that
-        # keeps shared observed history limited to operator-approved groups and
-        # lets gateway authorization pass even after the shared session source
-        # drops the per-sender user_id.
-        if not allowed or chat_id_str not in allowed:
-            return False
-
         # Only observe messages skipped by the require_mention gate.  If the
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
@@ -4935,7 +5451,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _telegram_group_observe_shared_source(self, source):
         """Return a chat/topic-scoped source for observed Telegram group context."""
-        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        shared_source = dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        route_fn = getattr(runner, "_source_with_profile_scope", None)
+        if callable(route_fn):
+            try:
+                return route_fn(shared_source)
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to route observed Telegram source through profile scope",
+                    self.name,
+                    exc_info=True,
+                )
+        return shared_source
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
@@ -5005,10 +5533,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return event
         raw_message = getattr(event, "raw_message", None)
         if not raw_message or not self._is_group_chat(raw_message):
-            return event
-        chat_id_str = str(getattr(getattr(raw_message, "chat", None), "id", ""))
-        allowed = self._telegram_observe_allowed_chats()
-        if not allowed or chat_id_str not in allowed:
             return event
         shared_source = self._telegram_group_observe_shared_source(event.source)
         observe_prompt = self._telegram_group_observe_channel_prompt()
@@ -5176,13 +5700,16 @@ class TelegramAdapter(BasePlatformAdapter):
         return False
 
     def _telegram_passive_audio_transcription_enabled(self, message: Message) -> bool:
-        """Allow configured unmentioned voice/audio to reach runner for transcript-only handling."""
+        """Allow unmentioned voice/audio to reach runner for transcript and/or audio trigger handling."""
         if not (getattr(message, "voice", None) or getattr(message, "audio", None)):
             return False
 
         chat = getattr(message, "chat", None)
         chat_id = str(getattr(chat, "id", ""))
-        if self._telegram_transcribe_audio_for_chat(chat_id) != "on":
+        if (
+            self._telegram_show_transcription_for_chat(chat_id) != "on"
+            and self._telegram_audio_trigger_for_chat(chat_id) != "on"
+        ):
             return False
 
         thread_id = getattr(message, "message_thread_id", None)
@@ -5223,12 +5750,8 @@ class TelegramAdapter(BasePlatformAdapter):
         When ``allowed_chats`` is non-empty, it remains a hard gate except for
         the narrow ``guest_mode`` bypass: group/supergroup messages that
         explicitly @mention this bot. Replies and regex wake words do not bypass
-        ``allowed_chats``. When ``require_mention`` is enabled, slash commands are not given
-        special treatment — they must pass the same mention/reply checks
-        as any other group message.  Users can still trigger commands via
-        the Telegram bot menu (``/command@botname``) or by explicitly
-        mentioning the bot (``@botname /command``), both of which are
-        recognised as mentions by :meth:`_message_mentions_bot`.
+        ``allowed_chats``. Slash commands do not receive special treatment here:
+        the gateway denies all slash command execution outside private chats.
         """
         if not self._is_group_chat(message):
             return True
@@ -5299,30 +5822,891 @@ class TelegramAdapter(BasePlatformAdapter):
         command = text.split(maxsplit=1)[0].lower()
         return command == "/start" or command.startswith("/start@")
 
-    async def _ensure_forum_commands(self, message) -> None:
-        """Lazy-register bot commands for forum supergroups.
+    def _command_surface_profile_for_message(self, message: Message) -> str:
+        """Resolve the Hermes profile that should shape visible commands."""
+        try:
+            chat = getattr(message, "chat", None)
+            if chat is None or not getattr(chat, "id", None):
+                return "default"
+            from hermes_cli.config import load_config
+            from gateway.profile_routing import (
+                normalize_profile_routes_config,
+                resolve_profile_for_source,
+            )
+            from gateway.session import SessionSource
 
-        Forum topics don't inherit AllGroupChats scope — Telegram resolves
-        via BotCommandScopeChat(chat_id).  Register on first message so the
-        command menu works in topic views.
+            chat_id = str(chat.id)
+            thread_id = getattr(message, "message_thread_id", None)
+            chat_type = "forum" if getattr(chat, "is_forum", False) else (
+                "group" if self._is_group_chat(message) else "dm"
+            )
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=str(thread_id) if thread_id is not None else None,
+            )
+            cfg = load_config() or {}
+            routes = normalize_profile_routes_config(cfg.get("profile_routes"))
+            return resolve_profile_for_source(routes, source) or "default"
+        except Exception:
+            logger.debug("[%s] Failed to resolve command-surface profile", self.name, exc_info=True)
+            return "default"
+
+    def _boxmap_miniapp_start_url(self) -> str:
+        configured = (
+            self.config.extra.get("boxmap_miniapp_start_url")
+            or os.getenv("HERMES_BOXMAP_MINIAPP_START_URL")
+            or os.getenv("BOXMAP_MINIAPP_START_URL")
+        )
+        if configured:
+            return str(configured).strip()
+
+        username = str(getattr(self._bot, "username", "") or "TripiooBot").lstrip("@")
+        return f"https://t.me/{username}?startapp=boxmap"
+
+    def _miniapp_bot_username(self) -> str:
+        username = getattr(self._bot, "username", None)
+        if isinstance(username, str) and username.strip():
+            return username.strip().lstrip("@")
+        configured = self.config.extra.get("miniapp_bot_username") if getattr(self.config, "extra", None) else None
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip().lstrip("@")
+        return "TripiooBot"
+
+    def _miniapp_start_url(self, start_param: str) -> str:
+        username = self._miniapp_bot_username()
+        return f"https://t.me/{username}?startapp={start_param}"
+
+    def _miniapp_webapp_base_url(self) -> str:
+        configured = (
+            self.config.extra.get("miniapp_webapp_url")
+            if getattr(self.config, "extra", None)
+            else None
+        ) or os.getenv("HERMES_MINIAPP_WEBAPP_URL") or os.getenv("MINIAPP_WEBAPP_URL")
+        base_url = str(configured or _MINIAPP_WEBAPP_BASE_URL).strip()
+        return base_url or _MINIAPP_WEBAPP_BASE_URL
+
+    def _miniapp_webapp_url(self, start_param: str) -> str:
+        parts = urlsplit(self._miniapp_webapp_base_url())
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["startapp"] = str(start_param or "").strip()
+        return urlunsplit((
+            parts.scheme,
+            parts.netloc,
+            parts.path or "/",
+            urlencode(query),
+            parts.fragment,
+        ))
+
+    @staticmethod
+    def _miniapp_supports_web_app_button_for_chat_id(chat_id: Any) -> bool:
+        chat_id_text = str(chat_id or "").strip()
+        return bool(chat_id_text and not chat_id_text.startswith("-"))
+
+    def _inline_miniapp_buttons_enabled_for_chat(self, chat_id: Any) -> bool:
+        """Return whether automatic Mini App keyboards may be attached in this chat."""
+        extra = getattr(self.config, "extra", None) or {}
+        settings = extra.get("inline_miniapp_buttons", {})
+        if isinstance(settings, bool):
+            return settings
+        if not isinstance(settings, dict):
+            return True
+        if settings.get("enabled") is False:
+            return False
+        disabled_chat_ids = settings.get("disabled_chat_ids", [])
+        if isinstance(disabled_chat_ids, (str, int)):
+            disabled_chat_ids = [disabled_chat_ids]
+        disabled = {str(item).strip() for item in disabled_chat_ids if str(item).strip()}
+        return str(chat_id or "").strip() not in disabled
+
+    def _miniapp_label_key(self, start_param: str) -> Optional[str]:
+        param = str(start_param or "").strip().lower()
+        if not param:
+            return None
+        if param.startswith("fitness_day_"):
+            return "fitness_day"
+        if param.startswith("fitness_week_"):
+            return "fitness_week"
+        if param in _MINIAPP_BUTTON_LABELS:
+            return param
+        return None
+
+    def _miniapp_button_label(self, start_param: str) -> Optional[str]:
+        label_key = self._miniapp_label_key(start_param)
+        if label_key is None:
+            return None
+        return _MINIAPP_BUTTON_LABELS.get(label_key)
+
+    def _is_supported_inline_miniapp_param(self, start_param: str) -> bool:
+        label_key = self._miniapp_label_key(start_param)
+        return bool(label_key and label_key in _SUPPORTED_INLINE_MINIAPP_PARAMS)
+
+    def _is_own_miniapp_bot_username(self, username: str) -> bool:
+        normalized = str(username or "").strip().lstrip("@").lower()
+        if not normalized:
+            return False
+        allowed = {"tr ipioobot".replace(" ", ""), self._miniapp_bot_username().lower()}
+        configured = self.config.extra.get("miniapp_bot_username") if getattr(self.config, "extra", None) else None
+        if isinstance(configured, str) and configured.strip():
+            allowed.add(configured.strip().lstrip("@").lower())
+        return normalized in allowed
+
+    def _miniapp_shortcut_text(self, start_param: str) -> str:
+        label_key = self._miniapp_label_key(start_param) or ""
+        if label_key == "planning" or label_key in {"todo", "tasks"}:
+            return "Открой миниапп планирования."
+        if label_key in {"boxmap", "scenarios"}:
+            return (
+                "Открой BoxMap-сценарии в миниаппе. "
+                "Доступ проверяется по участникам BoxMap-группы."
+            )
+        if label_key in {"menu", "meals", "family_menu", "family-menu"}:
+            return "Открой семейное меню в миниаппе."
+        if label_key in {"shopping", "groceries"}:
+            return "Открой покупки в миниаппе."
+        if label_key in {"dishes", "recipes"}:
+            return "Открой блюда в миниаппе."
+        if label_key == "health":
+            return "Открой миниапп здоровья."
+        if label_key.startswith("fitness"):
+            return "Открой тренировки в миниаппе."
+        if label_key.startswith("nutrition"):
+            return "Открой питание в миниаппе."
+        if label_key in {"meds", "medications"}:
+            return "Открой лекарства в миниаппе."
+        if label_key in {"social", "posts", "publishing"}:
+            return "Открой публикации в миниаппе."
+        if label_key == "stats":
+            return "Открой статистику в миниаппе."
+        return "Открой миниапп."
+
+    def _miniapp_keyboard(
+        self,
+        start_params: list[str],
+        *,
+        use_web_app: bool = False,
+    ) -> Optional[InlineKeyboardMarkup]:
+        rows = []
+        seen: set[str] = set()
+        for start_param in start_params:
+            param = str(start_param or "").strip()
+            if not param or param in seen or not self._is_supported_inline_miniapp_param(param):
+                continue
+            label = self._miniapp_button_label(param)
+            if not label:
+                continue
+            seen.add(param)
+            if self._miniapp_label_key(param) == "boxmap":
+                button_kwargs = {"url": self._boxmap_miniapp_start_url()}
+            else:
+                button_kwargs = (
+                    {"web_app": WebAppInfo(url=self._miniapp_webapp_url(param))}
+                    if use_web_app
+                    else {"url": self._miniapp_start_url(param)}
+                )
+            rows.append([
+                InlineKeyboardButton(label, **button_kwargs),
+            ])
+        if not rows:
+            return None
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _cleanup_miniapp_link_text(text: str) -> str:
+        cleaned = re.sub(r"`\s*`", "", text or "")
+        cleaned = re.sub(
+            r"(?im)^\s*(?:miniapp_url|url|link|ссылка|линк)\s*[:=-]?\s*$",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"[ \t]+([,.;:!?])", r"\1", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = cleaned.strip()
+        if cleaned.endswith(":"):
+            cleaned = f"{cleaned[:-1].rstrip()}."
+        return cleaned
+
+    def _extract_miniapp_buttons_from_content(
+        self,
+        content: str,
+        *,
+        use_web_app: bool = False,
+    ) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+        start_params: list[str] = []
+
+        def _replace(match: re.Match) -> str:
+            bot_username = match.group("bot")
+            start_param = match.group("param")
+            if (
+                not self._is_own_miniapp_bot_username(bot_username)
+                or not self._is_supported_inline_miniapp_param(start_param)
+            ):
+                return match.group("url")
+            start_params.append(start_param)
+            return ""
+
+        cleaned = _MINIAPP_START_LINK_RE.sub(_replace, content or "")
+        keyboard = self._miniapp_keyboard(start_params, use_web_app=use_web_app)
+        if keyboard is None:
+            return content, None
+        cleaned = self._cleanup_miniapp_link_text(cleaned)
+        if not cleaned:
+            cleaned = self._miniapp_shortcut_text(start_params[0])
+        return cleaned, keyboard
+
+    @staticmethod
+    def _miniapp_pending_key(chat_id: Any, thread_id: Any = None) -> tuple[str, str]:
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_thread_id = (
+            str(thread_id).strip()
+            if thread_id is not None and str(thread_id).strip()
+            else TelegramAdapter._GENERAL_TOPIC_THREAD_ID
+        )
+        return normalized_chat_id, normalized_thread_id
+
+    @staticmethod
+    def _coerce_pending_miniapp_params(value: Any) -> list[str]:
+        raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+        params: list[str] = []
+        for raw in raw_values:
+            param = str(raw or "").strip()
+            if param and param not in params:
+                params.append(param)
+        return params
+
+    @staticmethod
+    def _miniapp_param_for_mutating_mcp_tool(tool_name: Any) -> Optional[str]:
+        normalized = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            str(tool_name or "").strip().lower(),
+        ).strip("_")
+        return _MINIAPP_MUTATING_MCP_TOOL_PARAMS.get(normalized)
+
+    @staticmethod
+    def _tool_may_report_miniapp_mutation(tool_name: Any) -> bool:
+        normalized = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            str(tool_name or "").strip().lower(),
+        ).strip("_")
+        # MCP tools are namespaced by Hermes. social_post is the one native
+        # tool that writes the Social Mini App through its private API.
+        return normalized.startswith("mcp_") or normalized == "social_post"
+
+    @classmethod
+    def _miniapp_contract_from_tool_result(
+        cls,
+        result: Any,
+        *,
+        _depth: int = 0,
+    ) -> tuple[bool, list[str]]:
+        """Read the fail-closed Mini App mutation marker from a tool result."""
+        if _depth > 5 or result is None:
+            return False, []
+
+        if isinstance(result, str):
+            text = result.strip()
+            if not text or text[0] not in "[{":
+                return False, []
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False, []
+            return cls._miniapp_contract_from_tool_result(decoded, _depth=_depth + 1)
+
+        if isinstance(result, (list, tuple)):
+            marker_seen = False
+            params: list[str] = []
+            for item in result:
+                seen, item_params = cls._miniapp_contract_from_tool_result(
+                    item,
+                    _depth=_depth + 1,
+                )
+                marker_seen = marker_seen or seen
+                for param in item_params:
+                    if param not in params:
+                        params.append(param)
+            return marker_seen, params
+
+        if not isinstance(result, dict):
+            return False, []
+
+        marker = result.get("_miniapp")
+        if isinstance(marker, dict):
+            changed = marker.get("changed") is True
+            raw_params = marker.get("start_params")
+            if raw_params is None:
+                raw_params = [marker.get("start_param")]
+            elif not isinstance(raw_params, (list, tuple, set)):
+                raw_params = [raw_params]
+            params = (
+                [
+                    str(param).strip().lower()
+                    for param in raw_params
+                    if str(param or "").strip()
+                ]
+                if changed
+                else []
+            )
+            return True, list(dict.fromkeys(params))
+
+        marker_seen = False
+        params: list[str] = []
+        # MCP results are normally wrapped in these fields by mcp_tool.py.
+        for key in ("structuredContent", "structured_content", "result"):
+            if key not in result:
+                continue
+            seen, nested_params = cls._miniapp_contract_from_tool_result(
+                result[key],
+                _depth=_depth + 1,
+            )
+            marker_seen = marker_seen or seen
+            for param in nested_params:
+                if param not in params:
+                    params.append(param)
+        return marker_seen, params
+
+    def begin_miniapp_turn(self, chat_id: Any, thread_id: Any = None) -> None:
+        """Clear tool-derived buttons before a new agent turn starts."""
+        pending = getattr(self, "_pending_miniapp_buttons", None)
+        if isinstance(pending, dict):
+            pending.pop(self._miniapp_pending_key(chat_id, thread_id), None)
+
+    def record_miniapp_tool_completion(
+        self,
+        chat_id: Any,
+        thread_id: Any,
+        tool_name: Any,
+        *,
+        is_error: bool = False,
+        result: Any = None,
+    ) -> Optional[str]:
+        """Queue a button only for a successful Mini App MCP mutation."""
+        if is_error:
+            return None
+
+        contract_seen, start_params = self._miniapp_contract_from_tool_result(result)
+        if contract_seen and not self._tool_may_report_miniapp_mutation(tool_name):
+            return None
+        if not contract_seen:
+            legacy_param = self._miniapp_param_for_mutating_mcp_tool(tool_name)
+            start_params = [legacy_param] if legacy_param else []
+        start_params = [
+            param
+            for param in start_params
+            if param and self._is_supported_inline_miniapp_param(param)
+        ]
+        if not start_params:
+            return None
+
+        key = self._miniapp_pending_key(chat_id, thread_id)
+        pending = getattr(self, "_pending_miniapp_buttons", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._pending_miniapp_buttons = pending
+        params = self._coerce_pending_miniapp_params(pending.get(key))
+        for start_param in start_params:
+            if start_param not in params:
+                params.append(start_param)
+        pending[key] = params
+        return start_params[0]
+
+    @staticmethod
+    def _is_miniapp_progress_message(content: str) -> bool:
+        text = str(content or "").strip().lower().replace("ё", "е")
+        if not text:
+            return False
+        if text.startswith(("⏳", "⌛")):
+            return True
+        progress_prefixes = (
+            "загружаю ",
+            "проверяю ",
+            "добавляю ",
+            "обновляю ",
+            "изменяю ",
+            "удаляю ",
+            "сохраняю ",
+            "выполняю ",
+            "обрабатываю ",
+        )
+        return len(text) <= 160 and text.startswith(progress_prefixes) and text.endswith(("...", "…"))
+
+    def _configured_group_topic_name_for_message(self, message: Message) -> Optional[str]:
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(chat, "id", "") or "")
+        if not chat_id:
+            return None
+        thread_id = getattr(message, "message_thread_id", None)
+        thread_id_str = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        group_topics = self.config.extra.get("group_topics") if getattr(self.config, "extra", None) else None
+        if not isinstance(group_topics, list):
+            return None
+        for group in group_topics:
+            if not isinstance(group, dict) or str(group.get("chat_id", "")) != chat_id:
+                continue
+            topics = group.get("topics")
+            if not isinstance(topics, list):
+                continue
+            for topic in topics:
+                if not isinstance(topic, dict) or str(topic.get("thread_id", "")) != thread_id_str:
+                    continue
+                name = str(topic.get("name") or "").strip().lower()
+                skill = str(topic.get("skill") or "").strip().lower()
+                if name:
+                    return name
+                if "telegram_health" in skill:
+                    return "health"
+                if "telegram_planning" in skill:
+                    return "planning"
+        return None
+
+    def _miniapp_start_param_for_request(self, message: Message) -> Optional[str]:
+        text = str(getattr(message, "text", None) or "").strip().lower().replace("ё", "е")
+        if not text:
+            return None
+        wants_miniapp = any(marker in text for marker in _MINIAPP_WORD_MARKERS)
+        wants_open = any(marker in text for marker in _MINIAPP_OPEN_MARKERS)
+        data_action_markers = (
+            "добав",
+            "созда",
+            "запиш",
+            "измени",
+            "редакт",
+            "обнови",
+            "удал",
+            "убер",
+            "отмет",
+            "выполн",
+            "перенес",
+            "сохрани",
+            "залог",
+            "выпил",
+            "принял",
+            "пропуст",
+            "съел",
+            "приготов",
+            "купил",
+            "сделай",
+            "сделал",
+            "сделала",
+        )
+        data_read_markers = (
+            "покаж",
+            "открой",
+            "открыть",
+            "вывед",
+            "посмотр",
+            "какие",
+            "какой",
+            "какая",
+            "что у меня",
+            "сколько",
+            "список",
+            "истор",
+            "статус",
+            "сегодня",
+            "завтра",
+            "недел",
+        )
+        wants_data_action = any(marker in text for marker in data_action_markers)
+        wants_data_read = any(marker in text for marker in data_read_markers)
+        engineering_request = any(
+            marker in text
+            for marker in (
+                "почин",
+                "исправ",
+                "настрой",
+                "deploy",
+                "деплой",
+                "сломал",
+                "ошибк",
+                "код ",
+                "форма ",
+            )
+        )
+        planning_markers = (
+            "план",
+            "planning",
+            "задач",
+            "событи",
+            "встреч",
+            "календар",
+            "расписан",
+            "todo",
+            "tasks",
+        )
+        menu_markers = (
+            "меню",
+            "menu",
+            "meal",
+            "meals",
+            "блюд",
+            "рецепт",
+            "завтрак",
+            "обед",
+            "ужин",
+            "прием пищи",
+            "приём пищи",
+        )
+        shopping_markers = (
+            "покуп",
+            "shopping",
+            "grocer",
+            "список продуктов",
+            "продукт",
+        )
+        mentions_menu = any(marker in text for marker in menu_markers)
+        mentions_shopping = any(marker in text for marker in shopping_markers)
+        mentions_planning = any(marker in text for marker in planning_markers)
+        topic_name = self._configured_group_topic_name_for_message(message)
+        profile: Optional[str] = None
+        topic_name_text = topic_name or ""
+        is_family_surface = topic_name_text == "family" or topic_name_text.startswith("family-")
+        is_health_surface = topic_name == "health"
+        is_planning_surface = topic_name == "planning"
+        is_boxmap_surface = topic_name_text == "boxmap" or topic_name_text.startswith("boxmap-")
+        if not (is_family_surface or is_health_surface or is_planning_surface or is_boxmap_surface):
+            profile = self._command_surface_profile_for_message(message)
+            is_family_surface = profile == "family-chat"
+            is_planning_surface = profile in {"telegram_planning", "planning"}
+            is_health_surface = profile in {"telegram_health", "health"}
+            is_boxmap_surface = profile in {"telegram_boxmap", "boxmap"}
+
+        health_markers = (
+            "здоров",
+            "health",
+            "медиц",
+            "лекар",
+            "таблет",
+            "трен",
+            "фитнес",
+            "fitness",
+            "подход",
+            "повтор",
+            "отжим",
+            "подтяг",
+            "присед",
+            "пресс",
+            "упражнен",
+            "питан",
+            "nutrition",
+            "статист",
+        )
+        mentions_health = any(marker in text for marker in health_markers)
+        mentions_boxmap = any(
+            marker in text for marker in ("boxmap", "боксмап", "сценар")
+        )
+        mentions_social = any(
+            marker in text
+            for marker in (
+                "social",
+                "instagram",
+                "tiktok",
+                "публикац",
+                "черновик",
+                "посты",
+            )
+        )
+        has_data_intent = wants_miniapp or wants_open or wants_data_action or wants_data_read
+        has_app_surface = (
+            is_family_surface
+            or is_health_surface
+            or is_planning_surface
+            or is_boxmap_surface
+        )
+        has_domain_reference = (
+            mentions_menu
+            or mentions_shopping
+            or mentions_planning
+            or mentions_health
+            or mentions_boxmap
+            or mentions_social
+        )
+        if engineering_request and not wants_data_action:
+            return None
+        if not has_data_intent or not (has_app_surface or has_domain_reference):
+            return None
+
+        if is_family_surface and mentions_menu:
+            return "menu"
+        if mentions_shopping:
+            return "shopping"
+        if is_family_surface and wants_miniapp:
+            return "menu"
+        if is_boxmap_surface and (mentions_boxmap or wants_miniapp or wants_open):
+            return "boxmap"
+        if mentions_social:
+            return "social"
+        if (
+            "питан" in text
+            or "nutrition" in text
+            or "съел" in text
+            or "поел" in text
+            or ((mentions_menu or "еда" in text) and is_health_surface)
+        ):
+            return "nutrition_history" if "истор" in text or "history" in text else "nutrition"
+        if (
+            "лекар" in text
+            or "таблет" in text
+            or "препарат" in text
+            or "med" in text
+            or (is_health_surface and any(marker in text for marker in ("выпил", "принял", "пропуст")))
+        ):
+            return "meds"
+        if "статист" in text or "stats" in text:
+            return "stats"
+        if any(
+            marker in text
+            for marker in (
+                "трен",
+                "фитнес",
+                "fitness",
+                "подход",
+                "повтор",
+                "отжим",
+                "подтяг",
+                "присед",
+                "пресс",
+                "упражнен",
+            )
+        ):
+            if "недел" in text or "week" in text:
+                return "fitness_week"
+            if "истор" in text or "history" in text or "лог" in text:
+                return "fitness_history"
+            if "план" in text or "planning" in text:
+                return "fitness_planning"
+            return "fitness"
+        if mentions_menu:
+            return "menu"
+        if mentions_planning:
+            return "planning"
+        if mentions_health:
+            return "health"
+
+        if is_health_surface:
+            return "health"
+        if is_planning_surface:
+            return "planning"
+        if is_family_surface:
+            return "menu"
+        if is_boxmap_surface:
+            return "boxmap"
+        return None
+
+    @staticmethod
+    def _miniapp_request_is_direct_open(message: Message) -> bool:
+        text = str(getattr(message, "text", None) or "").strip().lower().replace("ё", "е")
+        if not text:
+            return False
+        data_action_markers = (
+            "добав",
+            "созда",
+            "запиш",
+            "измени",
+            "редакт",
+            "обнови",
+            "удал",
+            "убер",
+            "отмет",
+            "выполн",
+            "перенес",
+            "сохрани",
+        )
+        if any(marker in text for marker in data_action_markers):
+            return False
+        direct_markers = ("открой", "открыть", "запусти", "launch", "open")
+        if any(marker in text for marker in direct_markers):
+            return True
+        mentions_miniapp = any(marker in text for marker in _MINIAPP_WORD_MARKERS)
+        return mentions_miniapp and any(
+            marker in text
+            for marker in ("покажи", "показать", "дай", "скинь", "пришли", "ссыл", "линк", "кнопк")
+        )
+
+    def _is_boxmap_miniapp_request(self, message: Message) -> bool:
+        text_parts = [str(getattr(message, "text", None) or "")]
+        reply = getattr(message, "reply_to_message", None)
+        if reply is not None:
+            text_parts.extend([
+                str(getattr(reply, "text", None) or ""),
+                str(getattr(reply, "caption", None) or ""),
+            ])
+        text = "\n".join(part for part in text_parts if part).strip().lower().replace("ё", "е")
+        if not text:
+            return False
+
+        wants_scenarios = "сценар" in text or "scenario" in text
+        wants_miniapp = any(marker in text for marker in _MINIAPP_WORD_MARKERS)
+        if not (wants_scenarios and wants_miniapp):
+            return False
+
+        if "boxmap" in text or "боксмап" in text:
+            return True
+
+        return self._command_surface_profile_for_message(message) == "boxmap"
+
+    async def _send_miniapp_shortcut(self, message: Message, start_param: str) -> bool:
+        if not self._bot or not self._is_supported_inline_miniapp_param(start_param):
+            return False
+
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            return False
+
+        thread_id = getattr(message, "message_thread_id", None)
+        thread_kwargs = self._thread_kwargs_for_send(
+            str(chat_id),
+            str(thread_id) if thread_id is not None else None,
+            None,
+        )
+        reply_to_id = getattr(message, "message_id", None)
+        use_web_app = not self._is_group_chat(message)
+        keyboard = self._miniapp_keyboard([start_param], use_web_app=use_web_app)
+        if keyboard is None:
+            return False
+        text = self._miniapp_shortcut_text(start_param)
+
+        try:
+            await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=text,
+                parse_mode=None,
+                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
+                reply_markup=keyboard,
+                **thread_kwargs,
+                **self._notification_kwargs({"notify": True}),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Miniapp button send failed, retrying with plain link: %s",
+                self.name,
+                exc,
+                exc_info=True,
+            )
+
+        fallback_text = f"{text}\n{self._miniapp_start_url(start_param)}"
+        try:
+            await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=fallback_text,
+                parse_mode=None,
+                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
+                **thread_kwargs,
+                **self._notification_kwargs({"notify": True}),
+            )
+            return True
+        except Exception:
+            logger.warning("[%s] Miniapp plain-link fallback failed", self.name, exc_info=True)
+            return False
+
+    async def _send_boxmap_miniapp_shortcut(self, message: Message) -> bool:
+        if not self._bot:
+            return False
+
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            return False
+
+        thread_id = getattr(message, "message_thread_id", None)
+        thread_kwargs = self._thread_kwargs_for_send(
+            str(chat_id),
+            str(thread_id) if thread_id is not None else None,
+            None,
+        )
+        reply_to_id = getattr(message, "message_id", None)
+        keyboard = self._miniapp_keyboard(["boxmap"], use_web_app=False)
+        if keyboard is None:
+            return False
+        text = self._miniapp_shortcut_text("boxmap")
+
+        try:
+            await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=text,
+                parse_mode=None,
+                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
+                reply_markup=keyboard,
+                **thread_kwargs,
+                **self._notification_kwargs({"notify": True}),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] BoxMap miniapp button send failed, retrying with plain link: %s",
+                self.name,
+                exc,
+                exc_info=True,
+            )
+
+        fallback_text = f"{text}\n{self._boxmap_miniapp_start_url()}"
+        try:
+            await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=fallback_text,
+                parse_mode=None,
+                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
+                **thread_kwargs,
+                **self._notification_kwargs({"notify": True}),
+            )
+            return True
+        except Exception:
+            logger.warning("[%s] BoxMap miniapp plain-link fallback failed", self.name, exc_info=True)
+            return False
+
+    async def _ensure_forum_commands(self, message) -> None:
+        """Lazy-register chat-scoped bot commands where Telegram needs them.
+
+        Older runs may have registered BotCommandScopeChat menus for group
+        chats. Clear those on first group message. Named-profile private chats
+        still get a chat-scoped menu so default-only operator commands are
+        hidden there.
         """
         async with self._forum_lock:
             try:
                 chat = getattr(message, "chat", None)
-                if not chat or not getattr(chat, "is_forum", False):
+                if not chat:
                     return
                 chat_id = int(chat.id)
+                from telegram import BotCommand, BotCommandScopeChat
+                if self._is_group_chat(message):
+                    if chat_id in self._forum_command_registered:
+                        return
+                    await self._bot.set_my_commands([], scope=BotCommandScopeChat(chat_id=chat_id))
+                    self._forum_command_registered.add(chat_id)
+                    logger.info("[%s] Cleared chat-scoped commands for group chat %s", self.name, chat_id)
+                    return
+                profile_name = self._command_surface_profile_for_message(message)
+                needs_chat_scope = (
+                    profile_name not in {"default", "custom"}
+                )
+                if not needs_chat_scope:
+                    return
                 if chat_id in self._forum_command_registered:
                     return
-                from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                menu_commands, _ = telegram_menu_commands(
+                    max_commands=MAX_COMMANDS_PER_SCOPE,
+                    profile_name=profile_name,
+                )
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
-                logger.info("[%s] Lazy-registered %d commands for forum chat %s", self.name, len(bot_commands), chat_id)
+                logger.info(
+                    "[%s] Lazy-registered %d commands for chat %s (profile=%s)",
+                    self.name,
+                    len(bot_commands),
+                    chat_id,
+                    profile_name,
+                )
             except Exception as e:
-                logger.warning("[%s] Forum command lazy-registration failed: %s", self.name, e)
+                logger.warning("[%s] Chat command lazy-registration failed: %s", self.name, e)
 
     def _effective_update_message(self, update: Update) -> Optional[Message]:
         """Return the message-like payload for normal messages and channel posts.
@@ -5349,6 +6733,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
         await self._ensure_forum_commands(update.message)
+        miniapp_start_param = (
+            self._miniapp_start_param_for_request(msg)
+            if self._miniapp_request_is_direct_open(msg)
+            else None
+        )
+        if miniapp_start_param:
+            if miniapp_start_param == "boxmap":
+                sent = await self._send_boxmap_miniapp_shortcut(msg)
+            else:
+                sent = await self._send_miniapp_shortcut(msg, miniapp_start_param)
+            if sent:
+                return
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
@@ -5564,19 +6960,26 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = update.message
         should_process = self._should_process_message(msg)
         passive_audio_transcription = False
-        if not should_process and self._telegram_audio_transcription_rule_matches_message(msg):
+        if self._telegram_audio_transcription_rule_matches_message(msg):
             should_process = True
-        if not should_process and self._telegram_passive_audio_transcription_enabled(msg):
-            should_process = True
-            passive_audio_transcription = True
+        else:
+            # Chat-level voice transcription is a gateway policy, not an agent hint:
+            # when enabled, voice notes are transcribed and echoed by the gateway
+            # even if the same message would otherwise reach the agent via a
+            # mention, reply-to-bot, or free-response trigger.  After STT, only
+            # a configured audio-trigger keyword may continue the voice note to
+            # the agent; addressing and response mode never bypass that gate.
+            # Telegram audio-file attachments remain opt-in via explicit
+            # audio_transcription_rules.
+            passive_audio_transcription = bool(getattr(msg, "voice", None)) and self._telegram_passive_audio_transcription_enabled(msg)
+            if passive_audio_transcription:
+                should_process = True
         if not should_process and not self._should_observe_unmentioned_group_message(msg):
             return
 
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        if passive_audio_transcription:
-            event.telegram_passive_audio_transcription = True
         
         # Add caption as text
         if msg.caption:
@@ -5598,6 +7001,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # appends cached media paths without triggering a reply.
         if should_process:
             event = self._apply_telegram_group_observe_attribution(event)
+        if passive_audio_transcription:
+            setattr(event, "telegram_passive_audio_transcription", True)
 
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).
@@ -5991,7 +7396,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _get_dm_topic_info(self, chat_id: str, thread_id: Optional[str]) -> Optional[Dict[str, Any]]:
         """Look up DM topic config by chat_id and thread_id.
 
-        Returns the topic config dict (name, skill, etc.) if this thread_id
+        Returns the topic config dict (name, skill/skills, etc.) if this thread_id
         matches a known DM topic, or None.
         """
         if not thread_id:
@@ -6028,14 +7433,26 @@ class TelegramAdapter(BasePlatformAdapter):
         return None
 
     def _cache_dm_topic_from_message(self, chat_id: str, thread_id: str, topic_name: str) -> None:
-        """Cache a thread_id -> topic_name mapping discovered from an incoming message."""
+        """Cache a thread_id -> topic_name mapping discovered from a forum message."""
         cache_key = f"{chat_id}:{topic_name}"
         if cache_key not in self._dm_topics:
             self._dm_topics[cache_key] = int(thread_id)
             logger.info(
-                "[%s] Cached DM topic from message: %s -> thread_id=%s",
+                "[%s] Cached topic from message: %s -> thread_id=%s",
                 self.name, cache_key, thread_id,
             )
+
+    def _get_cached_topic_name(self, chat_id: str, thread_id: str) -> Optional[str]:
+        """Return a service-message-discovered topic name without config I/O."""
+        try:
+            thread_id_int = int(thread_id)
+        except (TypeError, ValueError):
+            return None
+        prefix = f"{chat_id}:"
+        for key, cached_thread_id in self._dm_topics.items():
+            if cached_thread_id == thread_id_int and key.startswith(prefix):
+                return key.split(":", 1)[1]
+        return None
 
     def _build_message_event(
         self,
@@ -6088,20 +7505,29 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id_str = self._GENERAL_TOPIC_THREAD_ID
         chat_topic = None
         topic_skill = None
+        discovered_topic_name = None
+        created_topic = getattr(message, "forum_topic_created", None)
+        edited_topic = getattr(message, "forum_topic_edited", None)
+        if created_topic is not None:
+            discovered_topic_name = getattr(created_topic, "name", None)
+        elif edited_topic is not None:
+            discovered_topic_name = getattr(edited_topic, "name", None)
+        if thread_id_str and discovered_topic_name:
+            self._cache_dm_topic_from_message(
+                str(chat.id),
+                thread_id_str,
+                str(discovered_topic_name),
+            )
 
         if chat_type == "dm" and thread_id_str:
             topic_info = self._get_dm_topic_info(str(chat.id), thread_id_str)
             if topic_info:
                 chat_topic = topic_info.get("name")
-                topic_skill = topic_info.get("skill")
+                topic_skill = topic_info.get("skills") or topic_info.get("skill")
 
             # Also check forum_topic_created service message for topic discovery
-            if hasattr(message, "forum_topic_created") and message.forum_topic_created:
-                created_name = message.forum_topic_created.name
-                if created_name:
-                    self._cache_dm_topic_from_message(str(chat.id), thread_id_str, created_name)
-                    if not chat_topic:
-                        chat_topic = created_name
+            if discovered_topic_name and not chat_topic:
+                chat_topic = str(discovered_topic_name)
 
         elif chat_type == "group" and thread_id_str:
             # Group/supergroup forum topic skill binding via config.extra['group_topics']
@@ -6112,9 +7538,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         tid = topic.get("thread_id")
                         if tid is not None and str(tid) == thread_id_str:
                             chat_topic = topic.get("name")
-                            topic_skill = topic.get("skill")
+                            topic_skill = topic.get("skills") or topic.get("skill")
                             break
                     break
+            if not chat_topic:
+                chat_topic = self._get_cached_topic_name(str(chat.id), thread_id_str)
 
         # Build source
         source = self.build_source(
@@ -6192,6 +7620,96 @@ class TelegramAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
 
+    @staticmethod
+    def _reaction_setting(env_name: str, default: str) -> str:
+        """Return a Telegram reaction lifecycle setting.
+
+        Values like ``clear`` remove the in-progress reaction. Values like
+        ``keep`` leave the current reaction untouched. Any other value is sent
+        as the emoji reaction.
+        """
+        return str(os.getenv(env_name, default) or "").strip()
+
+    @staticmethod
+    def _reaction_action(value: str) -> str:
+        action = str(value or "").strip()
+        if not action:
+            return "clear"
+        return action
+
+    @classmethod
+    def _is_visible_reaction_action(cls, value: str) -> bool:
+        normalized = cls._reaction_action(value).lower()
+        return normalized not in {"keep", "preserve", "unchanged", "clear", "remove", "none", "off", "false", "0"}
+
+    def _processing_reaction_key_for_source(
+        self,
+        source: Any,
+        message_id: Optional[str] = None,
+    ) -> Optional[tuple[str, str]]:
+        chat_id = getattr(source, "chat_id", None)
+        message_id = message_id or getattr(source, "message_id", None)
+        if not (chat_id and message_id):
+            return None
+        return (str(chat_id), str(message_id))
+
+    def _processing_reaction_key(self, event: MessageEvent) -> Optional[tuple[str, str]]:
+        source = getattr(event, "source", None)
+        return self._processing_reaction_key_for_source(
+            source,
+            getattr(event, "message_id", None),
+        )
+
+    def _processing_reaction_visible_set(self) -> Set[tuple[str, str]]:
+        visible = getattr(self, "_processing_reaction_visible", None)
+        if visible is None:
+            visible = set()
+            self._processing_reaction_visible = visible
+        return visible
+
+    async def mark_processing_work_started(
+        self,
+        source: Any,
+        message_id: Optional[str] = None,
+    ) -> None:
+        """Show a processing reaction after the agent chooses real work.
+
+        This is intentionally separate from ``on_processing_start``. A plain
+        inbound Telegram message should not get 👀 just because it is being
+        answered; the status appears only when the agent/model enters a tool or
+        research path and the gateway receives that explicit progress signal.
+        """
+        if not self._reactions_enabled():
+            return
+        key = self._processing_reaction_key_for_source(source, message_id)
+        if not key or key in self._processing_reaction_visible_set():
+            return
+        action = self._reaction_setting("TELEGRAM_REACTION_IN_PROGRESS", "\U0001f440")
+        if not self._is_visible_reaction_action(action):
+            return
+        if await self._apply_reaction_action(key[0], key[1], action):
+            self._processing_reaction_visible_set().add(key)
+
+    async def _apply_reaction_action(
+        self,
+        chat_id: str,
+        message_id: str,
+        value: str,
+        *,
+        clear_on_failure: bool = False,
+    ) -> bool:
+        action = self._reaction_action(value)
+        normalized = action.lower()
+        if normalized in {"keep", "preserve", "unchanged"}:
+            return True
+        if normalized in {"clear", "remove", "none", "off", "false", "0"}:
+            return await self._clear_reactions(chat_id, message_id)
+        if await self._set_reaction(chat_id, message_id, action):
+            return True
+        if clear_on_failure:
+            return await self._clear_reactions(chat_id, message_id)
+        return False
+
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
         if not self._bot:
@@ -6202,9 +7720,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id=int(message_id),
                 reaction=emoji,
             )
+            logger.info("[%s] set_message_reaction applied (%s)", self.name, emoji)
             return True
         except Exception as e:
-            logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, e)
+            logger.warning("[%s] set_message_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
     async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
@@ -6223,19 +7742,57 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id=int(message_id),
                 reaction=None,
             )
+            logger.info("[%s] cleared message reactions", self.name)
             return True
         except Exception as e:
-            logger.debug("[%s] clear reactions failed: %s", self.name, e)
+            logger.warning("[%s] clear reactions failed: %s", self.name, e)
             return False
 
-    async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
-        if not self._reactions_enabled():
-            return
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
+    async def handle_agent_control_response(
+        self,
+        event: MessageEvent,
+        control: AgentControlResponse,
+    ) -> SendResult:
+        """Consume ``[[silent]]`` / ``[[reaction:...]]`` without sending text."""
+        try:
+            setattr(event, "_agent_control_response", control.action)
+            if control.emoji:
+                setattr(event, "_agent_control_reaction", control.emoji)
+        except Exception:
+            pass
+
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        message_id = getattr(event, "message_id", None) or getattr(
+            getattr(event, "source", None),
+            "message_id",
+            None,
+        )
+        sent = False
+        cleared = False
+        key = self._processing_reaction_key(event)
+        if key:
+            self._processing_reaction_visible_set().discard(key)
         if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+            if control.action == "reaction" and control.emoji:
+                sent = await self._set_reaction(chat_id, message_id, control.emoji)
+                if not sent:
+                    cleared = await self._clear_reactions(chat_id, message_id)
+            elif control.action == "silent":
+                cleared = await self._clear_reactions(chat_id, message_id)
+        return SendResult(
+            success=True,
+            message_id=None,
+            raw_response={
+                "control_response": control.action,
+                "emoji": control.emoji,
+                "reaction_sent": sent,
+                "reaction_cleared": cleared,
+            },
+        )
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Do not react merely because a message started processing."""
+        return
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction.
@@ -6247,20 +7804,34 @@ class TelegramAdapter(BasePlatformAdapter):
         interrupted mid-flight), we explicitly clear the 👀 in-progress
         reaction so it doesn't linger on the user's message indefinitely.
         Without this clear, the only way to remove the 👀 was to wait for
-        another agent run to swap it to 👍/👎 — which never happens if the
+        another agent run to swap it to a terminal reaction — which never happens if the
         cancellation was the last activity in the chat.
         """
         if not self._reactions_enabled():
             return
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if not (chat_id and message_id):
+        if getattr(event, "_agent_control_response", None):
             return
+        key = self._processing_reaction_key(event)
+        if not key:
+            return
+        if key not in self._processing_reaction_visible_set():
+            return
+        self._processing_reaction_visible_set().discard(key)
+
         if outcome == ProcessingOutcome.CANCELLED:
-            await self._clear_reactions(chat_id, message_id)
-        else:
-            await self._set_reaction(
-                chat_id,
-                message_id,
-                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
+            await self._apply_reaction_action(
+                key[0],
+                key[1],
+                self._reaction_setting("TELEGRAM_REACTION_CANCELLED", "clear"),
             )
+            return
+        if outcome == ProcessingOutcome.SUCCESS:
+            reaction = self._reaction_setting("TELEGRAM_REACTION_SUCCESS", "clear")
+        else:
+            reaction = self._reaction_setting("TELEGRAM_REACTION_FAILURE", "\U0001f44e")
+        await self._apply_reaction_action(
+            key[0],
+            key[1],
+            reaction,
+            clear_on_failure=True,
+        )

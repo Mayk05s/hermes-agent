@@ -252,7 +252,8 @@ def _apply_pricing(rows: list[dict]) -> None:
     """Enrich each provider row with per-model pricing + Nous tier gating.
 
     Mutates ``rows`` in-place. For every row whose provider supports live
-    pricing (openrouter / nous / novita) adds::
+    pricing (OpenRouter / Nous / Novita live pricing, plus known official or
+    subscription-included routes such as OpenAI Codex) adds::
 
         row["pricing"] = {model_id: {"input": "$3.00", "output": "$15.00",
                                      "cache": "$0.30" | None, "free": bool}}
@@ -272,6 +273,22 @@ def _apply_pricing(rows: list[dict]) -> None:
         get_pricing_for_provider,
         partition_nous_models_by_tier,
     )
+    from agent.usage_pricing import get_pricing_entry
+
+    def _format_price_per_million(value) -> str:
+        if value is None:
+            return ""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if number == 0:
+            return "free"
+        if number >= 1:
+            return f"${number:.2f}"
+        if number >= 0.01:
+            return f"${number:.3f}"
+        return f"${number:.4f}"
 
     # Resolve Nous free-tier once (cached in models.py for the TTL window).
     nous_free_tier: Optional[bool] = None
@@ -285,28 +302,48 @@ def _apply_pricing(rows: list[dict]) -> None:
             raw_pricing = get_pricing_for_provider(slug) or {}
         except Exception:
             raw_pricing = {}
-        if not raw_pricing:
-            continue
-
         formatted: dict[str, dict] = {}
-        for mid in models:
-            p = raw_pricing.get(mid)
-            if not p:
+        if raw_pricing:
+            for mid in models:
+                p = raw_pricing.get(mid)
+                if not p:
+                    continue
+                inp_raw = p.get("prompt", "")
+                out_raw = p.get("completion", "")
+                cache_raw = p.get("input_cache_read", "")
+                inp = _format_price_per_mtok(inp_raw) if inp_raw != "" else ""
+                out = _format_price_per_mtok(out_raw) if out_raw != "" else ""
+                cache = _format_price_per_mtok(cache_raw) if cache_raw else None
+                # A model is "free" when both input and output cost nothing.
+                is_free = inp == "free" and (out == "free" or out == "")
+                formatted[mid] = {
+                    "input": inp,
+                    "output": out,
+                    "cache": cache,
+                    "free": is_free,
+                }
+        else:
+            if slug in {"openrouter", "nous", "novita"}:
                 continue
-            inp_raw = p.get("prompt", "")
-            out_raw = p.get("completion", "")
-            cache_raw = p.get("input_cache_read", "")
-            inp = _format_price_per_mtok(inp_raw) if inp_raw != "" else ""
-            out = _format_price_per_mtok(out_raw) if out_raw != "" else ""
-            cache = _format_price_per_mtok(cache_raw) if cache_raw else None
-            # A model is "free" when both input and output cost nothing.
-            is_free = inp == "free" and (out == "free" or out == "")
-            formatted[mid] = {
-                "input": inp,
-                "output": out,
-                "cache": cache,
-                "free": is_free,
-            }
+            for mid in models:
+                try:
+                    entry = get_pricing_entry(mid, provider=slug)
+                except Exception:
+                    entry = None
+                if entry is None:
+                    continue
+                inp = _format_price_per_million(entry.input_cost_per_million)
+                out = _format_price_per_million(entry.output_cost_per_million)
+                cache = _format_price_per_million(entry.cache_read_cost_per_million)
+                included = entry.pricing_version == "included-route"
+                is_free = bool(included or (inp == "free" and (out == "free" or out == "")))
+                formatted[mid] = {
+                    "input": inp,
+                    "output": out,
+                    "cache": cache or None,
+                    "free": is_free,
+                    "included": included,
+                }
 
         if formatted:
             row["pricing"] = formatted

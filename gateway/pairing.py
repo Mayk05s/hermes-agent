@@ -163,6 +163,36 @@ class PairingStore:
             and str(info.get("thread_id") or "").strip() == str(thread_id or "").strip()
         )
 
+    def _normalize_chat_approval_scope(self, approval_scope: str = "topic") -> str:
+        scope = str(approval_scope or "topic").strip().lower()
+        if scope not in {"chat", "topic"}:
+            return "topic"
+        return scope
+
+    def _remove_chat_topic_approvals(self, platform: str, chat_id: str) -> None:
+        """Remove narrower topic grants when promoting a chat request to chat-wide."""
+        clean_chat_id = str(chat_id or "").strip()
+        if not clean_chat_id:
+            return
+
+        path = self._approved_path(platform)
+        approved = self._load_json(path)
+        topic_prefix = f"{self._chat_approval_id(clean_chat_id)}:thread:"
+        changed = False
+        for approved_user_id, info in list(approved.items()):
+            info_chat_id = ""
+            info_thread_id = ""
+            if isinstance(info, dict):
+                info_chat_id = str(info.get("chat_id") or "").strip()
+                info_thread_id = str(info.get("thread_id") or "").strip()
+            if str(approved_user_id).startswith(topic_prefix) or (
+                info_chat_id == clean_chat_id and bool(info_thread_id)
+            ):
+                del approved[approved_user_id]
+                changed = True
+        if changed:
+            self._save_json(path, approved)
+
     # ----- Approved users -----
 
     def is_approved(self, platform: str, user_id: str) -> bool:
@@ -357,7 +387,12 @@ class PairingStore:
             self._record_rate_limit(platform, rate_limit_id)
             return entry_id
 
-    def approve_entry(self, platform: str, entry_id: str) -> Optional[dict]:
+    def approve_entry(
+        self,
+        platform: str,
+        entry_id: str,
+        approval_scope: str = "topic",
+    ) -> Optional[dict]:
         """
         Approve a pending pairing entry by dashboard-visible entry_id.
 
@@ -377,7 +412,11 @@ class PairingStore:
 
             del pending[entry_id]
             self._save_json(self._pending_path(platform), pending)
-            return self._approve_pending_entry(platform, entry)
+            return self._approve_pending_entry(
+                platform,
+                entry,
+                approval_scope=approval_scope,
+            )
 
     def reject_entry(self, platform: str, entry_id: str) -> bool:
         """Remove one pending pairing entry without approving it."""
@@ -395,18 +434,30 @@ class PairingStore:
             self._save_json(self._pending_path(platform), pending)
             return True
 
-    def _approve_pending_entry(self, platform: str, entry: dict) -> dict:
+    def _approve_pending_entry(
+        self,
+        platform: str,
+        entry: dict,
+        approval_scope: str = "topic",
+    ) -> dict:
         """Approve a pending entry already removed from pending storage."""
         subject_type = str(entry.get("subject_type") or "user").strip().lower() or "user"
         user_id = entry.get("user_id", "")
         user_name = entry.get("user_name", "")
         extra = {"subject_type": subject_type}
         if subject_type == "chat":
+            chat_id = str(entry.get("chat_id") or "").strip()
+            thread_id = str(entry.get("thread_id") or "").strip()
+            if chat_id and self._normalize_chat_approval_scope(approval_scope) == "chat":
+                thread_id = ""
+                user_id = self._chat_approval_id(chat_id)
+                self._remove_chat_topic_approvals(platform, chat_id)
+
             extra.update({
-                "chat_id": entry.get("chat_id", ""),
+                "chat_id": chat_id,
                 "chat_name": entry.get("chat_name", ""),
                 "chat_type": entry.get("chat_type", "group"),
-                "thread_id": entry.get("thread_id", ""),
+                "thread_id": thread_id,
                 "requester_user_id": entry.get("requester_user_id", ""),
                 "requester_user_name": entry.get("requester_user_name", ""),
             })

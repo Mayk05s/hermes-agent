@@ -159,7 +159,105 @@ caption
         tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
         assert tags == ["MEDIA:/tmp/voice.ogg"]
         assert voice is True
-    
+
+    def test_gateway_auto_append_recovers_omitted_generated_image(self):
+        """A successful image tool result is delivered even if the model forgets it."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        image_path = "/tmp/generated-card.png"
+        messages = [
+            {"role": "user", "content": "Make a card"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_image", "function": {"name": "image_generate"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_image",
+                "content": (
+                    '{"success": true, "image": '
+                    f'"{image_path}", "model": "gpt-image-2-medium"}}'
+                ),
+            },
+            {"role": "assistant", "content": "Готово."},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(
+            messages,
+            history_offset=0,
+            final_response="Готово.",
+        )
+
+        assert tags == [f"MEDIA:{image_path}"]
+        assert voice is False
+
+    def test_gateway_auto_append_does_not_duplicate_referenced_image(self):
+        """An image already present as markdown must not be attached twice."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        image_path = "/tmp/generated-card.png"
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_image", "function": {"name": "image_generate"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_image",
+                "content": f'{{"success": true, "image": "{image_path}"}}',
+            },
+        ]
+
+        tags, _ = _collect_auto_append_media_tags(
+            messages,
+            final_response=f"![Карточка]({image_path})",
+        )
+
+        assert tags == []
+
+    def test_gateway_auto_append_keeps_only_latest_image_retry_batch(self):
+        """Sequential generations are retries; only the final batch is recovered."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "first", "function": {"name": "image_generate"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "first",
+                "content": '{"success": true, "image": "/tmp/first.png"}',
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "second", "function": {"name": "image_generate"}},
+                    {"id": "third", "function": {"name": "image_generate"}},
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "second",
+                "content": '{"success": true, "image": "/tmp/second.png"}',
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "third",
+                "content": '{"success": true, "image": "/tmp/third.png"}',
+            },
+        ]
+
+        tags, _ = _collect_auto_append_media_tags(messages)
+
+        assert tags == ["MEDIA:/tmp/second.png", "MEDIA:/tmp/third.png"]
+
     def test_media_tags_not_extracted_from_history(self):
         """MEDIA tags from previous turns should NOT be extracted again."""
         # Simulate conversation history with a TTS call from a previous turn

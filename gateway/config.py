@@ -293,10 +293,9 @@ class PlatformConfig:
 
     # Whether the gateway is allowed to send "♻️ Gateway online" /
     # "♻ Gateway restarted" lifecycle notifications on this platform.
-    # Default True preserves prior behavior. Set False on platforms used
-    # by end users (e.g. Slack) where operator-flavored restart pings are
-    # noise; keep True for back-channels where the operator wants them.
-    gateway_restart_notification: bool = True
+    # Lifecycle notifications are opt-in. Operator-flavoured gateway messages
+    # must not appear in user chats merely because a config key was omitted.
+    gateway_restart_notification: bool = False
 
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -336,7 +335,7 @@ class PlatformConfig:
             api_key=data.get("api_key"),
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
-            gateway_restart_notification=_coerce_bool(_grn, True),
+            gateway_restart_notification=_coerce_bool(_grn, False),
             extra=data.get("extra", {}),
         )
 
@@ -873,6 +872,18 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
+                if plat == Platform.TELEGRAM:
+                    for _trigger_key in (
+                        "voice_trigger_keywords",
+                        "transcription_trigger_keywords",
+                        "trigger_keywords",
+                        "voice_trigger_aliases",
+                        "transcription_trigger_aliases",
+                        "trigger_aliases",
+                        "trigger_keyword_aliases",
+                    ):
+                        if _trigger_key in platform_cfg:
+                            bridged[_trigger_key] = platform_cfg[_trigger_key]
                 if "exclusive_bot_mentions" in platform_cfg:
                     bridged["exclusive_bot_mentions"] = platform_cfg["exclusive_bot_mentions"]
                 if plat == Platform.TELEGRAM and "observe_unmentioned_group_messages" in platform_cfg:
@@ -1057,6 +1068,15 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
                 if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
+                _telegram_reaction_env = {
+                    "reaction_in_progress": "TELEGRAM_REACTION_IN_PROGRESS",
+                    "reaction_success": "TELEGRAM_REACTION_SUCCESS",
+                    "reaction_failure": "TELEGRAM_REACTION_FAILURE",
+                    "reaction_cancelled": "TELEGRAM_REACTION_CANCELLED",
+                }
+                for _cfg_key, _env_key in _telegram_reaction_env.items():
+                    if _cfg_key in telegram_cfg and not os.getenv(_env_key):
+                        os.environ[_env_key] = str(telegram_cfg[_cfg_key]).strip()
                 if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
                     os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
                 # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode

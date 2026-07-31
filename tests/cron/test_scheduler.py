@@ -501,8 +501,8 @@ class TestDeliverResultWrapping:
         )
         return media_file.resolve()
 
-    def test_delivery_wraps_content_with_header_and_footer(self):
-        """Delivered content should include task name header and agent-invisible note."""
+    def test_delivery_sends_clean_content_without_scheduler_metadata(self):
+        """Recipients receive only the intended scheduled result."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -522,14 +522,10 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
-        assert "-------------" in sent_content
-        assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
+        assert sent_content == "Here is today's summary."
 
-    def test_delivery_uses_job_id_when_no_name(self):
-        """When a job has no name, the wrapper should fall back to job id."""
+    def test_delivery_never_exposes_job_id_when_no_name(self):
+        """A missing display name must not expose the internal job id."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -547,7 +543,7 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Output.")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert sent_content == "Output."
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
@@ -657,8 +653,9 @@ class TestDeliverResultWrapping:
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
 
-    def test_live_adapter_routes_image_to_send_image_file(self, tmp_path, monkeypatch):
-        """Image MEDIA files should be routed to send_image_file, not send_voice."""
+    def test_live_adapter_routes_single_image_with_caption(self, tmp_path, monkeypatch):
+        """Single image MEDIA deliveries should use a native caption instead of a
+        separate text bubble."""
         from gateway.config import Platform
         from concurrent.futures import Future
         media_path = self._safe_media_path(tmp_path, monkeypatch, "chart.png")
@@ -699,6 +696,58 @@ class TestDeliverResultWrapping:
 
         adapter.send_image_file.assert_called_once()
         assert adapter.send_image_file.call_args[1]["image_path"] == str(media_path)
+        assert adapter.send_image_file.call_args[1]["caption"] == "Chart attached"
+        adapter.send.assert_not_called()
+        adapter.send_voice.assert_not_called()
+
+    def test_live_adapter_routes_multiple_images_with_first_caption(self, tmp_path, monkeypatch):
+        """Multiple image MEDIA deliveries keep the text as the first image caption."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+        first_path = self._safe_media_path(tmp_path, monkeypatch, "first.png")
+        second_path = self._safe_media_path(tmp_path, monkeypatch, "second.jpg")
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_image_file.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        job = {
+            "id": "multi-img-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "1234"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(
+                job,
+                f"Caption text\nMEDIA:{first_path}\nMEDIA:{second_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert adapter.send_image_file.call_count == 2
+        calls = adapter.send_image_file.call_args_list
+        assert calls[0][1]["image_path"] == str(first_path)
+        assert calls[0][1]["caption"] == "Caption text"
+        assert calls[1][1]["image_path"] == str(second_path)
+        assert calls[1][1]["caption"] is None
+        adapter.send.assert_not_called()
         adapter.send_voice.assert_not_called()
 
     def test_live_adapter_media_only_no_text(self, tmp_path, monkeypatch):
@@ -1862,8 +1911,8 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
-    def test_failed_job_always_delivers(self):
-        """Failed jobs deliver regardless of [SILENT] in output."""
+    def test_failed_job_is_delivered_to_recipient(self):
+        """A failed scheduled task must not fail silently for its recipient."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -1872,6 +1921,9 @@ class TestSilentDelivery:
             from cron.scheduler import tick
             tick(verbose=False)
         deliver_mock.assert_called_once()
+        _job, message = deliver_mock.call_args.args[:2]
+        assert "monitor-job" in message
+        assert "some error" in message
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \

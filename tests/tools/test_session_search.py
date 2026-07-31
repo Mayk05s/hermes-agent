@@ -13,17 +13,30 @@ import time
 import pytest
 
 from hermes_state import SessionDB
+import tools.recall_access_tool as recall_access_mod
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
     _format_timestamp,
     session_search,
 )
+from tools.recall_access_tool import (
+    _RUNTIME_GRANTS,
+    recall_access_tool,
+    resolve_recall_target,
+)
 
 
 @pytest.fixture
 def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
+
+
+@pytest.fixture(autouse=True)
+def clear_recall_access_runtime_grants():
+    _RUNTIME_GRANTS.clear()
+    yield
+    _RUNTIME_GRANTS.clear()
 
 
 def _seed_modpack_sessions(db):
@@ -56,6 +69,55 @@ def _seed_modpack_sessions(db):
     db.append_message("s_newest", role="assistant", content="Investigating elite mob gating in the modpack KubeJS.")
     db.append_message("s_newest", role="assistant", content="Shipped commit b850442. Modpack alternator nerfed too.")
     db._conn.commit()
+
+
+def _telegram_scope(
+    chat_id="-1003735932411",
+    thread_id="6827",
+    profile_name="default",
+    scope_name="default",
+    memory_scope=None,
+    topic_isolation=True,
+):
+    origin = {
+        "platform": "telegram",
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "chat_type": "group",
+        "profile_name": profile_name,
+        "scope_name": scope_name,
+        "memory_scope": memory_scope or scope_name,
+    }
+    if topic_isolation:
+        origin["topic_isolation"] = True
+    return json.dumps(
+        {
+            "session_key": f"agent:main:telegram:group:{chat_id}:{thread_id}",
+            "origin": origin,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _set_gateway_topic(
+    monkeypatch,
+    chat_id="-1003735932411",
+    thread_id="6827",
+    profile_name="default",
+    scope_name="default",
+    memory_scope=None,
+    topic_isolation=True,
+):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", chat_id)
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", thread_id)
+    monkeypatch.setenv("HERMES_SESSION_KEY", f"agent:main:telegram:group:{chat_id}:{thread_id}")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "msg-1")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE_NAME", profile_name)
+    monkeypatch.setenv("HERMES_SESSION_SCOPE_NAME", scope_name)
+    monkeypatch.setenv("HERMES_SESSION_MEMORY_SCOPE", memory_scope or scope_name)
+    monkeypatch.setenv("HERMES_SESSION_TOPIC_ISOLATION", "true" if topic_isolation else "false")
 
 
 # =========================================================================
@@ -141,6 +203,22 @@ class TestBrowseShape:
         titles = [r.get("title") for r in result["results"]]
         assert any("Modpack" in (t or "") for t in titles)
 
+    def test_gateway_browse_is_limited_to_current_topic(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())
+        db.append_message("boxmap", role="user", content="boxmap topic status")
+        db.create_session(
+            "other-topic",
+            source="telegram",
+            access_scope=_telegram_scope(thread_id="321"),
+        )
+        db.append_message("other-topic", role="user", content="health topic status")
+
+        result = json.loads(session_search(db=db))
+        sids = [r["session_id"] for r in result["results"]]
+        assert "boxmap" in sids
+        assert "other-topic" not in sids
+
 
 # =========================================================================
 # Discovery shape (with query)
@@ -203,6 +281,450 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+    def test_gateway_discovery_is_limited_to_current_topic(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())
+        db.append_message("boxmap", role="user", content="sharedtoken boxmap funding issue")
+        db.create_session(
+            "homeassistant",
+            source="telegram",
+            access_scope=_telegram_scope(thread_id="2"),
+        )
+        db.append_message("homeassistant", role="user", content="sharedtoken home assistant map issue")
+        db.create_session(
+            "other-chat",
+            source="telegram",
+            access_scope=_telegram_scope(chat_id="-1003966683704", thread_id="359"),
+        )
+        db.append_message("other-chat", role="user", content="sharedtoken family issue")
+
+        result = json.loads(session_search(query="sharedtoken", limit=10, db=db))
+        assert result["success"] is True
+        assert [r["session_id"] for r in result["results"]] == ["boxmap"]
+
+    def test_gateway_discovery_uses_profile_scope_when_topic_isolation_is_off(self, db, monkeypatch):
+        _set_gateway_topic(
+            monkeypatch,
+            profile_name="family-chat",
+            scope_name="default",
+            memory_scope="default",
+            topic_isolation=False,
+        )
+        db.create_session(
+            "family-topic-a",
+            source="telegram",
+            access_scope=_telegram_scope(
+                profile_name="family-chat",
+                scope_name="default",
+                memory_scope="default",
+                topic_isolation=False,
+            ),
+        )
+        db.append_message("family-topic-a", role="user", content="profiletoken topic a")
+        db.create_session(
+            "family-topic-b",
+            source="telegram",
+            access_scope=_telegram_scope(
+                thread_id="313",
+                profile_name="family-chat",
+                scope_name="default",
+                memory_scope="default",
+                topic_isolation=False,
+            ),
+        )
+        db.append_message("family-topic-b", role="user", content="profiletoken topic b")
+        db.create_session(
+            "other-profile",
+            source="telegram",
+            access_scope=_telegram_scope(
+                thread_id="777",
+                profile_name="work",
+                scope_name="default",
+                memory_scope="default",
+                topic_isolation=False,
+            ),
+        )
+        db.append_message("other-profile", role="user", content="profiletoken other profile")
+        db.create_session(
+            "other-memory",
+            source="telegram",
+            access_scope=_telegram_scope(
+                thread_id="888",
+                profile_name="family-chat",
+                scope_name="health",
+                memory_scope="health",
+                topic_isolation=True,
+            ),
+        )
+        db.append_message("other-memory", role="user", content="profiletoken other memory")
+
+        result = json.loads(session_search(query="profiletoken", limit=10, db=db))
+        assert result["success"] is True
+        assert {r["session_id"] for r in result["results"]} == {"family-topic-a", "family-topic-b"}
+
+    def test_gateway_discovery_allows_child_sessions_from_current_topic(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        db.create_session("boxmap-root", source="telegram", access_scope=_telegram_scope())
+        db.create_session(
+            "boxmap-child",
+            source="telegram",
+            parent_session_id="boxmap-root",
+        )
+        db.append_message("boxmap-child", role="user", content="childscope boxmap continuation issue")
+        db.create_session(
+            "other-child-root",
+            source="telegram",
+            access_scope=_telegram_scope(thread_id="321"),
+        )
+        db.create_session(
+            "other-child",
+            source="telegram",
+            parent_session_id="other-child-root",
+        )
+        db.append_message("other-child", role="user", content="childscope health continuation issue")
+
+        result = json.loads(session_search(query="childscope", limit=10, db=db))
+        assert result["success"] is True
+        assert [r["session_id"] for r in result["results"]] == ["boxmap-child"]
+
+    def test_recall_access_one_turn_adds_other_topic_then_expires(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())
+        db.append_message("boxmap", role="user", content="granttoken boxmap issue")
+        db.create_session(
+            "planning",
+            source="telegram",
+            access_scope=_telegram_scope(thread_id="313"),
+        )
+        db.append_message("planning", role="user", content="granttoken planning decision")
+
+        before = json.loads(session_search(query="granttoken", limit=10, db=db))
+        assert {r["session_id"] for r in before["results"]} == {"boxmap"}
+
+        grant = json.loads(recall_access_tool(
+            reason="Need planning context for this answer",
+            chat_id="-1003735932411",
+            thread_id="313",
+            callback=lambda _question, _choices: "Grant once",
+        ))
+        assert grant["success"] is True
+        assert grant["granted"] is True
+        assert grant["duration"] == "one_turn"
+
+        during = json.loads(session_search(query="granttoken", limit=10, db=db))
+        assert {r["session_id"] for r in during["results"]} == {"boxmap", "planning"}
+        assert during["access_scope"]["grants"][0]["thread_id"] == "313"
+
+        monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "msg-2")
+        after = json.loads(session_search(query="granttoken", limit=10, db=db))
+        assert {r["session_id"] for r in after["results"]} == {"boxmap"}
+
+    def test_recall_access_session_grant_survives_next_message(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())
+        db.append_message("boxmap", role="user", content="sessiongrant boxmap issue")
+        db.create_session(
+            "planning",
+            source="telegram",
+            access_scope=_telegram_scope(thread_id="313"),
+        )
+        db.append_message("planning", role="user", content="sessiongrant planning decision")
+
+        grant = json.loads(recall_access_tool(
+            reason="Need planning context for this session",
+            chat_id="-1003735932411",
+            thread_id="313",
+            callback=lambda _question, _choices: "Grant for session",
+        ))
+        assert grant["duration"] == "session"
+
+        monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "msg-2")
+        result = json.loads(session_search(query="sessiongrant", limit=10, db=db))
+        assert {r["session_id"] for r in result["results"]} == {"boxmap", "planning"}
+
+    def test_recall_access_can_search_all_sibling_topics_after_confirmation(self, db, monkeypatch):
+        _set_gateway_topic(
+            monkeypatch,
+            chat_id="-1003966683704",
+            thread_id="576",
+            profile_name="family-chat",
+        )
+        db.create_session(
+            "current-family-topic",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="-1003966683704",
+                thread_id="576",
+                profile_name="family-chat",
+            ),
+        )
+        db.append_message("current-family-topic", role="user", content="suitcaselink current")
+        db.create_session(
+            "sibling-family-topic",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="-1003966683704",
+                thread_id="359",
+                profile_name="family-chat",
+            ),
+        )
+        db.append_message(
+            "sibling-family-topic",
+            role="user",
+            content="suitcaselink https://example.test/suitcase",
+        )
+        db.create_session(
+            "same-chat-other-profile",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="-1003966683704",
+                thread_id="999",
+                profile_name="private-work",
+            ),
+        )
+        db.append_message("same-chat-other-profile", role="user", content="suitcaselink private")
+        db.create_session(
+            "other-family-chat",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="-5274164515",
+                thread_id="77",
+                profile_name="family-chat",
+            ),
+        )
+        db.append_message("other-family-chat", role="user", content="suitcaselink dm")
+
+        before = json.loads(session_search(query="suitcaselink", limit=10, db=db))
+        assert {r["session_id"] for r in before["results"]} == {"current-family-topic"}
+
+        seen = {}
+
+        def approve(question, choices):
+            seen["question"] = question
+            seen["choices"] = choices
+            return choices[0]
+
+        grant = json.loads(recall_access_tool(
+            target="other_topics",
+            reason="Найти ранее присланную ссылку на чемодан",
+            duration="one_turn",
+            callback=approve,
+        ))
+
+        assert grant["success"] is True
+        assert grant["granted"] is True
+        assert grant["target"]["mode"] == "chat"
+        assert grant["target"]["profile_name"] == "family-chat"
+        assert "других топиках" in seen["question"]
+        assert seen["choices"] == [
+            "Искать один раз",
+            "На эту сессию",
+            "Разрешать всегда",
+            "Не искать",
+        ]
+
+        after = json.loads(session_search(query="suitcaselink", limit=10, db=db))
+        assert {r["session_id"] for r in after["results"]} == {
+            "current-family-topic",
+            "sibling-family-topic",
+        }
+        assert after["access_scope"]["grants"][0]["mode"] == "chat"
+
+    def test_recall_access_denial_does_not_expand_scope(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())
+        db.append_message("boxmap", role="user", content="denytoken boxmap issue")
+        db.create_session(
+            "planning",
+            source="telegram",
+            access_scope=_telegram_scope(thread_id="313"),
+        )
+        db.append_message("planning", role="user", content="denytoken planning decision")
+
+        grant = json.loads(recall_access_tool(
+            reason="Need planning context",
+            chat_id="-1003735932411",
+            thread_id="313",
+            callback=lambda _question, _choices: "Deny",
+        ))
+        assert grant["success"] is True
+        assert grant["granted"] is False
+
+        result = json.loads(session_search(query="denytoken", limit=10, db=db))
+        assert {r["session_id"] for r in result["results"]} == {"boxmap"}
+
+    def test_recall_access_resolves_transliterated_topic_name_in_current_chat(self, monkeypatch):
+        _set_gateway_topic(
+            monkeypatch,
+            chat_id="-1003938895426",
+            thread_id="35",
+            profile_name="boxmap",
+        )
+        monkeypatch.setattr(
+            recall_access_mod,
+            "_load_active_config",
+            lambda: ({
+                "telegram": {
+                    "extra": {
+                        "group_topics": [{
+                            "chat_id": -1003938895426,
+                            "topics": [{
+                                "name": "Instagram/TikTok",
+                                "thread_id": 2,
+                                "aliases": ["инстагра/тик ток"],
+                            }],
+                        }],
+                    },
+                },
+            }, None),
+        )
+
+        target = resolve_recall_target("инстагра/тик ток")
+
+        assert target["platform"] == "telegram"
+        assert target["chat_id"] == "-1003938895426"
+        assert target["thread_id"] == "2"
+        assert target["label"] == "Instagram/TikTok"
+
+    def test_explicit_same_chat_transfer_is_approval_and_does_not_prompt(self, db, monkeypatch):
+        _set_gateway_topic(
+            monkeypatch,
+            chat_id="-1003938895426",
+            thread_id="35",
+            profile_name="boxmap",
+        )
+        monkeypatch.setattr(
+            recall_access_mod,
+            "_load_active_config",
+            lambda: ({
+                "telegram": {
+                    "extra": {
+                        "group_topics": [{
+                            "chat_id": -1003938895426,
+                            "topics": [{
+                                "name": "Instagram/TikTok",
+                                "thread_id": 2,
+                                "aliases": ["инстагра/тик ток"],
+                            }],
+                        }],
+                    },
+                },
+            }, None),
+        )
+        db.create_session(
+            "current-topic",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="-1003938895426",
+                thread_id="35",
+                profile_name="boxmap",
+            ),
+        )
+        db.append_message("current-topic", role="user", content="importtoken current topic")
+        db.create_session(
+            "instagram-topic",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="-1003938895426",
+                thread_id="2",
+                profile_name="boxmap",
+            ),
+        )
+        db.append_message("instagram-topic", role="user", content="importtoken source dialogue")
+
+        def unexpected_prompt(_question, _choices):
+            raise AssertionError("explicit transfer request must not prompt again")
+
+        grant = json.loads(recall_access_tool(
+            target="инстагра/тик ток",
+            reason="Перенести контекст в текущий топик",
+            duration="session",
+            callback=unexpected_prompt,
+            user_request="Весь диалог с топика инстагра/тик ток перенеси сюда",
+        ))
+
+        assert grant["success"] is True
+        assert grant["granted"] is True
+        assert grant["duration"] == "session"
+        assert grant["approval"] == "explicit_current_user_request"
+        assert grant["target"]["thread_id"] == "2"
+
+        result = json.loads(session_search(query="importtoken", limit=10, db=db))
+        assert {r["session_id"] for r in result["results"]} == {
+            "current-topic",
+            "instagram-topic",
+        }
+
+    def test_explicit_ids_restore_topic_alias_and_do_not_prompt(self, monkeypatch):
+        _set_gateway_topic(
+            monkeypatch,
+            chat_id="-1003938895426",
+            thread_id="35",
+            profile_name="boxmap",
+        )
+        monkeypatch.setattr(
+            recall_access_mod,
+            "_load_active_config",
+            lambda: ({
+                "telegram": {
+                    "extra": {
+                        "group_topics": [{
+                            "chat_id": -1003938895426,
+                            "topics": [{
+                                "name": "Instagram/TikTok",
+                                "thread_id": 2,
+                                "aliases": ["instagram", "tiktok", "инстагра/тик ток"],
+                            }],
+                        }],
+                    },
+                },
+            }, None),
+        )
+
+        def unexpected_prompt(_question, _choices):
+            raise AssertionError("explicit same-chat transfer must not prompt again")
+
+        grant = json.loads(recall_access_tool(
+            reason=(
+                "Михаил прямо попросил перенести в текущий BoxMap Product-топик "
+                "контекст из темы Instagram/TikTok."
+            ),
+            duration="one_turn",
+            platform="telegram",
+            chat_id="-1003938895426",
+            thread_id="2",
+            callback=unexpected_prompt,
+            user_request=(
+                "[Mikhail|179555559]\n"
+                "@TripiooBot перенеси контекст из Instagram/TikTok"
+            ),
+        ))
+
+        assert grant["success"] is True
+        assert grant["granted"] is True
+        assert grant["approval"] == "explicit_current_user_request"
+        assert grant["target"] == {
+            "platform": "telegram",
+            "chat_id": "-1003938895426",
+            "thread_id": "2",
+            "label": "Instagram/TikTok",
+        }
+
+    def test_explicit_wording_never_auto_approves_a_different_chat(self, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+
+        grant = json.loads(recall_access_tool(
+            reason="Need context from another chat",
+            duration="session",
+            chat_id="-1003966683704",
+            thread_id="359",
+            callback=lambda _question, _choices: "Deny",
+            user_request="Перенеси сюда весь диалог из семейного чата",
+        ))
+
+        assert grant["success"] is True
+        assert grant["granted"] is False
 
 
 class TestDiscoverySort:
@@ -346,6 +868,21 @@ class TestScrollShape:
             session_id="s_oldest", around_message_id="not-an-int", db=db
         ))
         assert result["success"] is False
+
+    def test_gateway_scroll_rejects_other_topic(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        db.create_session(
+            "health",
+            source="telegram",
+            access_scope=_telegram_scope(thread_id="321"),
+        )
+        mid = db.append_message("health", role="user", content="private health issue")
+
+        result = json.loads(session_search(
+            session_id="health", around_message_id=mid, db=db
+        ))
+        assert result["success"] is False
+        assert "access scope" in result.get("error", "")
 
 
 class TestScrollPattern:

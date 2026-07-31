@@ -46,11 +46,23 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             side_effect=_mock_resolve,
         ):
-            from gateway.run import _resolve_runtime_agent_kwargs
+            from gateway.run import (
+                _consume_runtime_fallback_activation,
+                _resolve_runtime_agent_kwargs,
+            )
             result = _resolve_runtime_agent_kwargs()
+            fallback_event = _consume_runtime_fallback_activation()
 
         assert result["provider"] == "openrouter"
         assert result["api_key"] == "fallback-key"
+        assert fallback_event == {
+            "primary_model": "",
+            "primary_provider": "openai-codex",
+            "fallback_model": "meta-llama/llama-4-maverick",
+            "fallback_provider": "openrouter",
+            "reason": "auth",
+            "detail": "Codex token refresh failed with status 401",
+        }
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 

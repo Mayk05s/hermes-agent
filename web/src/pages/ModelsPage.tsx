@@ -1,23 +1,29 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  ArrowDown,
+  ArrowUp,
   Brain,
   ChevronDown,
   Cpu,
   DollarSign,
   Eye,
   KeyRound,
+  Plus,
   RefreshCw,
   Settings2,
   Star,
+  Trash2,
   Wrench,
   X,
   Zap,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
+  AuxiliaryFallbackEntry,
   AuxiliaryModelsResponse,
   AuxiliaryTaskAssignment,
+  ModelPricingInfo,
   ModelsAnalyticsModelEntry,
   ModelsAnalyticsResponse,
 } from "@/lib/api";
@@ -53,6 +59,8 @@ const AUX_TASKS: readonly { key: string; label: string; hint: string }[] = [
   { key: "triage_specifier", label: "Triage Specifier", hint: "Kanban spec fleshing" },
   { key: "kanban_decomposer", label: "Kanban Decomposer", hint: "Task decomposition" },
   { key: "profile_describer", label: "Profile Describer", hint: "Auto profile descriptions" },
+  { key: "mempalace_extractor", label: "MemPalace Extractor", hint: "Graph memory extraction" },
+  { key: "mempalace_validator", label: "MemPalace Validator", hint: "Graph validation and cleanup" },
   { key: "curator", label: "Curator", hint: "Skill-usage review" },
 ] as const;
 
@@ -483,7 +491,30 @@ function ModelCard({
 
 type PickerTarget =
   | { kind: "main" }
-  | { kind: "aux"; task: string };
+  | { kind: "aux"; task: string }
+  | { kind: "fallback"; task: string };
+
+function pricingLabel(pricing?: ModelPricingInfo): string {
+  if (!pricing) return "price unknown";
+  if (pricing.label) return pricing.label;
+  if (pricing.included) return "included";
+  if (pricing.free) return "free";
+  if (pricing.input || pricing.output) {
+    return `${pricing.input || "?"} in / ${pricing.output || "?"} out`;
+  }
+  return "price unknown";
+}
+
+function modelRouteLabel(entry: {
+  provider?: string;
+  model?: string;
+  pricing?: ModelPricingInfo;
+}): string {
+  const provider = entry.provider || "auto";
+  const model = entry.model || (provider === "auto" ? "main model" : "(provider default)");
+  const price = pricingLabel(entry.pricing);
+  return price ? `${provider} · ${model} · ${price}` : `${provider} · ${model}`;
+}
 
 function AuxiliaryTasksModal({
   aux,
@@ -498,6 +529,8 @@ function AuxiliaryTasksModal({
 }) {
   const [picker, setPicker] = useState<PickerTarget | null>(null);
   const [resetBusy, setResetBusy] = useState(false);
+  const [chainBusy, setChainBusy] = useState<string | null>(null);
+  const [chainError, setChainError] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const modalRef = useModalBehavior({ open: true, onClose });
 
@@ -515,6 +548,46 @@ function AuxiliaryTasksModal({
     } finally {
       setResetBusy(false);
     }
+  };
+
+  const saveFallbackChain = async (
+    task: string,
+    fallbackChain: AuxiliaryFallbackEntry[],
+  ) => {
+    setChainBusy(task);
+    setChainError(null);
+    try {
+      await api.setAuxiliaryFallbackChain({
+        task,
+        fallback_chain: fallbackChain,
+      });
+      onSaved();
+    } catch (e) {
+      setChainError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChainBusy(null);
+    }
+  };
+
+  const moveFallback = (
+    task: string,
+    chain: AuxiliaryFallbackEntry[],
+    index: number,
+    direction: -1 | 1,
+  ) => {
+    const target = index + direction;
+    if (target < 0 || target >= chain.length) return;
+    const next = [...chain];
+    [next[index], next[target]] = [next[target], next[index]];
+    void saveFallbackChain(task, next);
+  };
+
+  const removeFallback = (
+    task: string,
+    chain: AuxiliaryFallbackEntry[],
+    index: number,
+  ) => {
+    void saveFallbackChain(task, chain.filter((_, i) => i !== index));
   };
 
   return (
@@ -564,59 +637,151 @@ function AuxiliaryTasksModal({
           </p>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-5 space-y-1">
+        <div className="flex-1 overflow-y-auto p-5 space-y-2">
+          {chainError && (
+            <div className="border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {chainError}
+            </div>
+          )}
           {AUX_TASKS.map((t) => {
             const cur = aux?.tasks.find((a) => a.task === t.key);
             const isAuto =
               !cur || cur.provider === "auto" || !cur.provider;
+            const fallbackChain = cur?.fallback_chain ?? [];
+            const busy = chainBusy === t.key;
             return (
               <div
                 key={t.key}
-                className="flex items-center justify-between gap-3 px-3 py-2 border border-border/30 bg-card/50 hover:bg-muted/20 transition-colors"
+                className="border border-border/30 bg-card/50 px-3 py-2 transition-colors hover:bg-muted/20"
               >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2">
-                    <span className="text-xs font-medium">{t.label}</span>
-                    <span className="text-xs text-text-tertiary">
-                      {t.hint}
-                    </span>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-xs font-medium">{t.label}</span>
+                      <span className="text-xs text-text-tertiary">
+                        {t.hint}
+                      </span>
+                    </div>
+                    <div className="text-xs font-mono text-text-secondary truncate">
+                      {isAuto
+                        ? "auto (use main model)"
+                        : modelRouteLabel(cur ?? {})}
+                    </div>
                   </div>
-                  <div className="text-xs font-mono text-text-secondary truncate">
-                    {isAuto
-                      ? "auto (use main model)"
-                      : `${cur?.provider} · ${cur?.model || "(provider default)"}`}
-                  </div>
+                  <Button
+                    size="sm"
+                    outlined
+                    onClick={() => setPicker({ kind: "aux", task: t.key })}
+                    className="h-6 shrink-0 text-xs uppercase"
+                  >
+                    Change
+                  </Button>
                 </div>
-                <Button
-                  size="sm"
-                  outlined
-                  onClick={() => setPicker({ kind: "aux", task: t.key })}
-                  className="h-6 text-xs uppercase"
-                >
-                  Change
-                </Button>
+                <div className="mt-2 border-t border-border/30 pt-2">
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <span className="text-display text-xs font-medium tracking-wider text-text-tertiary">
+                      Fallback order
+                    </span>
+                    <Button
+                      size="sm"
+                      outlined
+                      onClick={() => setPicker({ kind: "fallback", task: t.key })}
+                      disabled={busy}
+                      className="h-6 text-xs uppercase"
+                      prefix={busy ? <Spinner /> : <Plus className="h-3 w-3" />}
+                    >
+                      Add
+                    </Button>
+                  </div>
+                  {fallbackChain.length === 0 ? (
+                    <div className="text-xs text-text-tertiary">
+                      no fallback models
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      {fallbackChain.map((entry, index) => (
+                        <div
+                          key={`${entry.provider}:${entry.model}:${index}`}
+                          className="flex min-w-0 items-center gap-2 border border-border/20 bg-background/30 px-2 py-1"
+                        >
+                          <span className="shrink-0 text-xs text-text-tertiary">
+                            {index + 1}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate text-xs font-mono text-text-secondary">
+                            {modelRouteLabel(entry)}
+                          </span>
+                          <Button
+                            ghost
+                            size="icon"
+                            title="Move fallback up"
+                            aria-label="Move fallback up"
+                            disabled={busy || index === 0}
+                            onClick={() => moveFallback(t.key, fallbackChain, index, -1)}
+                            className="h-6 w-6 shrink-0"
+                          >
+                            <ArrowUp className="h-3 w-3" />
+                          </Button>
+                          <Button
+                            ghost
+                            size="icon"
+                            title="Move fallback down"
+                            aria-label="Move fallback down"
+                            disabled={busy || index === fallbackChain.length - 1}
+                            onClick={() => moveFallback(t.key, fallbackChain, index, 1)}
+                            className="h-6 w-6 shrink-0"
+                          >
+                            <ArrowDown className="h-3 w-3" />
+                          </Button>
+                          <Button
+                            ghost
+                            size="icon"
+                            title="Remove fallback"
+                            aria-label="Remove fallback"
+                            disabled={busy}
+                            onClick={() => removeFallback(t.key, fallbackChain, index)}
+                            className="h-6 w-6 shrink-0 text-destructive"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             );
           })}
         </div>
 
-        {picker && picker.kind === "aux" && (
+        {picker && (picker.kind === "aux" || picker.kind === "fallback") && (
           <ModelPickerDialog
             key={`picker-${refreshKey}`}
             loader={api.getModelOptions}
             alwaysGlobal
-            title={`Set Auxiliary: ${
+            title={`${picker.kind === "fallback" ? "Add Fallback" : "Set Auxiliary"}: ${
               AUX_TASKS.find((t) => t.key === picker.task)?.label ??
               picker.task
             }`}
             onApply={async ({ provider, model }) => {
-              await api.setModelAssignment({
-                scope: "auxiliary",
-                task: picker.task,
-                provider,
-                model,
-              });
-              onSaved();
+              if (picker.kind === "fallback") {
+                const cur = aux?.tasks.find((a) => a.task === picker.task);
+                await api.setAuxiliaryFallbackChain({
+                  task: picker.task,
+                  fallback_chain: [
+                    ...(cur?.fallback_chain ?? []),
+                    { provider, model, base_url: "" },
+                  ],
+                });
+                onSaved();
+              } else {
+                await api.setModelAssignment({
+                  scope: "auxiliary",
+                  task: picker.task,
+                  provider,
+                  model,
+                });
+                onSaved();
+              }
             }}
             onClose={() => setPicker(null)}
           />
@@ -701,9 +866,7 @@ function ModelSettingsPanel({
               </span>
             </div>
             <div className="text-xs font-mono text-text-secondary truncate">
-              {mainProv || "(unset)"}
-              {mainProv && mainModel && " · "}
-              {mainModel || "(unset)"}
+              {modelRouteLabel(aux?.main ?? { provider: mainProv, model: mainModel })}
             </div>
           </div>
           <Button

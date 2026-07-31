@@ -927,6 +927,15 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
+    # The persisted system prompt is conditional on the live tool surface.
+    # Bind its DB signature only after availability checks have produced the
+    # exact callable names, so an old prompt cannot survive a connector fix.
+    from agent.system_prompt import bind_system_prompt_signature
+    agent._system_prompt_signature = bind_system_prompt_signature(
+        agent._system_prompt_signature,
+        agent.valid_tool_names,
+    )
+
     # Kanban worker/orchestrator lifecycle guidance is session-static:
     # the dispatcher decides at spawn time whether this process is a kanban
     # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).

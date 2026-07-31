@@ -266,6 +266,79 @@ def test_anthropic_pkce_branch_still_works():
     assert "claude.ai" in body["auth_url"]
 
 
+def test_oauth_catalog_surfaces_google_gemini_cli(monkeypatch):
+    """The dashboard OAuth card must list Gemini's OAuth provider."""
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "get_gemini_oauth_auth_status",
+        lambda: {
+            "logged_in": True,
+            "auth_file": "/tmp/hermes/auth/google_oauth.json",
+            "source": "google-oauth",
+            "api_key": "live-google-token",
+            "expires_at_ms": 1_775_640_710_946,
+            "email": "tek@nous.ai",
+            "project_id": "tek-proj",
+        },
+    )
+
+    resp = client.get("/api/providers/oauth", headers=HEADERS)
+
+    assert resp.status_code == 200, resp.text
+    providers = resp.json()["providers"]
+    gemini = next(p for p in providers if p["id"] == "google-gemini-cli")
+    assert gemini["name"] == "Google Gemini (OAuth)"
+    assert gemini["flow"] == "external"
+    assert gemini["cli_command"] == "hermes auth add google-gemini-cli"
+    assert gemini["status"]["logged_in"] is True
+    assert gemini["status"]["source_label"] == "tek@nous.ai"
+    assert gemini["status"]["token_preview"] == "…-token"
+    assert gemini["status"]["expires_at"].startswith("2026-04-08T")
+
+
+def test_oauth_catalog_refreshes_expired_google_gemini_cli(monkeypatch):
+    """Dashboard status should refresh Gemini OAuth before showing expired."""
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "get_gemini_oauth_auth_status",
+        lambda: {
+            "logged_in": True,
+            "auth_file": "/tmp/hermes/auth/google_oauth.json",
+            "source": "google-oauth",
+            "api_key": "expired-google-token",
+            "expires_at_ms": 1,
+            "email": "tek@nous.ai",
+        },
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "resolve_gemini_oauth_runtime_credentials",
+        lambda *, force_refresh=False: {
+            "provider": "google-gemini-cli",
+            "base_url": "cloudcode-pa://google",
+            "api_key": "fresh-google-token",
+            "source": "google-oauth",
+            "expires_at_ms": 1_775_640_710_946,
+            "auth_file": "/tmp/hermes/auth/google_oauth.json",
+            "email": "tek@nous.ai",
+            "project_id": "tek-proj",
+        },
+    )
+
+    resp = client.get("/api/providers/oauth", headers=HEADERS)
+
+    assert resp.status_code == 200, resp.text
+    providers = resp.json()["providers"]
+    gemini = next(p for p in providers if p["id"] == "google-gemini-cli")
+    assert gemini["status"]["logged_in"] is True
+    assert gemini["status"]["token_preview"] == "…-token"
+    assert gemini["status"]["expires_at"].startswith("2026-04-08T")
+
+
 def test_unknown_pkce_provider_rejected_cleanly():
     """A future PKCE provider without an explicit branch must NOT silently route to Anthropic.
 

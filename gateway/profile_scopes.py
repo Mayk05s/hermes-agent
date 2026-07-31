@@ -18,6 +18,7 @@ class ProfileScope:
     enabled: bool = True
     label: str = ""
     memory_scope: str = ""
+    topic_isolation: bool = False
     skill_sets: dict[str, Any] = field(default_factory=dict)
 
 
@@ -57,6 +58,19 @@ def _skill_sets(raw: Any) -> dict[str, Any]:
     return {"mode": mode or "allow", "names": names} if names else {}
 
 
+def _bool_value(raw: Any, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    normalized = _clean_text(raw).lower()
+    if normalized in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    return default
+
+
 def _scope_from_dict(raw: dict[str, Any], index: int) -> ProfileScope:
     platform = _clean_text(raw.get("platform")).lower()
     chat_id = _clean_text(raw.get("chat_id"))
@@ -77,6 +91,10 @@ def _scope_from_dict(raw: dict[str, Any], index: int) -> ProfileScope:
         scope=scope,
         label=_clean_text(raw.get("label")),
         memory_scope=memory_scope,
+        # Topic memory/recall is isolated unless the administrator opts out
+        # explicitly. Live execution sessions stay topic-local in both modes,
+        # which keeps sibling topics independently runnable.
+        topic_isolation=_bool_value(raw.get("topic_isolation"), default=True),
         skill_sets=_skill_sets(raw.get("skill_sets")),
     )
 
@@ -111,6 +129,7 @@ def profile_scopes_to_dict(config: ProfileScopeConfig) -> dict[str, Any]:
         }
         if scope.thread_id:
             item["thread_id"] = scope.thread_id
+        item["topic_isolation"] = scope.topic_isolation
         if scope.label:
             item["label"] = scope.label
         if scope.skill_sets:
@@ -130,16 +149,44 @@ def resolve_scope_for_source(config: ProfileScopeConfig, source: SessionSource) 
     thread_id = _clean_text(getattr(source, "thread_id", ""))
 
     chat_match = None
+    topic_match = None
     for scope in config.scopes:
         if not scope.enabled:
             continue
         if scope.platform != platform or scope.chat_id != chat_id:
             continue
-        if scope.thread_id and scope.thread_id == thread_id:
-            return scope
+        if scope.thread_id and scope.thread_id == thread_id and topic_match is None:
+            topic_match = scope
+            continue
         if not scope.thread_id:
             chat_match = scope
+    default_scope = config.default_scope or "default"
+    inherited_scope = chat_match or ProfileScope(
+        id="default",
+        scope=default_scope,
+        memory_scope=default_scope,
+        topic_isolation=True,
+    )
+    if topic_match is not None:
+        if topic_match.topic_isolation:
+            return topic_match
+        return ProfileScope(
+            id=topic_match.id,
+            enabled=topic_match.enabled,
+            platform=topic_match.platform,
+            chat_id=topic_match.chat_id,
+            thread_id=topic_match.thread_id,
+            scope=inherited_scope.scope,
+            label=topic_match.label,
+            memory_scope=inherited_scope.memory_scope or inherited_scope.scope,
+            topic_isolation=False,
+            skill_sets=topic_match.skill_sets,
+        )
     if chat_match is not None:
         return chat_match
-    default_scope = config.default_scope or "default"
-    return ProfileScope(id="default", scope=default_scope, memory_scope=default_scope)
+    return ProfileScope(
+        id="default",
+        scope=default_scope,
+        memory_scope=default_scope,
+        topic_isolation=True,
+    )

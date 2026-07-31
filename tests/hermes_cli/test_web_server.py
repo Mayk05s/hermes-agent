@@ -196,6 +196,91 @@ class TestWebServerEndpoints:
         assert captured["pricing"] is True
         assert resp.json()["providers"][0]["slug"] == "anthropic"
 
+    def test_get_auxiliary_models_includes_pricing_and_fallback_chain(self):
+        from hermes_cli.config import save_config
+
+        save_config(
+            {
+                "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+                "auxiliary": {
+                    "mempalace_extractor": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.4",
+                        "fallback_chain": [
+                            {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                            {"provider": "auto", "model": ""},
+                        ],
+                    }
+                },
+            }
+        )
+
+        resp = self.client.get("/api/model/auxiliary")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["main"]["pricing"]["label"] == "included"
+        task = next(item for item in data["tasks"] if item["task"] == "mempalace_extractor")
+        assert task["provider"] == "openai-codex"
+        assert task["model"] == "gpt-5.4"
+        assert task["pricing"]["label"] == "included"
+        assert [item["model"] for item in task["fallback_chain"]] == ["gpt-5.4-mini", ""]
+        assert task["fallback_chain"][0]["pricing"]["label"] == "included"
+        validator = next(item for item in data["tasks"] if item["task"] == "mempalace_validator")
+        assert validator["provider"] == "openai-codex"
+        assert validator["model"] == "gpt-5.5"
+        assert validator["pricing"]["label"] == "included"
+        assert [item["model"] for item in validator["fallback_chain"]] == ["gpt-5.4-mini", ""]
+
+    def test_set_auxiliary_fallback_chain_preserves_order(self):
+        from hermes_cli.config import load_config
+
+        resp = self.client.post(
+            "/api/model/auxiliary/fallback-chain",
+            json={
+                "task": "mempalace_extractor",
+                "fallback_chain": [
+                    {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+                    {"provider": "auto", "model": ""},
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert [item["provider"] for item in data["fallback_chain"]] == [
+            "openai-codex",
+            "groq",
+            "auto",
+        ]
+        cfg = load_config()
+        chain = cfg["auxiliary"]["mempalace_extractor"]["fallback_chain"]
+        assert chain == [
+            {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+            {"provider": "auto", "model": ""},
+        ]
+
+        validator_resp = self.client.post(
+            "/api/model/auxiliary/fallback-chain",
+            json={
+                "task": "mempalace_validator",
+                "fallback_chain": [
+                    {"provider": "openai-codex", "model": "gpt-5.4"},
+                    {"provider": "auto", "model": ""},
+                ],
+            },
+        )
+
+        assert validator_resp.status_code == 200
+        cfg = load_config()
+        assert cfg["auxiliary"]["mempalace_validator"]["fallback_chain"] == [
+            {"provider": "openai-codex", "model": "gpt-5.4"},
+            {"provider": "auto", "model": ""},
+        ]
+
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
 

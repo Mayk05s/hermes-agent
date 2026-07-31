@@ -106,6 +106,28 @@ class TestTelegramExecApproval:
         assert kwargs["reply_markup"] is not None  # InlineKeyboardMarkup
 
     @pytest.mark.asyncio
+    async def test_cross_chat_action_uses_action_specific_title(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 43
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        await adapter.send_exec_approval(
+            chat_id="-1003938895426",
+            command=(
+                "send_message cross-chat\n"
+                "from: telegram:-1003938895426\n"
+                "to: telegram:179555559"
+            ),
+            session_key="boxmap-shared-session",
+            description="Cross-chat message delivery requested by the user.",
+        )
+
+        text = adapter._bot.send_message.call_args.kwargs["text"]
+        assert "Cross-chat Send Approval Required" in text
+        assert "Command Approval Required" not in text
+
+    @pytest.mark.asyncio
     async def test_stores_approval_state(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()

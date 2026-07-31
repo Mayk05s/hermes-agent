@@ -35,8 +35,13 @@ import {
   Shield,
   FileOutput,
   RefreshCw,
+  Save,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, HERMES_BASE_PATH } from "@/lib/api";
+import type {
+  GeminiTtsVoiceInfo,
+  GeminiTtsVoicesResponse,
+} from "@/lib/api";
 import { getNestedValue, setNestedValue } from "@/lib/nested";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
@@ -48,6 +53,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/c
 import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Badge } from "@nous-research/ui/ui/components/badge";
+import { Label } from "@nous-research/ui/ui/components/label";
+import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
+import { Switch } from "@nous-research/ui/ui/components/switch";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
@@ -97,6 +105,54 @@ function CategoryIcon({
   return <Icon className={className ?? "h-4 w-4"} />;
 }
 
+type TtsDraft = {
+  provider: string;
+  voice: string;
+  model: string;
+  fallback_model: string;
+  style: string;
+};
+
+const TTS_PROVIDER_OPTIONS = [
+  "gemini",
+  "edge",
+  "elevenlabs",
+  "openai",
+  "xai",
+  "piper",
+  "neutts",
+];
+
+const DEFAULT_TTS_DRAFT: TtsDraft = {
+  provider: "gemini",
+  voice: "Enceladus",
+  model: "gemini-3.1-flash-tts-preview",
+  fallback_model: "gemini-2.5-flash-preview-tts",
+  style: "",
+};
+
+function draftFromGeminiInfo(info: GeminiTtsVoicesResponse): TtsDraft {
+  return {
+    provider: info.provider || "gemini",
+    voice: info.voice || info.reference?.voice || "Enceladus",
+    model: info.model || info.reference?.model || "gemini-3.1-flash-tts-preview",
+    fallback_model: info.fallback_model || "gemini-2.5-flash-preview-tts",
+    style: info.style || info.reference?.style || "",
+  };
+}
+
+function voiceSampleLabel(voice: GeminiTtsVoiceInfo): string {
+  const kind =
+    voice.sample_kind === "m"
+      ? "male"
+      : voice.sample_kind === "w"
+        ? "female"
+        : voice.sample_kind === "x"
+          ? "neutral"
+          : "";
+  return kind ? `${voice.name} (${kind})` : voice.name;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -120,6 +176,12 @@ export default function ConfigPage() {
   const [configPath, setConfigPath] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>("");
   const [confirmReset, setConfirmReset] = useState(false);
+  const [geminiTtsInfo, setGeminiTtsInfo] =
+    useState<GeminiTtsVoicesResponse | null>(null);
+  const [ttsDraft, setTtsDraft] = useState<TtsDraft>(DEFAULT_TTS_DRAFT);
+  const [ttsLoading, setTtsLoading] = useState(false);
+  const [ttsSaving, setTtsSaving] = useState(false);
+  const [ttsApplyProfiles, setTtsApplyProfiles] = useState(true);
   const { toast, showToast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { t } = useI18n();
@@ -181,6 +243,18 @@ export default function ConfigPage() {
       .getStatus()
       .then((resp) => setConfigPath(resp.config_path))
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    setTtsLoading(true);
+    api
+      .getGeminiTtsVoices()
+      .then((resp) => {
+        setGeminiTtsInfo(resp);
+        setTtsDraft(draftFromGeminiInfo(resp));
+      })
+      .catch(() => showToast("Failed to load Gemini voices", "error"))
+      .finally(() => setTtsLoading(false));
   }, []);
 
   // Set active category when categories load
@@ -267,6 +341,42 @@ export default function ConfigPage() {
       showToast(`${t.config.failedToSave}: ${e}`, "error");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleTtsPanelSave = async () => {
+    if (!config) return;
+    setTtsSaving(true);
+    try {
+      const resp = await api.saveGeminiTtsSettings({
+        provider: ttsDraft.provider,
+        voice: ttsDraft.voice,
+        model: ttsDraft.model,
+        fallback_model: ttsDraft.fallback_model,
+        style: ttsDraft.style,
+        apply_to_profiles: ttsApplyProfiles,
+      });
+      setGeminiTtsInfo(resp);
+      setTtsDraft(draftFromGeminiInfo(resp));
+
+      let next = setNestedValue(config, "tts.provider", resp.provider);
+      next = setNestedValue(next, "tts.gemini.voice", resp.voice);
+      next = setNestedValue(next, "tts.gemini.model", resp.model);
+      next = setNestedValue(next, "tts.gemini.fallback_model", resp.fallback_model);
+      next = setNestedValue(next, "tts.gemini.style", resp.style);
+      setConfig(next);
+
+      const updatedProfiles = resp.updated_profiles?.length ?? 0;
+      showToast(
+        updatedProfiles > 0
+          ? `TTS saved; updated ${updatedProfiles} profile override${updatedProfiles === 1 ? "" : "s"}`
+          : "TTS settings saved",
+        "success",
+      );
+    } catch (e) {
+      showToast(`Failed to save TTS settings: ${e}`, "error");
+    } finally {
+      setTtsSaving(false);
     }
   };
 
@@ -410,6 +520,21 @@ export default function ConfigPage() {
       );
     });
   };
+
+  const selectedGeminiVoice = geminiTtsInfo?.voices.find(
+    (voice) => voice.name === ttsDraft.voice,
+  );
+  const selectedSampleSrc = selectedGeminiVoice?.sample_url
+    ? `${HERMES_BASE_PATH}${selectedGeminiVoice.sample_url}`
+    : "";
+  const profileOverrideCount =
+    geminiTtsInfo?.profiles.filter((profile) => profile.has_gemini_override)
+      .length ?? 0;
+  const nanoclawVoice = geminiTtsInfo?.reference?.voice || "Enceladus";
+  const panelCanSave =
+    ttsDraft.provider.trim().length > 0 &&
+    (ttsDraft.provider !== "gemini" || ttsDraft.voice.trim().length > 0) &&
+    !ttsSaving;
 
   return (
     <div className="flex flex-col gap-4">
@@ -581,7 +706,185 @@ export default function ConfigPage() {
             </div>
           </aside>
 
-          <div className="flex-1 min-w-0">
+          <div className="flex flex-1 min-w-0 flex-col gap-4">
+            {!isSearching && activeCategory === "tts" && (
+              <Card>
+                <CardHeader className="py-3 px-4">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <CardTitle className="text-sm flex items-center gap-2">
+                      <Volume2 className="h-4 w-4" />
+                      Voice tuning
+                    </CardTitle>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <Badge tone="secondary" className="text-xs">
+                        NanoClaw: {nanoclawVoice}
+                      </Badge>
+                      <Badge tone="outline" className="text-xs">
+                        {profileOverrideCount} profile override
+                        {profileOverrideCount === 1 ? "" : "s"}
+                      </Badge>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="grid gap-4 px-4 pb-4">
+                  {ttsLoading ? (
+                    <div className="flex items-center justify-center py-8">
+                      <Spinner className="text-xl text-primary" />
+                    </div>
+                  ) : (
+                    <>
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                        <div className="grid min-w-0 gap-1.5">
+                          <Label htmlFor="tts-provider" className="text-xs">
+                            Provider
+                          </Label>
+                          <Select
+                            id="tts-provider"
+                            value={ttsDraft.provider}
+                            onValueChange={(value) =>
+                              setTtsDraft((draft) => ({
+                                ...draft,
+                                provider: value,
+                              }))
+                            }
+                          >
+                            {TTS_PROVIDER_OPTIONS.map((provider) => (
+                              <SelectOption key={provider} value={provider}>
+                                {provider}
+                              </SelectOption>
+                            ))}
+                          </Select>
+                        </div>
+
+                        <div className="grid min-w-0 gap-1.5">
+                          <Label htmlFor="tts-gemini-voice" className="text-xs">
+                            Gemini voice
+                          </Label>
+                          <Select
+                            id="tts-gemini-voice"
+                            disabled={ttsDraft.provider !== "gemini"}
+                            value={ttsDraft.voice}
+                            onValueChange={(value) =>
+                              setTtsDraft((draft) => ({
+                                ...draft,
+                                voice: value,
+                              }))
+                            }
+                          >
+                            {(geminiTtsInfo?.voices ?? []).map((voice) => (
+                              <SelectOption key={voice.name} value={voice.name}>
+                                {voiceSampleLabel(voice)}
+                              </SelectOption>
+                            ))}
+                          </Select>
+                        </div>
+
+                        <div className="grid min-w-0 gap-1.5">
+                          <Label htmlFor="tts-gemini-model" className="text-xs">
+                            Model
+                          </Label>
+                          <Input
+                            id="tts-gemini-model"
+                            value={ttsDraft.model}
+                            onChange={(e) =>
+                              setTtsDraft((draft) => ({
+                                ...draft,
+                                model: e.target.value,
+                              }))
+                            }
+                          />
+                        </div>
+
+                        <div className="grid min-w-0 gap-1.5">
+                          <Label
+                            htmlFor="tts-gemini-fallback-model"
+                            className="text-xs"
+                          >
+                            Fallback
+                          </Label>
+                          <Input
+                            id="tts-gemini-fallback-model"
+                            value={ttsDraft.fallback_model}
+                            onChange={(e) =>
+                              setTtsDraft((draft) => ({
+                                ...draft,
+                                fallback_model: e.target.value,
+                              }))
+                            }
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(280px,360px)]">
+                        <div className="grid min-w-0 gap-1.5">
+                          <Label htmlFor="tts-gemini-style" className="text-xs">
+                            Style
+                          </Label>
+                          <textarea
+                            id="tts-gemini-style"
+                            className="flex min-h-[116px] w-full border border-border bg-background/40 px-3 py-2 text-sm leading-relaxed placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30 focus-visible:border-foreground/25"
+                            value={ttsDraft.style}
+                            onChange={(e) =>
+                              setTtsDraft((draft) => ({
+                                ...draft,
+                                style: e.target.value,
+                              }))
+                            }
+                          />
+                        </div>
+
+                        <div className="grid min-w-0 content-start gap-3">
+                          <div className="grid min-w-0 gap-1.5">
+                            <Label className="text-xs">
+                              Sample
+                            </Label>
+                            {selectedSampleSrc ? (
+                              <audio
+                                key={selectedSampleSrc}
+                                controls
+                                className="h-9 w-full"
+                                src={selectedSampleSrc}
+                              />
+                            ) : (
+                              <div className="flex h-9 items-center border border-border px-3 text-xs text-muted-foreground">
+                                No local sample
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex items-center justify-between gap-3 border border-border bg-muted/20 px-3 py-2">
+                            <Label
+                              htmlFor="tts-apply-profiles"
+                              className="text-xs cursor-pointer"
+                            >
+                              Apply profile overrides
+                            </Label>
+                            <Switch
+                              id="tts-apply-profiles"
+                              checked={ttsApplyProfiles}
+                              onCheckedChange={setTtsApplyProfiles}
+                            />
+                          </div>
+
+                          <div className="flex justify-end">
+                            <Button
+                              size="sm"
+                              className="uppercase"
+                              onClick={handleTtsPanelSave}
+                              disabled={!panelCanSave}
+                              prefix={ttsSaving ? <Spinner /> : <Save />}
+                            >
+                              {ttsSaving ? t.common.saving : t.common.save}
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
             {isSearching ? (
               <Card>
                 <CardHeader className="py-3 px-4">

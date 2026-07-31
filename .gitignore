@@ -12,6 +12,7 @@ __pycache__/
 .env.production.local
 .env.development
 .env.test
+.secrets/
 .hermes-docker/
 .notebooklm-home/
 .notebooklm-cli-venv/

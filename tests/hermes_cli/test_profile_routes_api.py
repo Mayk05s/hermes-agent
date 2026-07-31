@@ -149,7 +149,7 @@ def test_profile_chat_settings_get_put(monkeypatch):
                     "platform": "telegram",
                     "chat_id": "-1001",
                     "response_mode": "mentions",
-                    "transcribe_audio": "off",
+                    "audio_trigger": "off",
                 }
             ]
         }
@@ -177,7 +177,7 @@ def test_profile_chat_settings_get_put(monkeypatch):
                     "platform": "telegram",
                     "chat_id": "-1002",
                     "response_mode": "all",
-                    "transcribe_audio": "on",
+                    "audio_trigger": "on",
                     "reply_to_mode": "off",
                     "label": "Ops",
                 }

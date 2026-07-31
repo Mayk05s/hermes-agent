@@ -52,7 +52,16 @@ _SESSION_PLATFORM: ContextVar = ContextVar("HERMES_SESSION_PLATFORM", default=_U
 _SESSION_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_CHAT_ID", default=_UNSET)
 _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=_UNSET)
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
+_SESSION_CHAT_TOPIC: ContextVar = ContextVar("HERMES_SESSION_CHAT_TOPIC", default=_UNSET)
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
+# Per-turn requester identity. Shared Telegram group sessions intentionally
+# clear SESSION_USER_ID so the transcript stays chat/topic-scoped, but
+# owner-only tools still need the gateway-attributed sender for the current
+# addressed message.
+_SESSION_REQUESTER_USER_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_REQUESTER_USER_ID",
+    default=_UNSET,
+)
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
@@ -68,6 +77,11 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 _SESSION_PROFILE_NAME: ContextVar = ContextVar("HERMES_SESSION_PROFILE_NAME", default=_UNSET)
 _SESSION_SCOPE_NAME: ContextVar = ContextVar("HERMES_SESSION_SCOPE_NAME", default=_UNSET)
 _SESSION_MEMORY_SCOPE: ContextVar = ContextVar("HERMES_SESSION_MEMORY_SCOPE", default=_UNSET)
+_SESSION_TOPIC_ISOLATION: ContextVar = ContextVar("HERMES_SESSION_TOPIC_ISOLATION", default=_UNSET)
+# Verbatim user-authored text that triggered the current agent turn.  Tools
+# use this as provenance for actions that must only happen on an explicit
+# request (for example, sending a message outside the originating chat).
+_SESSION_USER_REQUEST: ContextVar = ContextVar("HERMES_SESSION_USER_REQUEST", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -80,7 +94,9 @@ _VAR_MAP = {
     "HERMES_SESSION_CHAT_ID": _SESSION_CHAT_ID,
     "HERMES_SESSION_CHAT_NAME": _SESSION_CHAT_NAME,
     "HERMES_SESSION_THREAD_ID": _SESSION_THREAD_ID,
+    "HERMES_SESSION_CHAT_TOPIC": _SESSION_CHAT_TOPIC,
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
+    "HERMES_SESSION_REQUESTER_USER_ID": _SESSION_REQUESTER_USER_ID,
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
@@ -89,6 +105,8 @@ _VAR_MAP = {
     "HERMES_SESSION_PROFILE_NAME": _SESSION_PROFILE_NAME,
     "HERMES_SESSION_SCOPE_NAME": _SESSION_SCOPE_NAME,
     "HERMES_SESSION_MEMORY_SCOPE": _SESSION_MEMORY_SCOPE,
+    "HERMES_SESSION_TOPIC_ISOLATION": _SESSION_TOPIC_ISOLATION,
+    "HERMES_SESSION_USER_REQUEST": _SESSION_USER_REQUEST,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -115,7 +133,9 @@ def set_session_vars(
     chat_id: str = "",
     chat_name: str = "",
     thread_id: str = "",
+    chat_topic: str = "",
     user_id: str = "",
+    requester_user_id: str = "",
     user_name: str = "",
     session_key: str = "",
     message_id: str = "",
@@ -123,6 +143,8 @@ def set_session_vars(
     profile_name: str = "",
     scope_name: str = "",
     memory_scope: str = "",
+    topic_isolation: str = "",
+    user_request: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -137,7 +159,9 @@ def set_session_vars(
         _SESSION_CHAT_ID.set(chat_id),
         _SESSION_CHAT_NAME.set(chat_name),
         _SESSION_THREAD_ID.set(thread_id),
+        _SESSION_CHAT_TOPIC.set(chat_topic),
         _SESSION_USER_ID.set(user_id),
+        _SESSION_REQUESTER_USER_ID.set(requester_user_id),
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
         _SESSION_ALLOWED_SKILLS.set(allowed_skills),
@@ -145,6 +169,8 @@ def set_session_vars(
         _SESSION_PROFILE_NAME.set(profile_name),
         _SESSION_SCOPE_NAME.set(scope_name),
         _SESSION_MEMORY_SCOPE.set(memory_scope),
+        _SESSION_TOPIC_ISOLATION.set(topic_isolation),
+        _SESSION_USER_REQUEST.set(user_request),
     ]
     return tokens
 
@@ -165,7 +191,9 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_CHAT_ID,
         _SESSION_CHAT_NAME,
         _SESSION_THREAD_ID,
+        _SESSION_CHAT_TOPIC,
         _SESSION_USER_ID,
+        _SESSION_REQUESTER_USER_ID,
         _SESSION_USER_NAME,
         _SESSION_KEY,
         _SESSION_ALLOWED_SKILLS,
@@ -173,6 +201,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_PROFILE_NAME,
         _SESSION_SCOPE_NAME,
         _SESSION_MEMORY_SCOPE,
+        _SESSION_TOPIC_ISOLATION,
+        _SESSION_USER_REQUEST,
     ):
         var.set("")
 

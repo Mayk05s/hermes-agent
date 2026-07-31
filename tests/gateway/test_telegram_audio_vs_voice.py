@@ -86,14 +86,23 @@ def _audio_event(
 
 @pytest.mark.asyncio
 async def test_voice_message_still_transcribed():
-    """MessageType.VOICE must still be sent through _enrich_message_with_transcription."""
+    """A configured keyword hit transcribes VOICE before continuing to the AI."""
     runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_trigger": True,
+            "show_transcription": False,
+            "voice_trigger_keywords": ["tripio"],
+        },
+    )
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
     event = _voice_event("/tmp/voice.ogg")
 
     with patch(
         "tools.transcription_tools.transcribe_audio",
-        return_value={"success": True, "transcript": "hello world", "provider": "whisper"},
+        return_value={"success": True, "transcript": "Tripio hello world", "provider": "whisper"},
     ) as mock_transcribe:
         result = await runner._prepare_inbound_message_text(
             event=event,
@@ -102,7 +111,7 @@ async def test_voice_message_still_transcribed():
         )
 
     mock_transcribe.assert_called_once_with("/tmp/voice.ogg")
-    assert "hello world" in result
+    assert "Tripio hello world" in result
     assert "voice message" in result.lower()
 
 
@@ -114,6 +123,7 @@ async def test_telegram_voice_rule_transcript_only_posts_plain_text_and_preserve
         enabled=True,
         token="test",
         extra={
+            "audio_trigger": True,
             "audio_transcription_rules": [
                 {
                     "chat_id": -1003966683704,
@@ -198,6 +208,7 @@ async def test_telegram_voice_rule_keyword_runs_ai_with_decision_instruction():
         enabled=True,
         token="test",
         extra={
+            "audio_trigger": True,
             "audio_transcription_rules": [
                 {
                     "chat_id": "-1003966683704",
@@ -229,6 +240,120 @@ async def test_telegram_voice_rule_keyword_runs_ai_with_decision_instruction():
     assert "voice transcription rule matched" in result
     assert "decide whether to answer, take action, or stay silent" in result
     adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_passive_voice_can_show_transcript_without_audio_trigger():
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={"voice_trigger_keywords": ["tripioo"]},
+    )
+    runner._gateway_chat_settings_raw = lambda: {
+        "settings": [
+            {
+                "platform": "telegram",
+                "chat_id": "-200",
+                "audio_trigger": "off",
+                "show_transcription": "on",
+            }
+        ]
+    }
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-200", chat_type="group")
+    event.telegram_passive_audio_transcription = True
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "Tripioo напомни проверить", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=event.source, history=[])
+
+    assert result is None
+    adapter.send.assert_awaited_once_with(
+        "-200",
+        "Tripioo напомни проверить",
+        reply_to="321",
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_passive_voice_with_transcription_and_audio_trigger_stays_transcript_only_without_keyword():
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={"voice_trigger_keywords": ["tripioo"]},
+    )
+    runner._gateway_chat_settings_raw = lambda: {
+        "settings": [
+            {
+                "platform": "telegram",
+                "chat_id": "-200",
+                "audio_trigger": "on",
+                "show_transcription": "on",
+            }
+        ]
+    }
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-200", chat_type="group")
+    event.telegram_passive_audio_transcription = True
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "обсуждаем семейные планы", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=event.source, history=[])
+
+    assert result is None
+    adapter.send.assert_awaited_once_with(
+        "-200",
+        "обсуждаем семейные планы",
+        reply_to="321",
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_passive_voice_can_audio_trigger_without_showing_transcript():
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={"voice_trigger_keywords": ["tripioo"]},
+    )
+    runner._gateway_chat_settings_raw = lambda: {
+        "settings": [
+            {
+                "platform": "telegram",
+                "chat_id": "-200",
+                "audio_trigger": "on",
+                "show_transcription": "off",
+            }
+        ]
+    }
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-200", chat_type="group")
+    event.telegram_passive_audio_transcription = True
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "Tripioo напомни проверить", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=event.source, history=[])
+
+    assert result is not None
+    assert "Tripioo напомни проверить" in result
+    assert "voice transcription rule matched" in result
+    adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

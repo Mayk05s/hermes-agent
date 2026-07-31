@@ -1603,6 +1603,26 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
 
 
+def latest_user_task(messages: list | None) -> str:
+    """Return the newest real user message for explicit-write authorization."""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            return "\n".join(parts).strip()
+    return ""
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False) -> str:
@@ -1618,7 +1638,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
             )
         except Exception:
             pass
@@ -1683,6 +1706,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             choices=function_args.get("choices"),
             callback=agent.clarify_callback,
         )
+    elif function_name == "recall_access":
+        from tools.recall_access_tool import recall_access_tool as _recall_access_tool
+        return _recall_access_tool(
+            target=function_args.get("target", ""),
+            reason=function_args.get("reason", ""),
+            duration=function_args.get("duration", "one_turn"),
+            platform=function_args.get("platform", ""),
+            chat_id=function_args.get("chat_id", ""),
+            thread_id=function_args.get("thread_id", ""),
+            callback=agent.clarify_callback,
+            user_request=latest_user_task(messages),
+        )
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
     else:
@@ -1690,6 +1725,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             function_name, function_args, effective_task_id,
             tool_call_id=tool_call_id,
             session_id=agent.session_id or "",
+            user_task=latest_user_task(messages),
             enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
             skip_pre_tool_call_hook=True,
             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
@@ -1923,6 +1959,8 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     if source_msg.get("role") != "assistant":
         return
 
+    needs_thinking_pad = agent._needs_thinking_reasoning_pad()
+
     # 1. Explicit reasoning_content already set — preserve it verbatim
     # (includes DeepSeek/Kimi's own space-placeholder written at creation
     # time, and any valid reasoning content from the same provider).
@@ -1934,13 +1972,13 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     # doesn't 400 the user on the next turn.
     existing = source_msg.get("reasoning_content")
     if isinstance(existing, str):
-        if existing == "" and agent._needs_thinking_reasoning_pad():
+        if not needs_thinking_pad:
+            api_msg.pop("reasoning_content", None)
+        elif existing == "":
             api_msg["reasoning_content"] = " "
         else:
             api_msg["reasoning_content"] = existing
         return
-
-    needs_thinking_pad = agent._needs_thinking_reasoning_pad()
 
     # 2. Cross-provider poisoned history (#15748): on DeepSeek/Kimi,
     # if the source turn has tool_calls AND a 'reasoning' field but no
@@ -1964,11 +2002,11 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
         return
 
     # 3. Healthy session: promote 'reasoning' field to 'reasoning_content'
-    # for providers that use the internal 'reasoning' key.
+    # for providers that require provider-facing reasoning_content echo-back.
     # This must happen before the unconditional empty-string fallback so
     # genuine reasoning content is not overwritten (#15812 regression in
     # PR #15478).
-    if isinstance(normalized_reasoning, str) and normalized_reasoning:
+    if needs_thinking_pad and isinstance(normalized_reasoning, str) and normalized_reasoning:
         api_msg["reasoning_content"] = normalized_reasoning
         return
 

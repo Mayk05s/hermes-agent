@@ -447,6 +447,17 @@ class TestMarkJobRun:
         # Job should be removed after hitting repeat limit
         assert get_job(job["id"]) is None
 
+    def test_failed_one_shot_is_retained_as_disabled_error(self, tmp_cron_dir):
+        job = create_job(prompt="Once", schedule="30m", repeat=1)
+        mark_job_run(job["id"], success=False, error="blocked")
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["enabled"] is False
+        assert updated["state"] == "error"
+        assert updated["last_error"] == "blocked"
+        assert updated["next_run_at"] is None
+
     def test_repeat_negative_one_is_infinite(self, tmp_cron_dir):
         # LLMs often pass repeat=-1 to mean "infinite/forever".
         # The job must NOT be deleted after runs when repeat <= 0.

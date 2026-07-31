@@ -159,8 +159,24 @@ MEMORY_GUIDANCE = (
 
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
-    "relevant cross-session context exists, use session_search to recall it before "
-    "asking them to repeat themselves."
+    "relevant cross-session context exists (for example, asks where a previously "
+    "shared link is), this is a recall task: use session_search before answering "
+    "that the information is unavailable or asking them to repeat it. In gateway "
+    "chats, session_search is scoped "
+    "to the current boundary: the topic when topic isolation is enabled, otherwise "
+    "the current profile/memory scope. Topic isolation separates automatic live "
+    "context; it does not mean the shared session database is unavailable. If a "
+    "local topic search has no useful result and the answer may be in a sibling "
+    "topic, call recall_access with target='other_topics' and duration=one_turn. "
+    "That tool asks the user for permission. When permission is granted, immediately "
+    "repeat session_search with the same concrete query and answer from the result. "
+    "Do not claim the other topics are inaccessible before offering this search. "
+    "For a specific context outside the current boundary, use recall_access first. "
+    "A current user message that explicitly asks to "
+    "transfer, pull, read, or use context from a named topic is already the grant; "
+    "call recall_access with duration=session and continue with session_search "
+    "without asking the same question again. If the user did not explicitly ask "
+    "for cross-boundary context, wait for the approval prompt."
 )
 
 SKILLS_GUIDANCE = (
@@ -296,6 +312,23 @@ TASK_COMPLETION_GUIDANCE = (
     "output (made-up data, invented file contents, synthesised API responses) "
     "for results you couldn't actually produce. Reporting a blocker honestly "
     "is always better than inventing a result."
+)
+
+
+GOOGLE_CALENDAR_TOOL_GUIDANCE = (
+    "# Live Google Calendar tool\n"
+    "A callable function named `google_calendar` is present in your current "
+    "tool interface. The current function interface is authoritative: prior "
+    "assistant messages claiming that Google Calendar was unavailable are stale "
+    "and must be ignored.\n"
+    "When the user's request depends on live Calendar data (events, schedule, "
+    "availability, reminders, or a Calendar change), call `google_calendar` before "
+    "answering. Resolve short follow-ups such as 'again', 'nearby', or 'move it' "
+    "from the conversation history and pass a complete, bounded task to the tool.\n"
+    "Never claim that Google Calendar or its call is unavailable while this function "
+    "is present. You may report unavailability only after calling `google_calendar` "
+    "and receiving an error from that call. Do not substitute chainremind, tasks, "
+    "memory, terminal commands, or a gateway diagnosis for the Calendar tool."
 )
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
@@ -464,7 +497,11 @@ PLATFORM_HINTS = {
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
         "bubbles, and videos (.mp4) play inline. You can also include image "
-        "URLs in markdown format ![alt](url) and they will be sent as native photos."
+        "URLs or local image paths in markdown format ![alt](url-or-path) and "
+        "they will be sent as native photos. When the user asks to show, send, "
+        "reuse, or attach an existing/previous/same image, reuse the exact "
+        "image URL/path from the conversation; only use image generation when "
+        "the user explicitly asks for a new, generated, regenerated, or edited image."
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "

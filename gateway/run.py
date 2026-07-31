@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -135,9 +136,45 @@ _GATEWAY_SECRET_PATTERNS = (
 )
 
 
+_GROUP_OPERATOR_SLASH_COMMANDS: frozenset[str] = frozenset({
+    "approve",
+    "deny",
+})
+
+
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
+def _prepend_durable_job_registration_note(
+    message: str,
+    job_id: Optional[str],
+    *,
+    durable_recovery: bool = False,
+) -> str:
+    """Tell the agent that the gateway already owns current-turn durability.
+
+    The note belongs to the current user turn rather than the cached system
+    prompt because the gateway job ID changes for every inbound message.
+    Recovery turns already carry a stronger, reason-aware instruction.
+    """
+    normalized_job_id = str(job_id or "").strip()
+    if durable_recovery or not normalized_job_id:
+        return message
+
+    return (
+        f"[System note: This request is already registered as durable gateway "
+        f"job {normalized_job_id}. The gateway persists its status, recovers "
+        f"unfinished work after a restart, and delivers the final result to "
+        f"the originating chat. Do not call cronjob merely to obtain a Job "
+        f"ID, create a registry/checkpoint/trace record, or keep this current "
+        f"turn alive. Use cronjob only when the user explicitly requests "
+        f"execution at a future time or on a recurring schedule. Complete "
+        f"ordinary work in this current turn; if a Job ID is relevant, use "
+        f"{normalized_job_id}.]\n\n"
+        f"{message}"
+    )
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -298,9 +335,66 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
+    # Defense in depth: the conversation loop normally blocks damaged model
+    # output before persistence, but no provider glitch should reach Telegram
+    # even if an alternate agent path bypasses that guard.
+    from agent.conversation_loop import _looks_like_corrupted_model_output
+    if _looks_like_corrupted_model_output(redacted):
+        logger.warning(
+            "Blocked corrupted final gateway response before Telegram delivery "
+            "(%d chars)",
+            len(redacted),
+        )
+        return (
+            "⚠️ The model returned a corrupted response, so it was blocked "
+            "before delivery. Please retry your message."
+        )
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+def _format_fallback_activation_dm(event: dict) -> str:
+    """Format a concise owner DM for one provider-fallback activation."""
+    primary_model = str(event.get("primary_model") or "неизвестна")
+    primary_provider = str(event.get("primary_provider") or "неизвестен")
+    fallback_model = str(event.get("fallback_model") or "неизвестна")
+    fallback_provider = str(event.get("fallback_provider") or "неизвестен")
+    reason = str(event.get("reason") or "provider_failure")
+    detail = _redact_gateway_user_facing_secrets(
+        str(event.get("detail") or "").strip()
+    )
+
+    reason_labels = {
+        "auth": "ошибка авторизации основной модели",
+        "auth_permanent": "авторизация основной модели отклонена",
+        "billing": "закончились средства или доступный биллинг",
+        "rate_limit": "достигнут лимит или квота основной модели",
+        "overloaded": "основной провайдер перегружен",
+        "server_error": "внутренняя ошибка основного провайдера",
+        "timeout": "тайм-аут основного провайдера",
+        "model_not_found": "основная модель недоступна у провайдера",
+        "provider_policy_blocked": "запрос заблокирован политикой провайдера",
+        "content_policy_blocked": "запрос отклонён фильтром безопасности провайдера",
+        "format_error": "провайдер отклонил формат запроса",
+        "malformed_response": "провайдер вернул пустой или повреждённый API-ответ",
+        "empty_response": "модель не вернула видимого ответа после повторных попыток",
+        "corrupted_output": "основная модель вернула повреждённый ответ",
+        "provider_failure": "технический сбой основного провайдера",
+        "unknown": "неопознанный сбой основного провайдера",
+    }
+    reason_text = reason_labels.get(reason, reason_labels["provider_failure"])
+    if detail:
+        reason_text = f"{reason_text}: {detail[:300]}"
+
+    return (
+        "⚠️ Включён резервный провайдер\n\n"
+        f"Основная: {primary_model} ({primary_provider})\n"
+        f"Резервная: {fallback_model} ({fallback_provider})\n"
+        f"Причина: {reason_text}\n\n"
+        "Это уведомление отправляется один раз — до восстановления основной "
+        "модели или переключения на другой резерв."
+    )
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -673,7 +767,11 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
 # ordinary outputs. Only tools that intentionally create deliverable media
 # artifacts should be eligible for automatic append when the model omits them
 # from the final gateway reply.
-_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool"}
+_AUTO_APPEND_MEDIA_TOOL_NAMES = {
+    "image_generate",
+    "text_to_speech",
+    "text_to_speech_tool",
+}
 
 
 # Extension-anchored MEDIA: matcher for tool results. Mirrors the dispatch-site
@@ -693,15 +791,17 @@ def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
+    final_response: str = "",
 ) -> tuple[List[str], bool]:
-    """Collect real media tags from current-turn producer-tool results only.
+    """Collect omitted deliverables from current-turn producer-tool results.
 
     Two layered guards keep stale/example MEDIA: strings out of the reply:
 
     1. Producer-tool allowlist: only tools that intentionally emit deliverable
-       artifacts (TTS) are eligible. Documentation, logs, and search results can
-       contain example strings such as MEDIA:/absolute/path/to/file, which must
-       never be delivered as attachments. (Fixes the original report behind #16721.)
+       artifacts (TTS and image generation) are eligible. Documentation, logs,
+       and search results can contain example strings such as
+       MEDIA:/absolute/path/to/file, which must never be delivered as
+       attachments. (Fixes the original report behind #16721.)
     2. Current-turn isolation: only messages produced this turn are scanned, so a
        tool result from an earlier turn (still present in the full message list)
        cannot leak onto a later text-only reply (#34608).
@@ -713,39 +813,96 @@ def _collect_auto_append_media_tags(
     of #160. The producer-tool allowlist still applies on the fallback path.
     """
     history_media_paths = history_media_paths or set()
+    final_response = str(final_response or "")
     # Only trust the slice boundary when the message list still contains the
     # full history prefix. Otherwise scan everything (compression-safe fallback).
-    if history_offset and len(messages) >= history_offset:
+    turn_slice_trusted = not history_offset or len(messages) >= history_offset
+    if history_offset and turn_slice_trusted:
         new_messages = messages[history_offset:]
     else:
         new_messages = messages
 
     tool_name_by_call_id: Dict[str, str] = {}
+    latest_image_call_ids: set[str] = set()
     for msg in new_messages:
         if msg.get("role") != "assistant":
             continue
+        image_call_ids: set[str] = set()
         for call in msg.get("tool_calls") or []:
             call_id = call.get("id") or call.get("call_id")
             fn = call.get("function") or {}
             name = str(fn.get("name") or call.get("name") or "")
             if call_id and name:
-                tool_name_by_call_id[str(call_id)] = name
+                normalized_call_id = str(call_id)
+                tool_name_by_call_id[normalized_call_id] = name
+                if name == "image_generate":
+                    image_call_ids.add(normalized_call_id)
+        if image_call_ids:
+            # Sequential image_generate calls are usually retries after visual
+            # QA. Recover only the most recent batch, while preserving all
+            # images from a parallel multi-card generation call.
+            latest_image_call_ids = image_call_ids
 
     media_tags: List[str] = []
+    seen_media_paths = set(history_media_paths)
+    for match in _TOOL_MEDIA_RE.finditer(final_response):
+        seen_media_paths.add(match.group(1).strip().rstrip('\",}'))
+    seen_markers: set[str] = set()
     has_voice_directive = False
     for msg in new_messages:
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        tool_name = tool_name_by_call_id.get(call_id)
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
         content = str(msg.get("content") or "")
+
+        if tool_name == "image_generate":
+            # On the compression fallback path the current-turn boundary is no
+            # longer reliable. Do not infer an attachment from an arbitrary old
+            # image tool result; explicit MEDIA tags retain their existing
+            # history-path dedup protection below.
+            if not turn_slice_trusted or call_id not in latest_image_call_ids:
+                continue
+            try:
+                payload = json.loads(content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("success") is not False:
+                refs: List[str] = []
+                image_ref = payload.get("image")
+                if isinstance(image_ref, str):
+                    refs.append(image_ref)
+                image_refs = payload.get("images")
+                if isinstance(image_refs, list):
+                    refs.extend(ref for ref in image_refs if isinstance(ref, str))
+
+                for raw_ref in refs:
+                    ref = raw_ref.strip()
+                    if not ref or ref in final_response:
+                        continue
+                    if ref.startswith(("http://", "https://")):
+                        marker = f"![Generated image]({ref})"
+                        if marker not in seen_markers:
+                            media_tags.append(marker)
+                            seen_markers.add(marker)
+                        continue
+                    match = _TOOL_MEDIA_RE.fullmatch(f"MEDIA:{ref}")
+                    if not match:
+                        continue
+                    path = match.group(1).strip().rstrip('\",}')
+                    if path and path not in seen_media_paths:
+                        media_tags.append(f"MEDIA:{path}")
+                        seen_media_paths.add(path)
+
         if "MEDIA:" not in content:
             continue
         for match in _TOOL_MEDIA_RE.finditer(content):
             path = match.group(1).strip().rstrip('\",}')
-            if path and path not in history_media_paths:
+            if path and path not in seen_media_paths:
                 media_tags.append(f"MEDIA:{path}")
+                seen_media_paths.add(path)
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
 
@@ -1161,6 +1318,14 @@ logger = logging.getLogger(__name__)
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+_RUNTIME_PROVIDER_RESOLUTION = threading.local()
+
+
+def _consume_runtime_fallback_activation() -> dict | None:
+    """Return and clear fallback metadata from the current resolver thread."""
+    event = getattr(_RUNTIME_PROVIDER_RESOLUTION, "fallback_activation", None)
+    _RUNTIME_PROVIDER_RESOLUTION.fallback_activation = None
+    return event
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -1182,6 +1347,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
+    _RUNTIME_PROVIDER_RESOLUTION.fallback_activation = None
     try:
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
@@ -1189,12 +1355,26 @@ def _resolve_runtime_agent_kwargs() -> dict:
         # re-auth cannot help) from a genuine auth failure (expired/revoked
         # token). Both fall through to the fallback chain, but the log message
         # must not mislabel a quota exhaustion as an auth failure (#32790).
-        if is_rate_limited_auth_error(auth_exc):
+        is_rate_limited = is_rate_limited_auth_error(auth_exc)
+        if is_rate_limited:
             logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
         else:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
         fb_config = _try_resolve_fallback_provider()
         if fb_config is not None:
+            try:
+                configured = _load_gateway_runtime_config()
+                model_cfg = configured.get("model") or {}
+            except Exception:
+                model_cfg = {}
+            _RUNTIME_PROVIDER_RESOLUTION.fallback_activation = {
+                "primary_model": str(model_cfg.get("default") or ""),
+                "primary_provider": str(model_cfg.get("provider") or ""),
+                "fallback_model": str(fb_config.get("model") or ""),
+                "fallback_provider": str(fb_config.get("provider") or ""),
+                "reason": "rate_limit" if is_rate_limited else "auth",
+                "detail": str(auth_exc),
+            }
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
@@ -1525,6 +1705,94 @@ def _telegram_topic_binding(config: dict, source) -> dict | None:
     return None
 
 
+def _telegram_long_task_handoff(config: dict, source, event) -> dict | None:
+    """Resolve an automatic Telegram topic handoff for a substantial task.
+
+    The rule is deliberately config-driven and narrow.  It only applies to a
+    configured source topic and matches when the request has non-audio media,
+    exceeds a configured text length, or contains one of the configured task
+    phrases. Voice/audio is gateway-owned input: STT and trigger policy must
+    finish before any AI work can start, so it must never be moved here merely
+    because it has a cached media file.
+    """
+    topic = _telegram_topic_binding(config, source)
+    raw = topic.get("long_task_handoff") if isinstance(topic, dict) else None
+    if not isinstance(raw, dict) or raw.get("enabled", True) is False:
+        return None
+
+    target_thread_id = str(raw.get("target_thread_id") or "").strip()
+    source_thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    if not target_thread_id or target_thread_id == source_thread_id:
+        return None
+
+    text = str(getattr(event, "text", "") or "").strip()
+    normalized_text = text.casefold()
+    try:
+        min_text_length = max(0, int(raw.get("min_text_length") or 0))
+    except (TypeError, ValueError):
+        min_text_length = 0
+
+    keywords_raw = raw.get("keywords") or []
+    if isinstance(keywords_raw, str):
+        keywords_raw = [keywords_raw]
+    keywords = [
+        str(item or "").strip().casefold()
+        for item in keywords_raw
+        if str(item or "").strip()
+    ]
+    has_any_media = bool(
+        getattr(event, "media_urls", None)
+        or getattr(event, "media_types", None)
+    )
+    event_message_type = getattr(event, "message_type", None)
+    media_types = [
+        str(item or "").strip().casefold()
+        for item in (getattr(event, "media_types", None) or [])
+        if str(item or "").strip()
+    ]
+    is_audio_only = event_message_type in {MessageType.VOICE, MessageType.AUDIO} or (
+        bool(media_types)
+        and all(media_type.startswith("audio/") for media_type in media_types)
+    )
+    if is_audio_only:
+        return None
+    has_handoff_media = has_any_media
+    matched = (
+        bool(raw.get("always"))
+        or (bool(raw.get("on_media")) and has_handoff_media)
+        or (min_text_length > 0 and len(text) >= min_text_length)
+        or any(keyword in normalized_text for keyword in keywords)
+    )
+    if not matched:
+        return None
+
+    return {
+        "target_thread_id": target_thread_id,
+        "target_label": str(raw.get("target_label") or target_thread_id).strip(),
+        "notice": str(raw.get("notice") or "").strip(),
+    }
+
+
+def _telegram_topic_skills(topic: dict | None) -> list[str]:
+    if not isinstance(topic, dict):
+        return []
+    raw = topic.get("skills")
+    if raw is None:
+        raw = topic.get("skill")
+    if isinstance(raw, str):
+        raw_items = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        raw_items = list(raw)
+    else:
+        raw_items = []
+    skills: list[str] = []
+    for item in raw_items:
+        skill = str(item or "").strip().strip("/")
+        if skill and skill not in skills:
+            skills.append(skill)
+    return skills
+
+
 def _telegram_source_allows_homeassistant(config: dict, source) -> bool:
     """Return True only for Telegram chats/topics explicitly mapped to HA.
 
@@ -1552,9 +1820,9 @@ def _telegram_source_allows_homeassistant(config: dict, source) -> bool:
 
         topic = _telegram_topic_binding(config, source)
         if topic:
-            skill = str(topic.get("skill", ""))
+            skills = _telegram_topic_skills(topic)
             name = str(topic.get("name", ""))
-            return "telegram_homeassistant" in skill or name == "homeassistant"
+            return any("telegram_homeassistant" in skill for skill in skills) or name == "homeassistant"
     except Exception:
         logger.debug("Could not resolve Telegram HA tool scope", exc_info=True)
     return False
@@ -1573,15 +1841,26 @@ def _telegram_topic_skill_isolation_prompt(config: dict, source) -> str | None:
     topic = _telegram_topic_binding(config, source)
     if not topic:
         return None
-    skill = str(topic.get("skill", "") or "").strip()
+    skills = _telegram_topic_skills(topic)
     name = str(topic.get("name", "") or "").strip()
-    if not skill:
+    if not skills:
         return None
-    if "telegram_homeassistant" in skill or name == "homeassistant":
+    if any("telegram_homeassistant" in skill for skill in skills) or name == "homeassistant":
         return None
+    skill_label = ", ".join(skills)
+    if not bool(getattr(source, "topic_isolation", True)):
+        return (
+            "Telegram cross-topic context is active for opted-in topics in "
+            "this same chat. Memory and session_search recall are shared, while "
+            "each topic has an independent live execution lane. Proactively use "
+            "session_search when a sibling topic may contain relevant context. "
+            f"Use the configured skill(s): {skill_label}. The parent "
+            "chat remains a hard boundary: do not move messages, media, or "
+            "results to a DM or another group."
+        )
     return (
         "Telegram topic skill isolation is active for this chat/topic. "
-        f"Only the configured topic skill is visible here: {skill}. "
+        f"Only the configured topic skill(s) are visible here: {skill_label}. "
         "Only this topic's configured instructions, tools, shortcuts, memory, "
         "and behaviours are in scope. Instructions, shortcuts, tools, memory, "
         "and behaviours from other Telegram topics are out of scope."
@@ -1602,13 +1881,146 @@ def _gateway_allowed_skills_for_source(config: dict, source) -> list[str]:
     topic = _telegram_topic_binding(config, source)
     if not topic:
         return []
-    skill = str(topic.get("skill", "") or "").strip().strip("/")
-    if not skill:
-        return []
-    allowed = [skill]
-    if "/" in skill:
-        allowed.append(skill.rsplit("/", 1)[-1])
+    allowed = []
+    for skill in _telegram_topic_skills(topic):
+        allowed.append(skill)
+        if "/" in skill:
+            allowed.append(skill.rsplit("/", 1)[-1])
     return allowed
+
+
+def _auto_load_skill_text_for_profile(
+    skill_names,
+    original_text: str,
+    *,
+    task_id: str | None,
+    profile_home: Path,
+) -> tuple[str, list[str], list[str]]:
+    """Load topic-bound skills from the resolved profile's skills directory."""
+    if isinstance(skill_names, str):
+        names = [skill_names]
+    else:
+        names = [str(name).strip() for name in (skill_names or []) if str(name).strip()]
+    if not names:
+        return original_text, [], []
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    import tools.skills_tool as _skills_tool
+    from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+    profile_home = Path(profile_home)
+    token = set_hermes_home_override(profile_home)
+    prior_hermes_home = getattr(_skills_tool, "HERMES_HOME", None)
+    prior_skills_dir = getattr(_skills_tool, "SKILLS_DIR", None)
+    try:
+        _skills_tool.HERMES_HOME = profile_home
+        _skills_tool.SKILLS_DIR = profile_home / "skills"
+        combined_parts: list[str] = []
+        loaded_names: list[str] = []
+        missing_names: list[str] = []
+        for skill_name in names:
+            loaded = _load_skill_payload(skill_name, task_id=task_id)
+            if not loaded:
+                missing_names.append(skill_name)
+                continue
+            loaded_skill, skill_dir, display_name = loaded
+            note = (
+                f'[IMPORTANT: The "{display_name}" skill is auto-loaded. '
+                f"Follow its instructions for this session.]"
+            )
+            part = _build_skill_message(loaded_skill, skill_dir, note)
+            if part:
+                combined_parts.append(part)
+                loaded_names.append(skill_name)
+        if combined_parts:
+            combined_parts.append(original_text)
+            return "\n\n".join(combined_parts), loaded_names, missing_names
+        return original_text, loaded_names, missing_names
+    finally:
+        if prior_hermes_home is not None:
+            _skills_tool.HERMES_HOME = prior_hermes_home
+        if prior_skills_dir is not None:
+            _skills_tool.SKILLS_DIR = prior_skills_dir
+        reset_hermes_home_override(token)
+
+
+def _auto_skill_content_version(profile_home: Path, skill_name: str) -> str | None:
+    """Return a stable short hash for a profile-local topic skill."""
+    path = Path(profile_home) / "skills" / str(skill_name).strip() / "SKILL.md"
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:20]
+    except OSError:
+        return None
+
+
+def _auto_skills_to_load_for_session(
+    session_entry,
+    skill_names,
+    *,
+    is_new_session: bool,
+    profile_home: Path | None = None,
+) -> list[str]:
+    """Return auto-skills that are new or changed since last injection."""
+    if isinstance(skill_names, str):
+        names = [skill_names]
+    else:
+        names = [str(name).strip() for name in (skill_names or []) if str(name).strip()]
+    if not names:
+        return []
+    if is_new_session:
+        return names
+    already_loaded = {
+        str(name).strip()
+        for name in (getattr(session_entry, "auto_loaded_skills", None) or [])
+        if str(name).strip()
+    }
+    loaded_versions = dict(
+        getattr(session_entry, "auto_loaded_skill_versions", None) or {}
+    )
+    pending: list[str] = []
+    for name in names:
+        if name not in already_loaded:
+            pending.append(name)
+            continue
+        if profile_home is None:
+            continue
+        current_version = _auto_skill_content_version(profile_home, name)
+        if current_version and loaded_versions.get(name) != current_version:
+            pending.append(name)
+    return pending
+
+
+_GATEWAY_SENDER_ID_RE = re.compile(r"\[[^\]\n|]+\|(\d+)\]")
+_GATEWAY_REPLY_BEFORE_SENDER_RE = re.compile(
+    r'\[Replying to: "(?P<quoted>.*)"\]\r?\n\r?\n'
+    r'(?P<sender>\[[^\]\n|]+\|\d+\]\s*)',
+    re.DOTALL,
+)
+
+
+def _gateway_attributed_requester_user_id(message_text: str) -> str:
+    """Return the gateway-inserted sender ID for the direct current message."""
+    text = str(message_text or "")
+    reply_match = _GATEWAY_REPLY_BEFORE_SENDER_RE.search(text)
+    if reply_match:
+        direct_sender = _GATEWAY_SENDER_ID_RE.search(reply_match.group("sender"))
+        return direct_sender.group(1) if direct_sender else ""
+    direct_sender = _GATEWAY_SENDER_ID_RE.search(text)
+    return direct_sender.group(1) if direct_sender else ""
+
+
+def _gateway_turn_requester_user_id(source: Any, message_text: str) -> str:
+    """Return the verified sender ID for the current gateway turn.
+
+    Shared Telegram group/topic sessions intentionally clear ``source.user_id``
+    so every participant uses one conversation. The inbound adapter preserves
+    the actual sender in the current turn's ``[name|numeric_id]`` attribution,
+    which is safe to use for binding an interactive prompt to its requester.
+    """
+    source_user_id = str(getattr(source, "user_id", "") or "").strip()
+    if source_user_id:
+        return source_user_id
+    return _gateway_attributed_requester_user_id(message_text)
 
 
 def _scope_gateway_toolsets_for_source(
@@ -1930,6 +2342,12 @@ class GatewayRunner:
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+        self._fallback_notification_state_path = (
+            _hermes_home / ".fallback_provider_notification.json"
+        )
+        self._active_fallback_notification = (
+            self._load_fallback_notification_state()
+        )
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -1937,6 +2355,15 @@ class GatewayRunner:
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
+        from gateway.durable_jobs import DurableJobStore
+        self._durable_job_store = DurableJobStore(
+            _hermes_home / "gateway_jobs.sqlite3"
+        )
+        self._durable_job_instance = (
+            f"{os.getpid()}:{time.time_ns()}"
+        )
+        self._active_job_ids: Dict[str, str] = {}
+        self._scheduled_durable_job_ids: set[str] = set()
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2459,10 +2886,32 @@ class GatewayRunner:
 
         return normalize_profile_routes_config((_load_gateway_config() or {}).get("profile_routes"))
 
+    def _has_explicit_profile_route_for_source(self, source: SessionSource) -> bool:
+        """Return True when the admin explicitly assigned this chat/topic."""
+        try:
+            from gateway.profile_routing import find_profile_route_for_source
+
+            return find_profile_route_for_source(self._profile_route_config(), source) is not None
+        except Exception:
+            logger.debug("Failed to resolve explicit profile route for auth", exc_info=True)
+            return False
+
     def _profile_name_for_source(self, source: SessionSource) -> str:
         from gateway.profile_routing import resolve_profile_for_source
 
         return resolve_profile_for_source(self._profile_route_config(), source)
+
+    def _command_surface_profile_name(self, source: Optional[SessionSource]) -> str:
+        """Resolve the profile whose command surface should be shown."""
+        if source is not None:
+            explicit = str(getattr(source, "profile_name", "") or "").strip()
+            if explicit:
+                return explicit
+            try:
+                return self._profile_name_for_source(source) or "default"
+            except Exception:
+                logger.debug("Failed to resolve command surface profile", exc_info=True)
+        return "default"
 
     def _profile_home_for_name(self, profile_name: str) -> Path:
         from hermes_cli import profiles as profiles_mod
@@ -2497,20 +2946,23 @@ class GatewayRunner:
         profile_name = self._profile_name_for_source(source)
         scope = self._profile_scope_for_source(source, profile_name)
         memory_scope = getattr(scope, "memory_scope", "") or getattr(scope, "scope", "") or "default"
+        topic_isolation = bool(getattr(scope, "topic_isolation", False))
         routed = dataclasses.replace(
             source,
             profile_name=profile_name,
             scope_name=getattr(scope, "scope", "") or "default",
             memory_scope=memory_scope,
+            topic_isolation=topic_isolation,
         )
         logger.info(
-            "profile route: platform=%s chat=%s thread=%s -> profile=%s scope=%s memory_scope=%s",
+            "profile route: platform=%s chat=%s thread=%s -> profile=%s scope=%s memory_scope=%s topic_isolation=%s",
             getattr(getattr(source, "platform", None), "value", source.platform),
             source.chat_id,
             source.thread_id or "",
             routed.profile_name,
             routed.scope_name,
             routed.memory_scope,
+            routed.topic_isolation,
         )
         return routed
 
@@ -2582,9 +3034,46 @@ class GatewayRunner:
             logger.debug("Failed to apply chat settings overlay: %s", exc)
             return user_config
 
-    def _transcribe_audio_for_source(self, source: SessionSource) -> str:
-        value = str(self._chat_settings_for_source(source).get("transcribe_audio") or "default").lower()
+    @staticmethod
+    def _chat_tristate_value(raw: Any) -> str:
+        value = str(raw or "default").strip().lower()
         return value if value in {"default", "on", "off"} else "default"
+
+    def _telegram_audio_trigger_enabled(self, source: SessionSource) -> bool:
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        settings = self._chat_settings_for_source(source)
+        value = self._chat_tristate_value(settings.get("audio_trigger"))
+        if value == "on":
+            return True
+        if value == "off":
+            return False
+
+        legacy = self._chat_tristate_value(settings.get("transcribe_audio"))
+        if legacy == "on":
+            return True
+        if legacy == "off":
+            return False
+
+        platform_cfg = getattr(self.config, "platforms", {}).get(Platform.TELEGRAM)
+        extra = getattr(platform_cfg, "extra", None) if platform_cfg is not None else None
+        if isinstance(extra, dict) and "audio_trigger" in extra:
+            return is_truthy_value(extra.get("audio_trigger"), default=False)
+
+        try:
+            user_config = _load_gateway_config()
+            value = cfg_get(user_config, "telegram", "audio_trigger")
+        except Exception:
+            value = None
+        return is_truthy_value(value, default=False)
+
+    def _transcribe_audio_for_source(self, source: SessionSource) -> str:
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            if self._telegram_show_transcription_enabled(source=source) or self._telegram_audio_trigger_enabled(source):
+                return "on"
+            return "default"
+        value = self._chat_tristate_value(self._chat_settings_for_source(source).get("transcribe_audio"))
+        return value
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -3719,6 +4208,11 @@ class GatewayRunner:
                     status_parts.append(f"running: {current_tool}")
             except Exception:
                 pass
+        active_job_id = str(
+            getattr(self, "_active_job_ids", {}).get(session_key) or ""
+        )
+        if active_job_id:
+            status_parts.append(f"jobId {active_job_id}")
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
         if is_steer_mode:
@@ -3924,7 +4418,22 @@ class GatewayRunner:
                     adapter=adapter,
                 )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                active_job_id = str(
+                    getattr(self, "_active_job_ids", {}).get(session_key) or ""
+                )
+                session_msg = msg
+                if active_job_id:
+                    session_msg = (
+                        f"⚠️ Gateway {action} — Активная задача сохранена как "
+                        f"jobId `{active_job_id}`. После запуска gateway "
+                        f"автоматически продолжит её и пришлёт итоговый результат."
+                    )
+
+                result = await adapter.send(
+                    chat_id,
+                    session_msg,
+                    metadata=metadata,
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -4352,6 +4861,334 @@ class GatewayRunner:
         task.add_done_callback(self._background_tasks.discard)
         return True
 
+    def _durable_store(self):
+        """Return the durable gateway-job store when this runner owns one."""
+        return getattr(self, "_durable_job_store", None)
+
+    def _prepare_durable_job(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> tuple[Optional[str], bool]:
+        """Create/claim a job before agent work starts.
+
+        Returns ``(job_id, suppress_work)``. Completed-but-undelivered
+        duplicates are re-sent from storage without re-running their tools.
+        """
+        store = self._durable_store()
+        if store is None:
+            return None, False
+
+        existing_id = str(getattr(event, "durable_job_id", None) or "")
+        job = store.get(existing_id) if existing_id else None
+        created = False
+        if job is None:
+            platform = _gateway_platform_value(source.platform)
+            job, created = store.create_or_get(
+                session_key=session_key,
+                platform=platform,
+                source=source,
+                request_text=(
+                    getattr(event, "durable_request_text", None)
+                    or event.text
+                    or ""
+                ),
+                message_id=event.message_id,
+                platform_update_id=event.platform_update_id,
+            )
+
+        job_id = str(job["job_id"])
+        event.durable_job_id = job_id
+
+        if not created and job.get("status") in {"completed", "failed", "cancelled"}:
+            if not job.get("delivered_at") and job.get("result_text"):
+                scheduled = getattr(self, "_scheduled_durable_job_ids", None)
+                if scheduled is not None and job_id not in scheduled:
+                    scheduled.add(job_id)
+                    task = asyncio.create_task(self._redeliver_durable_job(job))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+            logger.info(
+                "Suppressing duplicate inbound work for terminal durable job %s "
+                "(status=%s delivered=%s)",
+                job_id,
+                job.get("status"),
+                bool(job.get("delivered_at")),
+            )
+            return job_id, True
+
+        store.mark_running(
+            job_id,
+            owner_instance=str(
+                getattr(self, "_durable_job_instance", "")
+                or f"{os.getpid()}:{time.time_ns()}"
+            ),
+        )
+        if not hasattr(self, "_active_job_ids"):
+            self._active_job_ids = {}
+        self._active_job_ids[session_key] = job_id
+        logger.info(
+            "Durable gateway job %s %s for session %s",
+            job_id,
+            "created" if created else "claimed",
+            session_key,
+        )
+        return job_id, False
+
+    def _bind_durable_job_session(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        session_id: str,
+        source: SessionSource,
+    ) -> None:
+        store = self._durable_store()
+        job_id = str(getattr(event, "durable_job_id", None) or "")
+        if store is None or not job_id:
+            return
+        store.bind_session(
+            job_id,
+            session_key=session_key,
+            session_id=session_id,
+            source=source,
+        )
+        if not hasattr(self, "_active_job_ids"):
+            self._active_job_ids = {}
+        self._active_job_ids[session_key] = job_id
+
+    def _complete_durable_job(
+        self,
+        event: MessageEvent,
+        result_text: str,
+        *,
+        delivered: bool = False,
+    ) -> None:
+        store = self._durable_store()
+        job_id = str(getattr(event, "durable_job_id", None) or "")
+        if store is None or not job_id:
+            return
+        final_text = str(result_text or "").strip()
+        if not final_text:
+            # A missing final response is diagnostic information, not a
+            # user-facing result.  Mark it delivered so startup recovery
+            # never broadcasts a placeholder to the original chat.
+            logger.warning("Durable gateway job %s completed without final text", job_id)
+            store.complete(job_id, "", delivered=True)
+        else:
+            store.complete(job_id, final_text, delivered=delivered)
+        getattr(self, "_scheduled_durable_job_ids", set()).discard(job_id)
+
+    def _fail_durable_job(
+        self,
+        event: MessageEvent,
+        exc: BaseException,
+    ) -> str:
+        job_id = str(getattr(event, "durable_job_id", None) or "")
+        result = (
+            f"⚠️ Задача `{job_id or 'unknown'}` завершилась с ошибкой "
+            f"({type(exc).__name__}): {str(exc)[:500] or 'no details'}"
+        )
+        store = self._durable_store()
+        if store is not None and job_id:
+            store.fail(
+                job_id,
+                error_text=f"{type(exc).__name__}: {exc}",
+                result_text=result,
+            )
+            getattr(self, "_scheduled_durable_job_ids", set()).discard(job_id)
+        return result
+
+    async def _handle_durable_job_delivery_receipt(
+        self,
+        event: MessageEvent,
+        *,
+        attempted: bool,
+        succeeded: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        store = self._durable_store()
+        job_id = str(getattr(event, "durable_job_id", None) or "")
+        if store is None or not job_id or not attempted:
+            return
+        store.record_delivery(job_id, success=succeeded, error=error)
+        if succeeded:
+            logger.info("Durable gateway job %s final result delivered", job_id)
+        else:
+            logger.warning(
+                "Durable gateway job %s completed but delivery failed: %s",
+                job_id,
+                error or "unknown platform error",
+            )
+
+    def _mark_durable_session_resume_pending(
+        self,
+        session_key: str,
+        reason: str,
+    ) -> list[str]:
+        store = self._durable_store()
+        if store is None or not session_key:
+            return []
+        try:
+            job_ids = store.mark_session_resume_pending(session_key, reason)
+            if job_ids:
+                logger.info(
+                    "Marked durable gateway job(s) %s resume-pending for %s",
+                    ", ".join(job_ids),
+                    session_key,
+                )
+            return job_ids
+        except Exception:
+            logger.exception(
+                "Failed to mark durable gateway job resume-pending for %s",
+                session_key,
+            )
+            return []
+
+    async def _redeliver_durable_job(self, job: Dict[str, Any]) -> bool:
+        """Deliver a stored terminal result without re-running the agent."""
+        store = self._durable_store()
+        job_id = str(job.get("job_id") or "")
+        try:
+            if store is None or not job_id:
+                return False
+            source = SessionSource.from_dict(store.source_dict(job))
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                return False
+            result_text = str(job.get("result_text") or "").strip()
+            if not result_text:
+                return False
+            # Recovery is an implementation detail. Deliver the actual
+            # stored result, without a lifecycle banner or internal job ID.
+            content = result_text
+            result = await adapter._send_with_retry(
+                chat_id=source.chat_id,
+                content=content,
+                metadata=self._thread_metadata_for_source(source, None),
+            )
+            success = bool(getattr(result, "success", False))
+            store.record_delivery(
+                job_id,
+                success=success,
+                error=str(getattr(result, "error", "") or "delivery failed"),
+            )
+            if success:
+                logger.info(
+                    "Re-delivered stored final result for durable job %s",
+                    job_id,
+                )
+            return success
+        except Exception as exc:
+            if store is not None and job_id:
+                try:
+                    store.record_delivery(job_id, success=False, error=str(exc))
+                except Exception:
+                    pass
+            logger.warning(
+                "Stored result re-delivery failed for durable job %s: %s",
+                job_id or "?",
+                exc,
+            )
+            return False
+        finally:
+            getattr(self, "_scheduled_durable_job_ids", set()).discard(job_id)
+
+    def _schedule_durable_jobs(self) -> tuple[int, set[str]]:
+        """Recover active jobs and re-deliver terminal results at startup."""
+        store = self._durable_store()
+        if store is None:
+            return 0, set()
+
+        scheduled_ids = getattr(self, "_scheduled_durable_job_ids", None)
+        if scheduled_ids is None:
+            scheduled_ids = set()
+            self._scheduled_durable_job_ids = scheduled_ids
+
+        scheduled_count = 0
+        claimed_session_keys: set[str] = set()
+
+        for job in store.terminal_undelivered_jobs():
+            job_id = str(job.get("job_id") or "")
+            if not job_id or job_id in scheduled_ids:
+                continue
+            try:
+                source = SessionSource.from_dict(store.source_dict(job))
+            except Exception:
+                logger.warning(
+                    "Cannot re-deliver durable job %s: invalid source metadata",
+                    job_id,
+                )
+                continue
+            if self.adapters.get(source.platform) is None:
+                continue
+            scheduled_ids.add(job_id)
+            task = asyncio.create_task(self._redeliver_durable_job(job))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            scheduled_count += 1
+
+        owner_instance = str(
+            getattr(self, "_durable_job_instance", "")
+            or f"{os.getpid()}:{time.time_ns()}"
+        )
+        for job in store.active_jobs():
+            job_id = str(job.get("job_id") or "")
+            session_key = str(job.get("session_key") or "")
+            if not job_id or job_id in scheduled_ids:
+                continue
+            try:
+                source = SessionSource.from_dict(store.source_dict(job))
+            except Exception:
+                logger.warning(
+                    "Cannot resume durable job %s: invalid source metadata",
+                    job_id,
+                )
+                continue
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                continue
+            try:
+                self.session_store.mark_resume_pending(
+                    session_key,
+                    reason="restart_interrupted",
+                )
+            except Exception:
+                logger.debug(
+                    "Could not set session resume_pending for durable job %s",
+                    job_id,
+                    exc_info=True,
+                )
+
+            if not store.mark_recovery_scheduled(
+                job_id,
+                owner_instance=owner_instance,
+            ):
+                continue
+            scheduled_ids.add(job_id)
+            claimed_session_keys.add(session_key)
+            event = MessageEvent(
+                text="",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+                durable_job_id=job_id,
+                durable_recovery=True,
+                durable_request_text=str(job.get("request_text") or ""),
+            )
+            task = asyncio.create_task(adapter.handle_message(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            scheduled_count += 1
+
+        if scheduled_count:
+            logger.info(
+                "Scheduled %d durable gateway job recovery/delivery action(s)",
+                scheduled_count,
+            )
+        return scheduled_count, claimed_session_keys
+
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
@@ -4361,7 +5198,11 @@ class GatewayRunner:
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
 
-    def _schedule_resume_pending_sessions(self) -> int:
+    def _schedule_resume_pending_sessions(
+        self,
+        *,
+        exclude_session_keys: Optional[set[str]] = None,
+    ) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
         ``resume_pending`` already preserves the transcript AND the existing
@@ -4377,6 +5218,7 @@ class GatewayRunner:
         message, or on the next gateway startup.
         """
         window = _auto_continue_freshness_window()
+        excluded = exclude_session_keys or set()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -4386,6 +5228,7 @@ class GatewayRunner:
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
+                    and entry.session_key not in excluded
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -4708,6 +5551,10 @@ class GatewayRunner:
             
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
+            if hasattr(adapter, "set_durable_job_delivery_handler"):
+                adapter.set_durable_job_delivery_handler(
+                    self._handle_durable_job_delivery_receipt
+                )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -4919,11 +5766,19 @@ class GatewayRunner:
             finally:
                 _clear_planned_restart_notification()
 
-        # Automatically continue fresh sessions that were interrupted by the
-        # previous gateway restart/shutdown.  The resume_pending flag is cleared
-        # by the normal successful-turn path, so a failed auto-resume remains
-        # visible for manual recovery on the next user message.
-        self._schedule_resume_pending_sessions()
+        # Recover explicit durable jobs first. The older session-level
+        # resume_pending path remains as a compatibility fallback for work that
+        # started before the registry existed, but must exclude claimed jobs.
+        _, durable_session_keys = self._schedule_durable_jobs()
+        self._schedule_resume_pending_sessions(
+            exclude_session_keys=durable_session_keys,
+        )
+        try:
+            store = self._durable_store()
+            if store is not None:
+                store.prune(older_than_days=30)
+        except Exception:
+            logger.debug("Durable gateway job prune failed", exc_info=True)
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -6449,6 +7304,10 @@ class GatewayRunner:
                         continue
 
                     adapter.set_message_handler(self._handle_message)
+                    if hasattr(adapter, "set_durable_job_delivery_handler"):
+                        adapter.set_durable_job_delivery_handler(
+                            self._handle_durable_job_delivery_receipt
+                        )
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -6475,6 +7334,10 @@ class GatewayRunner:
                             await build_channel_directory(self.adapters)
                         except Exception:
                             pass
+
+                        # A platform unavailable during startup may own jobs
+                        # waiting for recovery or final-result delivery.
+                        self._schedule_durable_jobs()
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
                         self._update_platform_runtime_status(
@@ -6613,12 +7476,24 @@ class GatewayRunner:
             # gateway boot can recover in-flight sessions (#27856).
             _pre_drain_keys: list[str] = []
             for _sk, _agent in list(self._running_agents.items()):
+                _durable_resume_reason = (
+                    "restart_timeout"
+                    if self._restart_requested
+                    else "shutdown_timeout"
+                )
+                _mark_durable_resume = getattr(
+                    self,
+                    "_mark_durable_session_resume_pending",
+                    None,
+                )
+                if callable(_mark_durable_resume):
+                    _mark_durable_resume(_sk, _durable_resume_reason)
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
                 try:
                     self.session_store.mark_resume_pending(
                         _sk,
-                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                        _durable_resume_reason,
                     )
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
@@ -6681,6 +7556,13 @@ class GatewayRunner:
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
                 for _sk, _agent in list(self._running_agents.items()):
+                    _mark_durable_resume = getattr(
+                        self,
+                        "_mark_durable_session_resume_pending",
+                        None,
+                    )
+                    if callable(_mark_durable_resume):
+                        _mark_durable_resume(_sk, _resume_reason)
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
                     try:
@@ -6771,6 +7653,7 @@ class GatewayRunner:
             self.adapters.clear()
             self._running_agents.clear()
             self._running_agents_ts.clear()
+            getattr(self, "_active_job_ids", {}).clear()
             self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
@@ -7210,6 +8093,61 @@ class GatewayRunner:
                 source.thread_id or "",
             ):
                 return True
+            if self._has_explicit_profile_route_for_source(source):
+                return True
+
+        # Telegram observed-history mode stores and replays group context at a
+        # chat/topic shared source, which intentionally has no per-sender
+        # user_id.  If the operator has not configured a chat allowlist, keep
+        # the historical mention-gated behavior. When a chat allowlist exists,
+        # the checks above are the only group-wide auth paths: explicit chat
+        # allowlist, chat pairing, or an explicit profile route. A triggered
+        # @mention in an unapproved group must not bypass that boundary just
+        # because the shared source has no sender id.
+        if (
+            source.platform == Platform.TELEGRAM
+            and source.chat_type in {"group", "forum"}
+            and source.chat_id
+            and not user_id
+        ):
+            observe_enabled = True
+            try:
+                platform_cfg = self.config.platforms.get(Platform.TELEGRAM) if self.config else None
+                extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
+                if isinstance(extra, dict):
+                    configured = extra.get("observe_unmentioned_group_messages")
+                    if configured is None:
+                        configured = extra.get("ingest_unmentioned_group_messages")
+                    if configured is not None:
+                        observe_enabled = (
+                            configured.lower() in {"true", "1", "yes", "on"}
+                            if isinstance(configured, str)
+                            else bool(configured)
+                        )
+                env_value = os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES")
+                if env_value is not None and not (isinstance(extra, dict) and (
+                    "observe_unmentioned_group_messages" in extra
+                    or "ingest_unmentioned_group_messages" in extra
+                )):
+                    observe_enabled = env_value.lower() in {"true", "1", "yes", "on"}
+            except Exception:
+                observe_enabled = True
+            has_chat_allowlist = bool(os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "").strip())
+            try:
+                platform_cfg = self.config.platforms.get(Platform.TELEGRAM) if self.config else None
+                extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
+                if isinstance(extra, dict):
+                    raw_cfg_allowlist = extra.get("group_allowed_chats") or extra.get("allowed_chats")
+                    if isinstance(raw_cfg_allowlist, (list, tuple, set)):
+                        has_chat_allowlist = has_chat_allowlist or any(
+                            str(item).strip() for item in raw_cfg_allowlist
+                        )
+                    elif raw_cfg_allowlist is not None:
+                        has_chat_allowlist = has_chat_allowlist or bool(str(raw_cfg_allowlist).strip())
+            except Exception:
+                pass
+            if observe_enabled and not has_chat_allowlist:
+                return True
 
         if not user_id:
             return False
@@ -7288,9 +8226,14 @@ class GatewayRunner:
             if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
 
-        # Check pairing store (always checked, regardless of allowlists)
+        # Check DM/user pairing store. Pairing an individual in private chat
+        # must not implicitly authorize every group they add the bot to; groups
+        # are authorized by chat allowlists or chat-pairing requests above.
         platform_name = source.platform.value if source.platform else ""
-        if self.pairing_store.is_approved(platform_name, user_id):
+        if (
+            source.chat_type not in {"group", "forum", "channel"}
+            and self.pairing_store.is_approved(platform_name, user_id)
+        ):
             return True
 
         # Check platform-specific and global allowlists
@@ -7474,13 +8417,120 @@ class GatewayRunner:
         return "pair"
 
     def _is_group_pairing_start_event(self, event: MessageEvent) -> bool:
-        """Return True when an unauthorized group/channel /start should request pairing."""
+        """Return True when an unauthorized group/channel should request pairing.
+
+        A new Telegram group may first reach us as ``@bot /start`` or a direct
+        mention rather than a clean ``/start`` command, especially after group
+        attribution rewrites the event text. Treat explicit bot attention as a
+        request to pair the chat, not as ordinary traffic to ignore silently.
+        """
         source = event.source
         if not source or source.chat_type not in {"group", "forum", "channel"}:
             return False
         if not source.chat_id:
             return False
-        return event.get_command() == "start"
+        if event.get_command() == "start":
+            return True
+
+        raw_message = getattr(event, "raw_message", None)
+        adapter = None
+        try:
+            adapter = self.adapters.get(source.platform)
+        except Exception:
+            adapter = None
+
+        if raw_message is not None and adapter is not None:
+            is_start = getattr(adapter, "_is_group_pairing_start_command", None)
+            if callable(is_start):
+                try:
+                    if is_start(raw_message):
+                        return True
+                except Exception:
+                    logger.debug("Telegram group pairing /start detection failed", exc_info=True)
+            mentions_bot = getattr(adapter, "_message_mentions_bot", None)
+            if callable(mentions_bot):
+                try:
+                    if mentions_bot(raw_message):
+                        return True
+                except Exception:
+                    logger.debug("Telegram group pairing mention detection failed", exc_info=True)
+
+        text = ""
+        if raw_message is not None:
+            text = (
+                getattr(raw_message, "text", None)
+                or getattr(raw_message, "caption", None)
+                or ""
+            )
+        if not text:
+            text = event.text or ""
+        lowered = text.lower()
+
+        bot_username = ""
+        if adapter is not None:
+            bot = getattr(adapter, "_bot", None)
+            bot_username = str(getattr(bot, "username", "") or "").strip().lower()
+        if bot_username and f"@{bot_username}" in lowered:
+            return True
+        return bool(re.search(r"(?<!\S)/start(?:@[A-Za-z0-9_]+)?(?:\s|$)", text))
+
+    def _is_telegram_group_start_command_event(self, event: MessageEvent) -> bool:
+        """Return True for Telegram group/forum/channel /start onboarding pings."""
+        source = event.source
+        if (
+            not source
+            or source.platform != Platform.TELEGRAM
+            or source.chat_type not in {"group", "forum", "channel"}
+            or not source.chat_id
+        ):
+            return False
+        if event.get_command() == "start":
+            return True
+
+        raw_message = getattr(event, "raw_message", None)
+        adapter = None
+        try:
+            adapter = self.adapters.get(source.platform)
+        except Exception:
+            adapter = None
+        if raw_message is not None and adapter is not None:
+            is_start = getattr(adapter, "_is_group_pairing_start_command", None)
+            if callable(is_start):
+                try:
+                    if is_start(raw_message):
+                        return True
+                except Exception:
+                    logger.debug("Telegram group /start detection failed", exc_info=True)
+
+        text = ""
+        if raw_message is not None:
+            text = (
+                getattr(raw_message, "text", None)
+                or getattr(raw_message, "caption", None)
+                or ""
+            )
+        if not text:
+            text = event.text or ""
+        return bool(re.search(r"(?<!\S)/start(?:@[A-Za-z0-9_]+)?(?:\s|$)", text))
+
+    @staticmethod
+    def _group_pairing_requester(event: MessageEvent) -> tuple[str, str]:
+        source = event.source
+        requester_user_id = str(getattr(source, "user_id", "") or "").strip()
+        requester_user_name = str(getattr(source, "user_name", "") or "").strip()
+        raw_message = getattr(event, "raw_message", None)
+        raw_user = getattr(raw_message, "from_user", None) if raw_message is not None else None
+        if raw_user is not None:
+            requester_user_id = requester_user_id or str(getattr(raw_user, "id", "") or "").strip()
+            requester_user_name = (
+                requester_user_name
+                or str(
+                    getattr(raw_user, "full_name", None)
+                    or getattr(raw_user, "first_name", None)
+                    or ""
+                ).strip()
+            )
+        return requester_user_id, requester_user_name
 
     async def _handle_group_pairing_request(self, event: MessageEvent) -> Optional[str]:
         """Create a pending pairing request for an unauthorized group/channel."""
@@ -7493,14 +8543,15 @@ class GatewayRunner:
         ):
             return ""
 
+        requester_user_id, requester_user_name = self._group_pairing_requester(event)
         entry_id = self.pairing_store.generate_chat_request(
             platform_name,
             source.chat_id,
             source.chat_name or "",
             chat_type=source.chat_type or "group",
             thread_id=source.thread_id or "",
-            requester_user_id=source.user_id or "",
-            requester_user_name=source.user_name or "",
+            requester_user_id=requester_user_id,
+            requester_user_name=requester_user_name,
         )
         adapter = self.adapters.get(source.platform)
         if not adapter:
@@ -7567,6 +8618,10 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        if getattr(event, "durable_request_text", None) is None:
+            # Snapshot the literal inbound request before plugin hooks, skill
+            # bodies, reply context, or sender attribution rewrite event.text.
+            event.durable_request_text = event.text or ""
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -7664,6 +8719,106 @@ class GatewayRunner:
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # A configured notification-only Telegram topic can hand substantial
+        # work to a dedicated work topic before we choose the session key.
+        # Routing this early keeps the durable job, running-agent lock,
+        # transcript, progress messages, and final answer on the same target.
+        if not is_internal and not event.is_command():
+            try:
+                _handoff = _telegram_long_task_handoff(
+                    _load_gateway_config(),
+                    source,
+                    event,
+                )
+            except Exception:
+                logger.debug("Failed to resolve Telegram long-task handoff", exc_info=True)
+                _handoff = None
+            if _handoff:
+                _original_source = source
+                _target_thread_id = _handoff["target_thread_id"]
+                _target_label = _handoff["target_label"]
+                source = dataclasses.replace(
+                    source,
+                    thread_id=_target_thread_id,
+                    chat_topic=_target_label,
+                    message_id=None,
+                )
+                _handoff_prompt = (
+                    "This task was automatically moved from Telegram topic "
+                    f"{_original_source.thread_id or 'unknown'} to "
+                    f"«{_target_label}» ({_target_thread_id}). Continue the "
+                    "task and deliver all substantive progress and results in "
+                    "the target topic."
+                )
+                event = dataclasses.replace(
+                    event,
+                    source=source,
+                    channel_prompt="\n\n".join(
+                        part
+                        for part in (
+                            str(getattr(event, "channel_prompt", "") or "").strip(),
+                            _handoff_prompt,
+                        )
+                        if part
+                    ),
+                )
+                logger.info(
+                    "telegram long-task handoff: chat=%s thread=%s -> thread=%s (%s)",
+                    source.chat_id,
+                    _original_source.thread_id or "",
+                    _target_thread_id,
+                    _target_label,
+                )
+                if not getattr(event, "durable_recovery", False):
+                    _handoff_adapter = self.adapters.get(source.platform)
+                    if _handoff_adapter:
+                        _notice = _handoff["notice"] or (
+                            f"Перенёс долгую задачу в «{_target_label}» — "
+                            "продолжу и отвечу там."
+                        )
+                        try:
+                            await _handoff_adapter.send(
+                                _original_source.chat_id,
+                                _notice,
+                                metadata=self._thread_metadata_for_source(
+                                    _original_source,
+                                    self._reply_anchor_for_event(event),
+                                ),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to send Telegram topic handoff notice",
+                                exc_info=True,
+                            )
+
+        # Resolve profile/scope before choosing the quick key. Cross-topic
+        # recall may share a memory scope, but build_session_key always keeps
+        # the topic ID so sibling topics have independent running-agent locks.
+        source = self._source_with_profile_scope(source)
+        try:
+            event.source = source
+        except Exception:
+            pass
+
+        # Slash commands are only accepted in private chats. Keep this before
+        # update/confirm/running-agent shortcuts so group commands cannot hit
+        # side-effecting handlers through an alternate path.
+        _quick_key = self._session_key_for_source(source)
+        if not is_internal:
+            if self._is_telegram_group_start_command_event(event):
+                logger.info(
+                    "Ignoring Telegram group /start platform ping for chat %s",
+                    source.chat_id,
+                )
+                return None
+            _chat_command = event.get_command()
+            if _chat_command:
+                _private_chat_denial = self._private_chat_only_command_denial(
+                    source, _chat_command
+                )
+                if _private_chat_denial is not None:
+                    return _private_chat_denial
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -7672,7 +8827,6 @@ class GatewayRunner:
         # IMPORTANT: recognized slash commands must bypass this interception.
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
-        _quick_key = self._session_key_for_source(source)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -8669,6 +9823,16 @@ class GatewayRunner:
                 return self._telegram_topic_root_lobby_message()
             return None
 
+        durable_job_id = None
+        if not is_internal or getattr(event, "durable_job_id", None):
+            durable_job_id, suppress_work = self._prepare_durable_job(
+                event,
+                source,
+                _quick_key,
+            )
+            if suppress_work:
+                return None
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -8710,7 +9874,43 @@ class GatewayRunner:
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+
+            if isinstance(_agent_result, dict):
+                durable_result_text = str(
+                    _agent_result.get("final_response") or ""
+                )
+            elif isinstance(_agent_result, str):
+                durable_result_text = _agent_result
+            else:
+                durable_result_text = ""
+
+            store = self._durable_store()
+            durable_record = (
+                store.get(durable_job_id)
+                if store is not None and durable_job_id
+                else None
+            )
+            if durable_record and durable_record.get("status") in {
+                "pending",
+                "running",
+                "resume_pending",
+            }:
+                if self._draining and not durable_result_text.strip():
+                    store.mark_resume_pending(
+                        durable_job_id,
+                        "restart_timeout"
+                        if self._restart_requested
+                        else "shutdown_timeout",
+                    )
+                else:
+                    self._complete_durable_job(
+                        event,
+                        durable_result_text,
+                    )
             return _agent_result
+        except Exception as exc:
+            self._fail_durable_job(event, exc)
+            raise
         finally:
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
@@ -8724,6 +9924,12 @@ class GatewayRunner:
                 self._running_agents_ts.pop(_quick_key, None)
                 if hasattr(self, "_busy_ack_ts"):
                     self._busy_ack_ts.pop(_quick_key, None)
+            if (
+                durable_job_id
+                and getattr(self, "_active_job_ids", {}).get(_quick_key)
+                == durable_job_id
+            ):
+                self._active_job_ids.pop(_quick_key, None)
 
     async def _prepare_inbound_message_text(
         self,
@@ -8788,9 +9994,7 @@ class GatewayRunner:
                 # chat/topic-scoped Telegram audio_transcription_rules entry.
                 # MessageType.VOICE = voice message (Opus/OGG) — STT by default.
                 if event.message_type == MessageType.AUDIO:
-                    if transcribe_audio_mode == "off":
-                        audio_file_paths.append(path)
-                    elif transcribe_audio_mode == "on" or self._matching_telegram_voice_transcription_rule(event, source) is not None:
+                    if self._matching_telegram_voice_transcription_rule(event, source) is not None:
                         audio_paths.append(path)
                     else:
                         audio_file_paths.append(path)
@@ -8798,10 +10002,7 @@ class GatewayRunner:
                     mtype.startswith("audio/")
                     and event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
                 ):
-                    if transcribe_audio_mode == "off":
-                        audio_file_paths.append(path)
-                    else:
-                        audio_paths.append(path)
+                    audio_paths.append(path)
 
             if image_paths:
                 # Decide routing: native (attach pixels) vs text (vision_analyze
@@ -8830,14 +10031,30 @@ class GatewayRunner:
 
             if audio_paths:
                 voice_rule = self._matching_telegram_voice_transcription_rule(event, source)
-                if voice_rule is None and getattr(event, "telegram_passive_audio_transcription", False):
-                    voice_rule = {
-                        "send_transcript": True,
-                        "trigger_keywords": self._telegram_voice_trigger_keywords(),
-                        "trigger_aliases": self._telegram_voice_trigger_aliases(),
+                if (
+                    getattr(source, "platform", None) == Platform.TELEGRAM
+                    and event.message_type == MessageType.VOICE
+                ):
+                    # Telegram voice notes are owned by the gateway, including
+                    # replies, mentions, DMs, and free-response chats. First
+                    # apply STT/display settings; only a configured audio
+                    # trigger matched against the completed transcript may
+                    # continue into the AI agent. Addressing metadata must not
+                    # bypass this contract.
+                    voice_rule = dict(voice_rule or {})
+                    audio_trigger_enabled = self._telegram_audio_trigger_enabled(source)
+                    show_transcription_enabled = self._telegram_show_transcription_enabled(
+                        voice_rule,
+                        source=source,
+                    )
+                    if not show_transcription_enabled and not audio_trigger_enabled:
+                        return None
+                    voice_rule.update({
+                        "audio_trigger": audio_trigger_enabled,
+                        "send_transcript": show_transcription_enabled,
                         "on_keyword_match": "run_ai",
                         "on_no_match": "transcript_only",
-                    }
+                    })
                 if voice_rule is not None:
                     voice_rule_result = await self._apply_telegram_voice_transcription_rule(
                         message_text,
@@ -9039,6 +10256,11 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        # Preserve the actual inbound user text before topic auto-skill bodies,
+        # reply context, media notes, or sender attribution are prepended.
+        # Intent guards must never classify instructions inside those injected
+        # blocks as user write intent.
+        _raw_user_message_text = event.text or ""
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -9068,10 +10290,15 @@ class GatewayRunner:
             event.source = source
         except Exception:
             pass
-
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
+        self._bind_durable_job_session(
+            event,
+            session_key=session_key,
+            session_id=session_entry.session_id,
+            source=source,
+        )
         if self._is_telegram_topic_lane(source):
             try:
                 binding = self._session_db.get_telegram_topic_binding(
@@ -9160,7 +10387,14 @@ class GatewayRunner:
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context,
+            user_request_text=(
+                _raw_user_message_text
+                or getattr(event, "durable_request_text", None)
+                or ""
+            ),
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -9203,7 +10437,7 @@ class GatewayRunner:
                     and had_activity
                     and platform_name not in policy.notify_exclude_platforms
                 )
-                if should_notify:
+                if should_notify and source.platform != Platform.TELEGRAM:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
                         if reset_reason == "suspended":
@@ -9238,40 +10472,53 @@ class GatewayRunner:
             session_entry.auto_reset_reason = None
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
-        # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        # Discord channel_skill_bindings). Supports a single name or ordered
+        # list. Existing sessions can receive newly configured topic skills
+        # once, then remember that the skill body was already injected.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
-            _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
-            try:
-                from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _combined_parts: list[str] = []
-                _loaded_names: list[str] = []
-                for _sname in _skill_names:
-                    _loaded = _load_skill_payload(_sname, task_id=_quick_key)
-                    if _loaded:
-                        _loaded_skill, _skill_dir, _display_name = _loaded
-                        _note = (
-                            f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                            f"Follow its instructions for this session.]"
-                        )
-                        _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
-                        if _part:
-                            _combined_parts.append(_part)
-                            _loaded_names.append(_sname)
-                    else:
-                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
-                if _combined_parts:
-                    # Append the user's original text after all skill payloads
-                    _combined_parts.append(event.text)
-                    event.text = "\n\n".join(_combined_parts)
-                    logger.info(
-                        "[Gateway] Auto-loaded skill(s) %s for session %s",
-                        _loaded_names, session_key,
+        if _auto:
+            _profile_name = str(getattr(context.source, "profile_name", "") or "default")
+            _profile_home = self._profile_home_for_name(_profile_name)
+            _skill_names = _auto_skills_to_load_for_session(
+                session_entry,
+                _auto,
+                is_new_session=_is_new_session,
+                profile_home=_profile_home,
+            )
+            if _skill_names:
+                try:
+                    event.text, _loaded_names, _missing_names = _auto_load_skill_text_for_profile(
+                        _skill_names,
+                        event.text,
+                        task_id=_quick_key,
+                        profile_home=_profile_home,
                     )
-            except Exception as e:
-                logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
+                    for _sname in _missing_names:
+                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
+                    if _loaded_names:
+                        existing_loaded = list(getattr(session_entry, "auto_loaded_skills", None) or [])
+                        for _sname in _loaded_names:
+                            if _sname not in existing_loaded:
+                                existing_loaded.append(_sname)
+                        session_entry.auto_loaded_skills = existing_loaded
+                        existing_versions = dict(
+                            getattr(session_entry, "auto_loaded_skill_versions", None) or {}
+                        )
+                        for _sname in _loaded_names:
+                            _version = _auto_skill_content_version(_profile_home, _sname)
+                            if _version:
+                                existing_versions[_sname] = _version
+                        session_entry.auto_loaded_skill_versions = existing_versions
+                        try:
+                            self.session_store._save()
+                        except Exception as e:
+                            logger.debug("[Gateway] Failed to persist auto-loaded skills: %s", e)
+                        logger.info(
+                            "[Gateway] Auto-loaded skill(s) %s for session %s",
+                            _loaded_names, session_key,
+                        )
+                except Exception as e:
+                    logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
@@ -9668,6 +10915,12 @@ class GatewayRunner:
         )
 
         try:
+            # Telegram audio preprocessing can end in a transcript-only result
+            # (message_text is None above).  Reaching this point means a real
+            # response path has been selected, so the base adapter may now
+            # expose the typing indicator while the answer is generated.
+            event.mark_response_started()
+
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -9689,6 +10942,15 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                durable_job_id=getattr(event, "durable_job_id", None),
+                durable_recovery=bool(
+                    getattr(event, "durable_recovery", False)
+                ),
+                durable_request_text=getattr(
+                    event,
+                    "durable_request_text",
+                    None,
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -9762,6 +11024,12 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+            _runtime_user_config = _load_gateway_config()
+            await self._notify_fallback_activation_once(
+                agent_result.get("fallback_activation"),
+                user_config=_runtime_user_config,
+                actual_model=agent_result.get("model"),
+            )
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -9803,7 +11071,7 @@ class GatewayRunner:
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
                 _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
+                    user_config=_runtime_user_config,
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
@@ -9813,7 +11081,7 @@ class GatewayRunner:
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent"):
+            if _footer_line and response and not agent_result.get("already_sent") and source.platform != Platform.TELEGRAM:
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
@@ -10054,7 +11322,7 @@ class GatewayRunner:
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
                 # still surface the runtime metadata on the final reply.
-                if _footer_line:
+                if _footer_line and source.platform != Platform.TELEGRAM:
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
@@ -10065,6 +11333,11 @@ class GatewayRunner:
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                self._complete_durable_job(
+                    event,
+                    response,
+                    delivered=True,
+                )
                 return None
 
             return response
@@ -10428,10 +11701,33 @@ class GatewayRunner:
         hasn't set ``allow_admin_from`` for the scope, the policy returns
         ``enabled=False`` and this method always returns None.
         """
-        from gateway.slash_access import policy_for_source as _policy_for_source
+        from gateway.slash_access import (
+            is_operator_for_source as _is_operator_for_source,
+            is_operator_only_command as _is_operator_only_command,
+            policy_for_source as _policy_for_source,
+        )
 
         if not canonical_cmd:
             return None
+
+        private_chat_denial = self._private_chat_only_command_denial(source, canonical_cmd)
+        if private_chat_denial is not None:
+            return private_chat_denial
+
+        if _is_operator_only_command(canonical_cmd):
+            if _is_operator_for_source(self.config, source):
+                return None
+            logger.warning(
+                "Operator-only slash command /%s denied for %s:%s",
+                canonical_cmd,
+                source.platform.value if source and source.platform else "?",
+                source.user_id if source else None,
+            )
+            return (
+                f"⛔ /{canonical_cmd} is owner-only here. "
+                "Ask the bot owner to run it or add you to allow_admin_from."
+            )
+
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
@@ -10458,6 +11754,41 @@ class GatewayRunner:
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
 
 
+    def _private_chat_only_command_denial(
+        self, source: Optional[SessionSource], command_name: str
+    ) -> Optional[str]:
+        """Return a denial when a slash command came from a non-DM chat."""
+        chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+        if chat_type in {"dm", "direct", "private", ""}:
+            return None
+        canonical_cmd = str(command_name or "").strip().lower().lstrip("/")
+        try:
+            from hermes_cli.commands import resolve_command as _resolve_command
+            cmd_def = _resolve_command(canonical_cmd)
+            if cmd_def is not None:
+                canonical_cmd = cmd_def.name
+        except Exception:
+            pass
+        if canonical_cmd in _GROUP_OPERATOR_SLASH_COMMANDS:
+            try:
+                from gateway.slash_access import is_operator_for_source as _is_operator_for_source
+                if _is_operator_for_source(self.config, source):
+                    return None
+            except Exception:
+                logger.debug("Failed to resolve group slash operator", exc_info=True)
+        logger.warning(
+            "Slash command /%s denied outside private chat for %s:%s chat=%s",
+            command_name,
+            source.platform.value if source and source.platform else "?",
+            source.user_id if source else None,
+            source.chat_id if source else None,
+        )
+        return (
+            "⛔ Slash commands are disabled outside private chat. "
+            "Open a direct chat with the bot to run commands."
+        )
+
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 
@@ -10466,7 +11797,10 @@ class GatewayRunner:
         (admin / user / unrestricted), and the slash commands they can
         actually run on this scope.
         """
-        from gateway.slash_access import policy_for_source as _policy_for_source
+        from gateway.slash_access import (
+            is_operator_for_source as _is_operator_for_source,
+            policy_for_source as _policy_for_source,
+        )
 
         source = event.source
         policy = _policy_for_source(self.config, source)
@@ -10476,11 +11810,20 @@ class GatewayRunner:
         user_id = (source.user_id if source else None) or "?"
 
         if not policy.enabled:
+            if _is_operator_for_source(self.config, source):
+                tier = "operator (owner allowlist fallback; no admin list configured for this scope)"
+                commands = "all available"
+            else:
+                tier = (
+                    "unrestricted (no admin list configured for this scope; "
+                    "operator-only commands still require the owner)"
+                )
+                commands = "all non-operator commands"
             return (
                 f"**You** — {platform} ({scope})\n"
                 f"User ID: `{user_id}`\n"
-                f"Tier: unrestricted (no admin list configured for this scope)\n"
-                f"Slash commands: all available"
+                f"Tier: {tier}\n"
+                f"Slash commands: {commands}"
             )
 
         if policy.is_admin(user_id):
@@ -10662,6 +12005,23 @@ class GatewayRunner:
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
+        active_job_id = str(
+            getattr(self, "_active_job_ids", {}).get(session_key) or ""
+        )
+        if not active_job_id:
+            store = self._durable_store()
+            if store is not None:
+                try:
+                    jobs = store.active_for_session(session_key)
+                    if jobs:
+                        active_job_id = str(jobs[-1].get("job_id") or "")
+                except Exception:
+                    logger.debug(
+                        "Failed to read durable job for /status",
+                        exc_info=True,
+                    )
+        if active_job_id:
+            lines.append(f"Job ID: `{active_job_id}`")
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         lines.extend([
@@ -10693,6 +12053,10 @@ class GatewayRunner:
                     "state": t("gateway.agents.state_starting") if is_pending else t("gateway.agents.state_running"),
                     "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
                     "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
+                    "job_id": str(
+                        getattr(self, "_active_job_ids", {}).get(session_key)
+                        or ""
+                    ),
                 }
             )
 
@@ -10723,9 +12087,10 @@ class GatewayRunner:
                 current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
                 sid = f" · `{row['session_id']}`" if row["session_id"] else ""
                 model = f" · `{row['model']}`" if row["model"] else ""
+                job = f" · job `{row['job_id']}`" if row["job_id"] else ""
                 lines.append(
                     f"{idx}. `{row['session_key']}` · {row['state']} · "
-                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"
+                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{job}{current}"
                 )
             if len(agent_rows) > 12:
                 lines.append(t("gateway.agents.more", count=len(agent_rows) - 12))
@@ -11103,9 +12468,10 @@ class GatewayRunner:
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from hermes_cli.commands import gateway_help_lines
+        profile_name = self._command_surface_profile_name(getattr(event, "source", None))
         lines = [
             t("gateway.help.header"),
-            *gateway_help_lines(),
+            *gateway_help_lines(profile_name=profile_name),
         ]
         try:
             from agent.skill_commands import get_skill_commands
@@ -11127,6 +12493,7 @@ class GatewayRunner:
 
     async def _handle_commands_command(self, event: MessageEvent) -> str:
         from hermes_cli.commands import gateway_help_lines
+        profile_name = self._command_surface_profile_name(getattr(event, "source", None))
 
         raw_args = event.get_command_args().strip()
         if raw_args:
@@ -11138,7 +12505,7 @@ class GatewayRunner:
             requested_page = 1
 
         # Build combined entry list: built-in commands + skill commands
-        entries = list(gateway_help_lines())
+        entries = list(gateway_help_lines(profile_name=profile_name))
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
@@ -12544,12 +13911,22 @@ class GatewayRunner:
         response: str,
         event: MessageEvent,
         adapter,
-    ) -> None:
+        *,
+        send_text: bool = False,
+        text_metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
-        Called after streaming has already sent the text to the user, so the
-        text itself is already delivered — this only handles file attachments
-        that the normal _process_message_background path would have caught.
+        Normally this is called after streaming has already sent the text, so
+        only the attachments are delivered.  ``send_text=True`` is used by the
+        queued-follow-up handoff, which must deliver the completed first
+        response itself before starting the next turn.  In that mode the
+        cleaned text is sent here as well, preventing raw ``MEDIA:`` paths from
+        leaking through the direct adapter send.
+
+        Returns ``True`` when extraction completed, allowing callers that use
+        ``send_text=True`` to fall back to the raw response only if extraction
+        itself failed.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
@@ -12572,11 +13949,29 @@ class GatewayRunner:
             # extract_local_files scanned text that still contained MEDIA: tags,
             # producing false-positive bare-path matches with the MEDIA: prefix
             # glued on. This matches the chain order in gateway/platforms/base.py.
-            _, cleaned = adapter.extract_images(cleaned)
-            local_files, _ = adapter.extract_local_files(cleaned)
+            extracted_images, cleaned = adapter.extract_images(cleaned)
+            local_files, cleaned = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
 
-            _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            _thread_meta = (
+                text_metadata
+                if text_metadata is not None
+                else self._thread_metadata_for_source(
+                    event.source,
+                    self._reply_anchor_for_event(event),
+                )
+            )
+
+            if send_text:
+                text_content = cleaned.strip()
+                if text_content:
+                    final_text_metadata = dict(_thread_meta or {})
+                    final_text_metadata["hermes_turn_final"] = True
+                    await adapter.send(
+                        event.source.chat_id,
+                        text_content,
+                        metadata=final_text_metadata,
+                    )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -12604,12 +13999,16 @@ class GatewayRunner:
                 else:
                     non_image_local.append(file_path)
 
-            if image_paths:
+            image_attachments = list(extracted_images or [])
+            image_attachments.extend(
+                (f"file://{_quote(p)}", "") for p in image_paths
+            )
+
+            if image_attachments:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
-                        images=images,
+                        images=image_attachments,
                         metadata=_thread_meta,
                     )
                 except Exception as e:
@@ -12657,8 +14056,10 @@ class GatewayRunner:
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
 
+            return True
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+            return False
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
@@ -12753,8 +14154,9 @@ class GatewayRunner:
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
 
-        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-        return t("gateway.background.started", preview=preview, task_id=task_id)
+        # Background execution is an implementation detail; its final response
+        # is delivered by _run_background_task when it exists.
+        return ""
 
     async def _run_background_task(
         self,
@@ -12785,11 +14187,7 @@ class GatewayRunner:
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
-                )
+                logger.error("Background task %s has no provider credentials", task_id)
                 return
 
             platform_key = _platform_config_key(source.platform)
@@ -12870,7 +14268,7 @@ class GatewayRunner:
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
+                logger.error("Background task %s failed: %s", task_id, result["error"])
 
             # Extract media files from the response
             if response:
@@ -12879,19 +14277,10 @@ class GatewayRunner:
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-
                 if text_content:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
+                        content=text_content,
                         metadata=_thread_metadata,
                     )
 
@@ -12918,23 +14307,10 @@ class GatewayRunner:
                     except Exception:
                         pass
             else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
-                )
+                logger.info("Background task %s completed without a final response", task_id)
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
-            try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
-            except Exception:
-                pass
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
@@ -13221,8 +14597,24 @@ class GatewayRunner:
         normalized = {str(item).strip().lower() for item in message_types if str(item).strip()}
         return "audio" in normalized or "all" in normalized
 
-    def _telegram_show_transcription_enabled(self, rule: Optional[Dict[str, Any]] = None) -> bool:
+    def _telegram_show_transcription_enabled(
+        self,
+        rule: Optional[Dict[str, Any]] = None,
+        source: Optional[SessionSource] = None,
+    ) -> bool:
         """Return whether Telegram should echo STT text into chat."""
+        if source is not None:
+            try:
+                chat_value = str(
+                    self._chat_settings_for_source(source).get("show_transcription") or "default"
+                ).strip().lower()
+                if chat_value == "on":
+                    return True
+                if chat_value == "off":
+                    return False
+            except Exception:
+                pass
+
         if isinstance(rule, dict):
             for key in ("show_transcription", "telegram.show_transcription"):
                 if key in rule:
@@ -13309,6 +14701,8 @@ class GatewayRunner:
         return re.sub(r"\s+", " ", text).strip()
 
     def _telegram_transcript_matches_trigger(self, transcript_text: str, rule: Dict[str, Any]) -> bool:
+        if rule.get("audio_trigger") is False or rule.get("triggers_enabled") is False:
+            return False
         triggers = []
         triggers.extend(self._coerce_telegram_trigger_values(rule.get("trigger_keywords")))
         triggers.extend(self._coerce_telegram_trigger_values(rule.get("trigger_aliases")))
@@ -15970,6 +17364,116 @@ class GatewayRunner:
         finally:
             notify_path.unlink(missing_ok=True)
 
+    def _load_fallback_notification_state(
+        self,
+    ) -> Optional[tuple[str, str, str, str]]:
+        """Restore the fallback-notification latch across gateway restarts."""
+        path = self._fallback_notification_state_path
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            signature = payload.get("signature")
+            if (
+                isinstance(signature, list)
+                and len(signature) == 4
+                and all(isinstance(item, str) for item in signature)
+            ):
+                return tuple(signature)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("Could not read fallback notification state: %s", exc)
+        return None
+
+    def _persist_fallback_notification_state(
+        self,
+        signature: Optional[tuple[str, str, str, str]],
+    ) -> None:
+        """Persist or clear the current fallback-notification latch."""
+        path = self._fallback_notification_state_path
+        try:
+            if signature is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_json_write(
+                    path,
+                    {"signature": list(signature)},
+                    indent=2,
+                )
+        except Exception as exc:
+            logger.warning("Could not persist fallback notification state: %s", exc)
+
+    async def _notify_fallback_activation_once(
+        self,
+        event: dict | None,
+        *,
+        user_config: dict,
+        actual_model: str | None,
+    ) -> None:
+        """DM the Telegram home channel once for each fallback activation.
+
+        Repeated turns on the same fallback are silent. Seeing the configured
+        primary model again clears the latch, so a later fallback activation
+        produces a fresh notification.
+        """
+        model_cfg = (user_config or {}).get("model") or {}
+        primary_model = str(model_cfg.get("default") or "").strip()
+        actual = str(actual_model or "").strip()
+
+        def _slug(value: str) -> str:
+            return value.rsplit("/", 1)[-1].strip().lower()
+
+        if not event:
+            if primary_model and actual and _slug(primary_model) == _slug(actual):
+                if self._active_fallback_notification is not None:
+                    self._active_fallback_notification = None
+                    self._persist_fallback_notification_state(None)
+            return
+
+        signature = (
+            str(event.get("primary_provider") or ""),
+            str(event.get("primary_model") or ""),
+            str(event.get("fallback_provider") or ""),
+            str(event.get("fallback_model") or ""),
+        )
+        if signature == self._active_fallback_notification:
+            return
+
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        home = self.config.get_home_channel(Platform.TELEGRAM)
+        if not adapter or not home or not home.chat_id:
+            logger.warning(
+                "Fallback activation detected but Telegram home DM is not configured"
+            )
+            return
+        if str(home.chat_id).startswith("-"):
+            logger.warning(
+                "Fallback activation DM skipped: Telegram home channel %s is not private",
+                home.chat_id,
+            )
+            return
+
+        previous = self._active_fallback_notification
+        self._active_fallback_notification = signature
+        try:
+            result = await adapter.send(
+                str(home.chat_id),
+                _format_fallback_activation_dm(event),
+            )
+            if result is not None and getattr(result, "success", True) is False:
+                raise RuntimeError(
+                    getattr(result, "error", "send returned success=False")
+                )
+            logger.info(
+                "Sent one-time fallback activation DM to Telegram home %s: %s/%s",
+                home.chat_id,
+                signature[2],
+                signature[3],
+            )
+            self._persist_fallback_notification_state(signature)
+        except Exception as exc:
+            self._active_fallback_notification = previous
+            logger.warning("Fallback activation DM failed: %s", exc)
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -16054,7 +17558,12 @@ class GatewayRunner:
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        user_request_text: str = "",
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -16069,7 +17578,12 @@ class GatewayRunner:
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
+            chat_topic=str(context.source.chat_topic or ""),
             user_id=str(context.source.user_id) if context.source.user_id else "",
+            requester_user_id=_gateway_turn_requester_user_id(
+                context.source,
+                user_request_text,
+            ),
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
@@ -16083,6 +17597,8 @@ class GatewayRunner:
             profile_name=str(getattr(context.source, "profile_name", "") or "default"),
             scope_name=str(getattr(context.source, "scope_name", "") or "default"),
             memory_scope=str(getattr(context.source, "memory_scope", "") or "default"),
+            topic_isolation="true" if getattr(context.source, "topic_isolation", False) else "false",
+            user_request=str(user_request_text or ""),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -16314,7 +17830,7 @@ class GatewayRunner:
 
         enriched_parts, transcripts = await self._transcribe_audio_paths_for_inbound_voice(audio_paths)
         transcript_text = "\n\n".join(t for t in transcripts if t)
-        if transcript_text and self._telegram_show_transcription_enabled(rule):
+        if transcript_text and self._telegram_show_transcription_enabled(rule, source=source):
             adapter = self.adapters.get(Platform.TELEGRAM)
             if adapter:
                 try:
@@ -17097,6 +18613,28 @@ class GatewayRunner:
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        if interrupt_reason in {
+            _INTERRUPT_REASON_STOP,
+            _INTERRUPT_REASON_RESET,
+        }:
+            store = self._durable_store()
+            if store is not None:
+                try:
+                    cancelled = store.cancel_session(
+                        session_key,
+                        interrupt_reason,
+                    )
+                    for job_id in cancelled:
+                        getattr(
+                            self,
+                            "_scheduled_durable_job_ids",
+                            set(),
+                        ).discard(job_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to cancel durable gateway jobs for %s",
+                        session_key,
+                    )
         if release_running_state:
             self._release_running_agent_state(session_key)
 
@@ -17590,6 +19128,9 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        durable_job_id: Optional[str] = None,
+        durable_recovery: bool = False,
+        durable_request_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17603,8 +19144,33 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Mini App buttons are scoped to one concrete agent turn. Clear any
+        # unconsumed state before work starts (including proxy turns, where
+        # local MCP completions are not observable and therefore must fail
+        # closed).
+        _turn_adapter = self.adapters.get(source.platform)
+        _begin_miniapp_turn = getattr(_turn_adapter, "begin_miniapp_turn", None)
+        if callable(_begin_miniapp_turn):
+            _begin_miniapp_turn(source.chat_id, source.thread_id)
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if durable_recovery:
+                _original_request = str(durable_request_text or "").strip()
+                if len(_original_request) > 4000:
+                    _original_request = _original_request[:4000] + "…"
+                message = (
+                    f"[System note: Resume durable gateway job "
+                    f"{durable_job_id or ''}. Inspect prior progress, preserve "
+                    f"completed side effects, finish the original task, and "
+                    f"return a clear final result.]\n\n"
+                    f"[Original user task]\n{_original_request}\n"
+                )
+            else:
+                message = _prepend_durable_job_registration_note(
+                    message,
+                    durable_job_id,
+                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -17726,11 +19292,59 @@ class GatewayRunner:
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
+        _loop_for_step = asyncio.get_running_loop()
+        _processing_work_reaction_started = [False]
+
+        def _mark_processing_work_started_from_agent() -> None:
+            if _processing_work_reaction_started[0] or not _run_still_current():
+                return
+            adapter = self.adapters.get(source.platform)
+            marker = getattr(adapter, "mark_processing_work_started", None)
+            if not callable(marker):
+                return
+            _processing_work_reaction_started[0] = True
+            safe_schedule_threadsafe(
+                marker(source, getattr(source, "message_id", None) or event_message_id),
+                _loop_for_step,
+                logger=logger,
+                log_message="processing work reaction scheduling error",
+            )
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
+            if not _run_still_current():
                 return
+
+            if event_type == "processing.status":
+                if str(tool_name or "").strip() == "_processing":
+                    _mark_processing_work_started_from_agent()
+                return
+
+            if event_type == "tool.completed":
+                # Transport metadata must come from the executed tool, never
+                # from words in the request or answer. Telegram's adapter
+                # filters this to successful, mutating Mini App MCP tools and
+                # queues the corresponding app section for final delivery.
+                adapter = self.adapters.get(source.platform)
+                record_miniapp_completion = getattr(
+                    adapter,
+                    "record_miniapp_tool_completion",
+                    None,
+                )
+                if callable(record_miniapp_completion):
+                    try:
+                        record_miniapp_completion(
+                            source.chat_id,
+                            source.thread_id,
+                            tool_name,
+                            is_error=bool(kwargs.get("is_error", False)),
+                            result=kwargs.get("result"),
+                        )
+                    except Exception as _miniapp_err:
+                        logger.debug(
+                            "Mini App tool-completion tracking failed: %s",
+                            _miniapp_err,
+                        )
 
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
@@ -17764,6 +19378,9 @@ class GatewayRunner:
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in {"tool.started",}:
+                return
+
+            if not progress_queue:
                 return
 
             # Suppress tool-progress bubbles once the user has sent `stop`.
@@ -18198,7 +19815,6 @@ class GatewayRunner:
         stream_consumer_holder = [None]  # Mutable container for stream consumer
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
-        _loop_for_step = asyncio.get_running_loop()
         _hooks_ref = self.hooks
 
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
@@ -18314,12 +19930,14 @@ class GatewayRunner:
             # runtime budget settings bridged into env vars.
             _reload_runtime_env_preserving_config_authority()
 
+            _runtime_fallback_event = None
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
                 )
+                _runtime_fallback_event = _consume_runtime_fallback_activation()
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",
@@ -18459,6 +20077,7 @@ class GatewayRunner:
                     "profile.home": str(profile_home),
                     "profile.scope": str(getattr(source, "scope_name", "") or "default"),
                     "profile.memory_scope": str(getattr(source, "memory_scope", "") or "default"),
+                    "profile.topic_isolation": "true" if getattr(source, "topic_isolation", False) else "false",
                     "source.platform": getattr(getattr(source, "platform", None), "value", source.platform),
                     "source.chat_id": str(getattr(source, "chat_id", "") or ""),
                     "source.thread_id": str(getattr(source, "thread_id", "") or ""),
@@ -18527,7 +20146,7 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_callback = progress_callback
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -18624,6 +20243,10 @@ class GatewayRunner:
                     pass
 
                 send_ok = False
+                clarify_metadata = dict(_status_thread_metadata or {})
+                requester_user_id = _gateway_turn_requester_user_id(source, message)
+                if requester_user_id:
+                    clarify_metadata["gateway_requester_user_id"] = requester_user_id
                 fut = safe_schedule_threadsafe(
                     _status_adapter.send_clarify(
                         chat_id=_status_chat_id,
@@ -18631,7 +20254,7 @@ class GatewayRunner:
                         choices=list(choices) if choices else None,
                         clarify_id=clarify_id,
                         session_key=session_key or "",
-                        metadata=_status_thread_metadata,
+                        metadata=clarify_metadata or None,
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -18771,8 +20394,13 @@ class GatewayRunner:
 
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                approval_heading = (
+                    "Cross-chat send requires approval"
+                    if approval_data.get("approval_kind") == "action"
+                    else "Dangerous command requires approval"
+                )
                 msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
+                    f"⚠️ **{approval_heading}:**\n"
                     f"```\n{cmd_preview}\n```\n"
                     f"Reason: {desc}\n\n"
                     f"Reply `/approve` to execute, `/approve session` to approve this pattern "
@@ -18793,6 +20421,12 @@ class GatewayRunner:
                         _approval_send_fut.result(timeout=15)
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
+
+            message = _prepend_durable_job_registration_note(
+                message,
+                durable_job_id,
+                durable_recovery=durable_recovery,
+            )
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -18845,7 +20479,33 @@ class GatewayRunner:
                 and _interruption_is_fresh
             )
 
-            if _is_resume_pending:
+            if durable_recovery:
+                _reason = (
+                    getattr(_resume_entry, "resume_reason", None)
+                    if _resume_entry is not None
+                    else None
+                ) or "restart_interrupted"
+                _reason_phrase = (
+                    "a gateway restart"
+                    if _reason == "restart_timeout"
+                    else "a gateway shutdown"
+                    if _reason == "shutdown_timeout"
+                    else "a gateway interruption"
+                )
+                _job_id = str(durable_job_id or "")
+                _original_request = str(durable_request_text or "").strip()
+                if len(_original_request) > 4000:
+                    _original_request = _original_request[:4000] + "…"
+                message = (
+                    f"[System note: Resume durable gateway job {_job_id}. "
+                    f"Its previous run was interrupted by {_reason_phrase}. "
+                    f"Inspect the intact conversation/tool history, preserve "
+                    f"completed side effects, do not blindly repeat successful "
+                    f"actions, and finish the original task. Always return a "
+                    f"clear final result for delivery.]\n\n"
+                    f"[Original user task]\n{_original_request}\n"
+                )
+            elif _is_resume_pending:
                 _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
                 _reason_phrase = (
                     "a gateway restart"
@@ -18984,12 +20644,12 @@ class GatewayRunner:
                     "context_length": _context_length,
                 }
             
-            # Scan tool results for MEDIA:<path> tags that need to be delivered
-            # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-            # in its JSON response, but the model's final text reply usually
-            # doesn't include them.  We collect unique tags from tool results and
-            # append any that aren't already present in the final response, so the
-            # adapter's extract_media() can find and deliver the files exactly once.
+            # Scan producer-tool results for deliverables that need native
+            # delivery. TTS embeds MEDIA: tags in JSON, while image_generate
+            # returns an image path/URL that the model can accidentally omit
+            # from its final text. Collect current-turn outputs and append only
+            # those not already referenced by the final response, so the
+            # adapter can deliver each file exactly once.
             #
             # Scope the scan to THIS turn's tool results only. ``agent_history``
             # was passed into run_conversation as ``conversation_history``, so the
@@ -19004,24 +20664,24 @@ class GatewayRunner:
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
-                media_tags, has_voice_directive = _collect_auto_append_media_tags(
-                    result.get("messages", []),
-                    history_offset=len(agent_history),
-                    history_media_paths=_history_media_paths,
-                )
+            media_tags, has_voice_directive = _collect_auto_append_media_tags(
+                result.get("messages", []),
+                history_offset=len(agent_history),
+                history_media_paths=_history_media_paths,
+                final_response=final_response,
+            )
 
-                if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
-            
+            if media_tags:
+                seen = set()
+                unique_tags = []
+                for tag in media_tags:
+                    if tag not in seen:
+                        seen.add(tag)
+                        unique_tags.append(tag)
+                if has_voice_directive:
+                    unique_tags.insert(0, "[[audio_as_voice]]")
+                final_response = final_response + "\n" + "\n".join(unique_tags)
+
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
             # If so, update the session store entry so the NEXT message loads
@@ -19137,10 +20797,15 @@ class GatewayRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": getattr(agent, "provider", None) if agent else runtime_kwargs.get("provider"),
+                "fallback_activation": (
+                    result.get("fallback_activation")
+                    or _runtime_fallback_event
+                ),
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
-                "response_transformed": result.get("response_transformed", False),
+                "response_transformed": bool(result.get("response_transformed", False)),
             }
         
         # Start progress message sender if enabled
@@ -19299,7 +20964,18 @@ class GatewayRunner:
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                _active_job_id = str(
+                    getattr(self, "_active_job_ids", {}).get(session_key) or ""
+                )
+                _job_detail = (
+                    f" · jobId `{_active_job_id}`"
+                    if _active_job_id
+                    else ""
+                )
+                _heartbeat_text = (
+                    f"⏳ Working — {_elapsed_mins} min"
+                    f"{_status_detail}{_job_detail}"
+                )
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -19654,14 +21330,28 @@ class GatewayRunner:
                     if first_response and not _already_streamed:
                         try:
                             logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response with attachment processing before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
+                            _first_response_event = MessageEvent(
+                                source=source,
+                                text=message,
+                                message_type=MessageType.TEXT,
+                                message_id=event_message_id,
                             )
+                            _first_response_processed = await self._deliver_media_from_response(
+                                first_response,
+                                _first_response_event,
+                                adapter,
+                                send_text=True,
+                                text_metadata=_status_thread_metadata,
+                            )
+                            if not _first_response_processed:
+                                await adapter.send(
+                                    source.chat_id,
+                                    first_response,
+                                    metadata=_status_thread_metadata,
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
@@ -20102,7 +21792,10 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 result = mempalace.refresh_all_profiles_if_due()
                 refreshed = int(result.get("refreshed") or 0)
                 if refreshed:
-                    logger.info("MemPalace refresh: rebuilt %d profile(s)", refreshed)
+                    processed = 0
+                    for item in result.get("profiles") or []:
+                        processed += int(item.get("history_messages_processed") or 0)
+                    logger.info("MemPalace refresh: processed %d message(s) across %d profile(s)", processed, refreshed)
             except Exception as e:
                 logger.debug("MemPalace refresh tick error: %s", e)
 

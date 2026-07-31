@@ -64,6 +64,16 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+_PROCESSING_STATUS_MARKER_RE = re.compile(
+    r"\[\[\s*(?:processing|status|work_status)\s*:\s*(?:eyes|eye|work|research|long|👀)\s*\]\]",
+    re.IGNORECASE,
+)
+_PRIVATE_REASONING_PREFIX_RE = re.compile(
+    r"^\s*(?:analysis\s*:|we\s+(?:need|should)\s+to\s+(?:answer|respond)\b|"
+    r"let(?:'s|\s+us)\s+(?:answer|respond|craft)\b)",
+    re.IGNORECASE,
+)
+
 _LIVE_TOOL_UNAVAILABLE_RE = re.compile(
     r"(?:"
     r"\b(?:no|without)\b.{0,100}\b(?:available|accessible|provided|exposed|registered|enabled|live)\b"
@@ -175,6 +185,64 @@ def _force_exact_tool_choice(api_kwargs: dict, api_mode: str, tool_name: str) ->
             "type": "function",
             "function": {"name": tool_name},
         }
+
+
+def _looks_like_corrupted_model_output(text: str) -> bool:
+    """Detect severely garbled provider output before it becomes transcript.
+
+    This is deliberately conservative: code, Markdown tables, and terse prose
+    can all contain lots of punctuation, so no single signal is sufficient.
+    The guard requires a long response plus a combination of character noise,
+    extreme line fragmentation, Unicode replacement characters, or a leaked
+    private-reasoning prefix.
+    """
+    body = str(text or "").strip()
+    if len(body) < 160:
+        return False
+
+    visible = [char for char in body if not char.isspace()]
+    if len(visible) < 100:
+        return False
+
+    alnum_ratio = sum(char.isalnum() for char in visible) / len(visible)
+    symbol_ratio = 1.0 - alnum_ratio
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    short_line_ratio = (
+        sum(len(line) <= 12 for line in lines) / len(lines)
+        if lines
+        else 0.0
+    )
+
+    noisy = alnum_ratio < 0.42 and symbol_ratio > 0.50
+    fragmented = len(lines) >= 12 and short_line_ratio >= 0.60
+    has_decode_damage = "\ufffd" in body
+    leaked_reasoning = bool(_PRIVATE_REASONING_PREFIX_RE.search(body))
+    repeated_markup_noise = body.count("&") >= 20
+
+    return (
+        (has_decode_damage and (noisy or fragmented))
+        or (leaked_reasoning and noisy and fragmented)
+        or (repeated_markup_noise and noisy and fragmented)
+    )
+
+
+def _consume_processing_status_marker(text: str) -> tuple[str, bool]:
+    """Remove hidden processing-status markers from assistant text."""
+    if not text:
+        return text, False
+    found = False
+
+    def _replace(_match: re.Match) -> str:
+        nonlocal found
+        found = True
+        return ""
+
+    cleaned = _PROCESSING_STATUS_MARKER_RE.sub(_replace, text)
+    if not found:
+        return text, False
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, True
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
@@ -861,10 +929,12 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    corrupted_response_retries = 0
     live_tool_recovery_attempts: set[str] = set()
     tools_called_this_turn: set[str] = set()
     forced_live_tool_name: Optional[str] = None
     live_tool_recovery_instruction: Optional[str] = None
+    agent._turn_fallback_activation = None
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Per-turn file-mutation verifier state.  Keyed by resolved path;
@@ -1313,7 +1383,11 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback(
+                            reason=FailoverReason.rate_limit
+                        ):
+                            if getattr(agent, "_turn_fallback_activation", None):
+                                agent._turn_fallback_activation["detail"] = _nous_msg
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -1567,6 +1641,11 @@ def run_conversation(
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
+                        if getattr(agent, "_turn_fallback_activation", None):
+                            agent._turn_fallback_activation.update({
+                                "reason": "malformed_response",
+                                "detail": "Provider returned an empty or malformed API response.",
+                            })
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False
@@ -1638,6 +1717,11 @@ def run_conversation(
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                         if agent._try_activate_fallback():
+                            if getattr(agent, "_turn_fallback_activation", None):
+                                agent._turn_fallback_activation.update({
+                                    "reason": "malformed_response",
+                                    "detail": _failure_hint,
+                                })
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -2887,6 +2971,10 @@ def run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
+                            if getattr(agent, "_turn_fallback_activation", None):
+                                agent._turn_fallback_activation["detail"] = (
+                                    agent._summarize_api_error(api_error)
+                                )
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -3286,7 +3374,11 @@ def run_conversation(
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
+                        if getattr(agent, "_turn_fallback_activation", None):
+                            agent._turn_fallback_activation["detail"] = (
+                                agent._summarize_api_error(api_error)
+                            )
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False
@@ -3430,7 +3522,11 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
+                        if getattr(agent, "_turn_fallback_activation", None):
+                            agent._turn_fallback_activation["detail"] = (
+                                agent._summarize_api_error(api_error)
+                            )
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False
@@ -3647,6 +3743,23 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            if assistant_message.content:
+                _clean_content, _processing_status_requested = _consume_processing_status_marker(
+                    assistant_message.content
+                )
+                if _processing_status_requested:
+                    assistant_message.content = _clean_content
+                    if agent.tool_progress_callback:
+                        try:
+                            agent.tool_progress_callback(
+                                "processing.status",
+                                "_processing",
+                                "eyes",
+                                None,
+                            )
+                        except Exception:
+                            pass
 
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -4394,6 +4507,11 @@ def run_conversation(
                             "switching to fallback provider..."
                         )
                         if agent._try_activate_fallback():
+                            if getattr(agent, "_turn_fallback_activation", None):
+                                agent._turn_fallback_activation.update({
+                                    "reason": "empty_response",
+                                    "detail": "Model returned no visible content after retries.",
+                                })
                             agent._empty_content_retries = 0
                             agent._buffer_status(
                                 f"↻ Switched to fallback: {agent.model} "
@@ -4494,6 +4612,47 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+
+                # Fail closed on obviously damaged provider output. A real
+                # incident returned 2.6K characters of replacement glyphs,
+                # isolated punctuation, and leaked "We need to answer"
+                # scratchpad text; it was previously persisted and delivered
+                # as a normal Telegram reply. Do not append the damaged turn
+                # to ``messages``. Prefer the next configured fallback, and if
+                # none is available persist only a safe failure explanation.
+                if _looks_like_corrupted_model_output(final_response):
+                    corrupted_response_retries += 1
+                    logger.warning(
+                        "Blocked corrupted model output (%d chars, attempt %d): "
+                        "model=%s provider=%s",
+                        len(final_response),
+                        corrupted_response_retries,
+                        agent.model,
+                        agent.provider,
+                    )
+                    if (
+                        corrupted_response_retries <= 2
+                        and agent._try_activate_fallback()
+                    ):
+                        if getattr(agent, "_turn_fallback_activation", None):
+                            agent._turn_fallback_activation["reason"] = "corrupted_output"
+                        agent._buffer_status(
+                            "⚠️ Model returned a corrupted response — "
+                            "switching to the next fallback provider..."
+                        )
+                        continue
+
+                    final_response = (
+                        "⚠️ The model returned a corrupted response, so it was "
+                        "blocked before delivery. Please retry your message."
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": final_response,
+                        "finish_reason": "corrupted_response_blocked",
+                    })
+                    _turn_exit_reason = "corrupted_response_blocked"
+                    break
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
@@ -4861,6 +5020,9 @@ def run_conversation(
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,
+        "fallback_activation": getattr(
+            agent, "_turn_fallback_activation", None
+        ),
         "base_url": agent.base_url,
         "input_tokens": agent.session_input_tokens,
         "output_tokens": agent.session_output_tokens,

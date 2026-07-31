@@ -108,6 +108,14 @@ def _source_platform(source: SessionSource) -> str:
 
 
 def resolve_profile_for_source(config: ProfileRouteConfig, source: SessionSource) -> str:
+    route = find_profile_route_for_source(config, source)
+    if route is not None:
+        return route.profile
+    return config.default_profile or "default"
+
+
+def find_profile_route_for_source(config: ProfileRouteConfig, source: SessionSource) -> ProfileRoute | None:
+    """Return the explicit enabled profile route matching *source*, if any."""
     platform = _source_platform(source)
     chat_id = _clean_text(getattr(source, "chat_id", ""))
     thread_id = _clean_text(getattr(source, "thread_id", ""))
@@ -119,8 +127,8 @@ def resolve_profile_for_source(config: ProfileRouteConfig, source: SessionSource
         if route.platform != platform or route.chat_id != chat_id:
             continue
         if route.thread_id and route.thread_id == thread_id:
-            return route.profile
+            return route
         if not route.thread_id:
-            chat_match = route.profile
+            chat_match = route
 
-    return chat_match or config.default_profile or "default"
+    return chat_match

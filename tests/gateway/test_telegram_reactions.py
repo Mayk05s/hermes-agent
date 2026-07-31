@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.base import (
+    AgentControlResponse,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+)
 from gateway.session import SessionSource
 
 
@@ -18,6 +23,8 @@ def _make_adapter(**extra_env):
     adapter.config = PlatformConfig(enabled=True, token="fake-token")
     adapter._bot = AsyncMock()
     adapter._bot.set_message_reaction = AsyncMock()
+    adapter._processing_reaction_visible = set()
+    adapter._background_tasks = set()
     return adapter
 
 
@@ -81,6 +88,61 @@ def test_reactions_disabled_with_no(monkeypatch):
     assert adapter._reactions_enabled() is False
 
 
+# ── lifecycle reaction settings ──────────────────────────────────────
+
+
+def test_reaction_setting_reads_env(monkeypatch):
+    from gateway.platforms.telegram import TelegramAdapter
+
+    monkeypatch.setenv("TELEGRAM_REACTION_SUCCESS", "\U0001f389")
+
+    assert TelegramAdapter._reaction_setting("TELEGRAM_REACTION_SUCCESS", "\u2705") == "\U0001f389"
+
+
+@pytest.mark.asyncio
+async def test_apply_reaction_action_clear(monkeypatch):
+    adapter = _make_adapter()
+    adapter._clear_reactions = AsyncMock(return_value=True)
+    adapter._set_reaction = AsyncMock(return_value=True)
+
+    result = await adapter._apply_reaction_action("123", "456", "clear")
+
+    assert result is True
+    adapter._clear_reactions.assert_awaited_once_with("123", "456")
+    adapter._set_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_reaction_action_clears_when_terminal_reaction_fails(monkeypatch):
+    adapter = _make_adapter()
+    adapter._clear_reactions = AsyncMock(return_value=True)
+    adapter._set_reaction = AsyncMock(return_value=False)
+
+    result = await adapter._apply_reaction_action(
+        "123",
+        "456",
+        "\u2705",
+        clear_on_failure=True,
+    )
+
+    assert result is True
+    adapter._set_reaction.assert_awaited_once_with("123", "456", "\u2705")
+    adapter._clear_reactions.assert_awaited_once_with("123", "456")
+
+
+@pytest.mark.asyncio
+async def test_apply_reaction_action_keep(monkeypatch):
+    adapter = _make_adapter()
+    adapter._clear_reactions = AsyncMock(return_value=True)
+    adapter._set_reaction = AsyncMock(return_value=True)
+
+    result = await adapter._apply_reaction_action("123", "456", "keep")
+
+    assert result is True
+    adapter._clear_reactions.assert_not_awaited()
+    adapter._set_reaction.assert_not_awaited()
+
+
 # ── _set_reaction ────────────────────────────────────────────────────
 
 
@@ -126,18 +188,64 @@ async def test_set_reaction_handles_api_error_gracefully(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_adds_eyes_reaction(monkeypatch):
-    """Processing start should add eyes reaction when enabled."""
+async def test_on_processing_start_does_not_react(monkeypatch):
+    """Plain message processing should not get eyes automatically."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
 
     await adapter.on_processing_start(event)
 
+    adapter._bot.set_message_reaction.assert_not_awaited()
+    assert adapter._processing_reaction_visible == set()
+
+
+@pytest.mark.asyncio
+async def test_mark_processing_work_started_adds_eyes(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
         reaction="\U0001f440",
+    )
+    assert ("123", "456") in adapter._processing_reaction_visible
+
+
+@pytest.mark.asyncio
+async def test_mark_processing_work_started_is_idempotent(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f440",
+    )
+    assert ("123", "456") in adapter._processing_reaction_visible
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_uses_configured_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.setenv("TELEGRAM_REACTION_IN_PROGRESS", "\U0001f50e")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f50e",
     )
 
 
@@ -175,26 +283,27 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_success(monkeypatch):
-    """Successful processing should set thumbs-up reaction."""
+    """Successful processing without visible status does nothing."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.delenv("TELEGRAM_REACTION_SUCCESS", raising=False)
     adapter = _make_adapter()
     event = _make_event()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    adapter._bot.set_message_reaction.assert_awaited_once_with(
-        chat_id=123,
-        message_id=456,
-        reaction="\U0001f44d",
-    )
+    adapter._bot.set_message_reaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_failure(monkeypatch):
-    """Failed processing should set thumbs-down reaction."""
+    """Failed processing swaps visible status to the default thumbs-down."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.delenv("TELEGRAM_REACTION_FAILURE", raising=False)
     adapter = _make_adapter()
     event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+    adapter._bot.set_message_reaction.reset_mock()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
@@ -203,6 +312,70 @@ async def test_on_processing_complete_failure(monkeypatch):
         message_id=456,
         reaction="\U0001f44e",
     )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_success_can_clear(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.setenv("TELEGRAM_REACTION_SUCCESS", "clear")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+    adapter._bot.set_message_reaction.reset_mock()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_failure_uses_configured_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.setenv("TELEGRAM_REACTION_FAILURE", "\U0001f6ab")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+    adapter._bot.set_message_reaction.reset_mock()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f6ab",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_clears_when_configured_reaction_fails(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.setenv("TELEGRAM_REACTION_SUCCESS", "\u2705")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+    adapter._bot.set_message_reaction = AsyncMock(
+        side_effect=[RuntimeError("reaction is not allowed"), None]
+    )
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert adapter._bot.set_message_reaction.await_args_list[0].kwargs == {
+        "chat_id": 123,
+        "message_id": 456,
+        "reaction": "\u2705",
+    }
+    assert adapter._bot.set_message_reaction.await_args_list[1].kwargs == {
+        "chat_id": 123,
+        "message_id": 456,
+        "reaction": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -222,12 +395,15 @@ async def test_on_processing_complete_cancelled_clears_reaction(monkeypatch):
     """Cancelled processing should clear the in-progress reaction.
 
     Without this clear, the 👀 reaction lingers on the user's message
-    indefinitely (until another agent run swaps it for 👍/👎). On a
+    indefinitely (until another agent run swaps it for a terminal reaction). On a
     ``/stop`` that ends a session, that reaction never gets cleaned up.
     """
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+    adapter._bot.set_message_reaction.reset_mock()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
 
@@ -274,6 +450,92 @@ async def test_clear_reactions_returns_false_without_bot(monkeypatch):
     assert result is False
 
 
+# ── agent control responses ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_control_reaction_sets_reaction_even_when_lifecycle_disabled(monkeypatch):
+    """Explicit reaction markers are separate from lifecycle reactions."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    result = await adapter.handle_agent_control_response(
+        event,
+        AgentControlResponse(action="reaction", emoji="\U0001f60d"),
+    )
+
+    assert result.success is True
+    assert result.message_id is None
+    assert result.raw_response["reaction_sent"] is True
+    assert getattr(event, "_agent_control_response") == "reaction"
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f60d",
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_silent_clears_lifecycle_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    result = await adapter.handle_agent_control_response(
+        event,
+        AgentControlResponse(action="silent"),
+    )
+
+    assert result.success is True
+    assert result.raw_response["reaction_cleared"] is True
+    assert getattr(event, "_agent_control_response") == "silent"
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_processing_complete_preserves_control_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.handle_agent_control_response(
+        event,
+        AgentControlResponse(action="reaction", emoji="\U0001f44d"),
+    )
+    adapter._bot.set_message_reaction.reset_mock()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_control_response_replaces_visible_processing_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.mark_processing_work_started(event.source, event.message_id)
+    adapter._bot.set_message_reaction.reset_mock()
+
+    await adapter.handle_agent_control_response(
+        event,
+        AgentControlResponse(action="reaction", emoji="\U0001f44d"),
+    )
+
+    assert adapter._processing_reaction_visible == set()
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f44d",
+    )
+
+
 # ── config.py bridging ───────────────────────────────────────────────
 
 
@@ -282,20 +544,32 @@ def test_config_bridges_telegram_reactions(monkeypatch, tmp_path):
     import yaml
     config_file = tmp_path / "config.yaml"
     config_file.write_text(yaml.dump({
-        "telegram": {
+            "telegram": {
             "reactions": True,
+            "reaction_in_progress": "\U0001f440",
+            "reaction_success": "clear",
+            "reaction_failure": "\U0001f44e",
+            "reaction_cancelled": "clear",
         },
-    }))
+    }, allow_unicode=True))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # Use setenv (not delenv) so monkeypatch registers cleanup even when
     # the var doesn't exist yet — load_gateway_config will overwrite it.
     monkeypatch.setenv("TELEGRAM_REACTIONS", "")
+    monkeypatch.setenv("TELEGRAM_REACTION_IN_PROGRESS", "")
+    monkeypatch.setenv("TELEGRAM_REACTION_SUCCESS", "")
+    monkeypatch.setenv("TELEGRAM_REACTION_FAILURE", "")
+    monkeypatch.setenv("TELEGRAM_REACTION_CANCELLED", "")
 
     from gateway.config import load_gateway_config
     load_gateway_config()
 
     import os
     assert os.getenv("TELEGRAM_REACTIONS") == "true"
+    assert os.getenv("TELEGRAM_REACTION_IN_PROGRESS") == "\U0001f440"
+    assert os.getenv("TELEGRAM_REACTION_SUCCESS") == "clear"
+    assert os.getenv("TELEGRAM_REACTION_FAILURE") == "\U0001f44e"
+    assert os.getenv("TELEGRAM_REACTION_CANCELLED") == "clear"
 
 
 def test_config_reactions_env_takes_precedence(monkeypatch, tmp_path):

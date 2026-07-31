@@ -11,6 +11,8 @@ INHERIT = "default"
 
 TRISTATE_FIELDS = {
     "transcribe_audio",
+    "audio_trigger",
+    "show_transcription",
     "show_reasoning",
     "interim_assistant_messages",
     "long_running_notifications",
@@ -22,6 +24,8 @@ TRISTATE_FIELDS = {
 SETTING_FIELDS = (
     "response_mode",
     "transcribe_audio",
+    "audio_trigger",
+    "show_transcription",
     "reply_to_mode",
     "tool_progress",
     "show_reasoning",
@@ -148,6 +152,11 @@ def _normalize_values(raw: Any) -> dict[str, Any]:
     for field_name in SETTING_FIELDS:
         if field_name in raw:
             values[field_name] = _coerce_setting(field_name, raw.get(field_name))
+    if (
+        values.get("audio_trigger", INHERIT) == INHERIT
+        and values.get("transcribe_audio", INHERIT) != INHERIT
+    ):
+        values["audio_trigger"] = values["transcribe_audio"]
     return values
 
 

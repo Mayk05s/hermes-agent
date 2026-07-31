@@ -102,6 +102,28 @@ async def test_silence_narration_dropped_pre_send(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_reaction_marker_dropped_pre_send(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_FILTER_SILENCE_NARRATION", "0")
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:99887766")
+
+    result = await router._deliver_to_platform(
+        target,
+        "[[reaction:\U0001f44d]]",
+        metadata=None,
+    )
+
+    assert adapter.calls == []
+    assert result == {
+        "success": True,
+        "filtered": "control_reaction",
+        "delivered": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_real_message_is_delivered(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_FILTER_SILENCE_NARRATION", raising=False)

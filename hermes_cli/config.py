@@ -1250,6 +1250,37 @@ DEFAULT_CONFIG = {
             "timeout": 60,
             "extra_body": {},
         },
+        # MemPalace extractor — converts chat-history batches into durable
+        # knowledge-graph entities/facts/relations. Route this to a strong
+        # reasoning model; it is triggered from the MemPalace UI and optional
+        # background consolidator.
+        "mempalace_extractor": {
+            "provider": "openai-codex",
+            "model": "gpt-5.4",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 180,
+            "extra_body": {},
+            "fallback_chain": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                {"provider": "auto", "model": ""},
+            ],
+        },
+        # MemPalace validator — post-pass over graph noise candidates after
+        # extraction. Route this to a smarter model when you want conservative
+        # semantic cleanup instead of deleting every rule-based candidate.
+        "mempalace_validator": {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 240,
+            "extra_body": {},
+            "fallback_chain": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                {"provider": "auto", "model": ""},
+            ],
+        },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
         # building over hundreds of candidate skills). "auto" = use main chat
@@ -1355,6 +1386,13 @@ DEFAULT_CONFIG = {
             "fields": ["model", "context_pct", "cwd"],  # Order shown; drop any to hide
         },
         "copy_shortcut": "auto",  # "auto" (platform default) | "ctrl_c" | "ctrl_shift_c" | "disabled"
+    },
+
+    # Person-specific forms of address used by communication styles and the
+    # Telegram gateway guard. Profiles may override/extend this block, but the
+    # root config is the shared address book across profiles.
+    "addressing": {
+        "people": [],
     },
 
     # Web dashboard settings
@@ -1735,7 +1773,11 @@ DEFAULT_CONFIG = {
 
     # Telegram platform settings (gateway mode)
     "telegram": {
-        "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
+        "reactions": False,            # Add status reactions to messages during processing
+        "reaction_in_progress": "👀",  # Reaction while the bot is processing
+        "reaction_success": "clear",   # Reaction after success; "clear" removes the in-progress reaction
+        "reaction_failure": "👎",      # Reaction after failure
+        "reaction_cancelled": "clear", # Reaction on cancellation; "clear" removes the in-progress reaction
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
     },

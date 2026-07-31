@@ -192,7 +192,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
                 )
             except Exception:
                 block_message = None
@@ -598,7 +601,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
                 )
             except Exception:
                 pass
@@ -760,6 +766,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+        elif function_name == "recall_access":
+            from agent.agent_runtime_helpers import latest_user_task
+            from tools.recall_access_tool import recall_access_tool as _recall_access_tool
+            function_result = _recall_access_tool(
+                target=function_args.get("target", ""),
+                reason=function_args.get("reason", ""),
+                duration=function_args.get("duration", "one_turn"),
+                platform=function_args.get("platform", ""),
+                chat_id=function_args.get("chat_id", ""),
+                thread_id=function_args.get("thread_id", ""),
+                callback=agent.clarify_callback,
+                user_request=latest_user_task(messages),
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('recall_access', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):
@@ -846,10 +868,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             try:
+                from agent.agent_runtime_helpers import latest_user_task
+
                 function_result = _ra().handle_function_call(
                     function_name, function_args, effective_task_id,
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
+                    user_task=latest_user_task(messages),
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
@@ -868,10 +893,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
+                from agent.agent_runtime_helpers import latest_user_task
+
                 function_result = _ra().handle_function_call(
                     function_name, function_args, effective_task_id,
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
+                    user_task=latest_user_task(messages),
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),

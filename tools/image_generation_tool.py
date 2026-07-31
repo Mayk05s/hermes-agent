@@ -26,7 +26,7 @@ import os
 import datetime
 import threading
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
 # eagerly added ~64 ms to every CLI cold start because
@@ -71,6 +71,8 @@ from tools.tool_backend_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_REFERENCE_IMAGES = 10
 
 
 # ---------------------------------------------------------------------------
@@ -887,7 +889,19 @@ from tools.registry import registry, tool_error
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts. The underlying "
+        "Generate or edit high-quality images when the user "
+        "explicitly asks to create, generate, draw, regenerate, or edit an "
+        "image. Do not call this tool to resend, show, share, reuse, or attach "
+        "an existing/previous/same/this image; reuse the exact URL or file path "
+        "already present in the conversation instead. When the user supplies "
+        "one or more images as character, product, style, composition, or edit "
+        "references, pass every relevant `[Image attached at: ...]` path or "
+        "image URL in `reference_images`, preserving their conversation order. "
+        "State each reference's role explicitly in the prompt, for example "
+        "`Reference image 1 is the cat whose appearance must be preserved; "
+        "reference image 2 supplies the scene and composition.` Images attached "
+        "to the current user message are also recovered automatically if "
+        "`reference_images` is accidentally omitted. The underlying "
         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
         "selectable by the agent. Returns either a URL or an absolute file "
         "path in the `image` field; display it with markdown "
@@ -905,6 +919,18 @@ IMAGE_GENERATE_SCHEMA = {
                 "enum": list(VALID_ASPECT_RATIOS),
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
+            },
+            "reference_images": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": MAX_REFERENCE_IMAGES,
+                "description": (
+                    "Optional ordered image references for generation or editing. "
+                    "Each item may be an absolute local image path from an "
+                    "`[Image attached at: ...]` handle, an http(s) image URL, or "
+                    "a data:image URL. Include all relevant images and explain "
+                    "their roles by index in the prompt."
+                ),
             },
         },
         "required": ["prompt"],
@@ -951,7 +977,56 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _normalize_reference_images(value: Any) -> List[str]:
+    """Return an order-preserving, deduplicated list of image references."""
+    if isinstance(value, str):
+        candidates = [value]
+    elif isinstance(value, (list, tuple)):
+        candidates = list(value)
+    else:
+        candidates = []
+
+    normalized: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        reference = candidate.strip()
+        if not reference or reference in seen:
+            continue
+        seen.add(reference)
+        normalized.append(reference)
+        if len(normalized) >= MAX_REFERENCE_IMAGES:
+            break
+    return normalized
+
+
+def _reference_images_from_user_task(user_task: Any) -> List[str]:
+    """Recover image handles attached to the current user message.
+
+    Native image routing appends stable ``[Image attached at: /path]`` handles
+    to the text part seen by the model.  Tool dispatch also receives that text
+    as ``user_task``.  Recovering the paths here makes the reference flow
+    resilient when a model correctly calls ``image_generate`` but forgets to
+    repeat the handles in its tool arguments.
+    """
+    if not isinstance(user_task, str) or not user_task.strip():
+        return []
+    try:
+        from agent.image_routing import extract_image_refs
+
+        local_paths, image_urls = extract_image_refs(user_task)
+    except Exception as exc:
+        logger.debug("Could not recover current-turn image references: %s", exc)
+        return []
+    return _normalize_reference_images([*local_paths, *image_urls])
+
+
+def _dispatch_to_plugin_provider(
+    prompt: str,
+    aspect_ratio: str,
+    reference_images: Optional[List[str]] = None,
+):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -1008,6 +1083,8 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
         kwargs = {"prompt": prompt, "aspect_ratio": aspect_ratio}
         if configured_model:
             kwargs["model"] = configured_model
+        if reference_images:
+            kwargs["reference_images"] = list(reference_images)
         result = provider.generate(**kwargs)
     except Exception as exc:
         logger.warning(
@@ -1035,10 +1112,17 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    reference_images = _normalize_reference_images(args.get("reference_images"))
+    if not reference_images:
+        reference_images = _reference_images_from_user_task(kw.get("user_task"))
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    dispatched = _dispatch_to_plugin_provider(
+        prompt,
+        aspect_ratio,
+        reference_images=reference_images,
+    )
     if dispatched is not None:
         return dispatched
 

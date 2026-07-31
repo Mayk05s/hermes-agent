@@ -1,7 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
@@ -21,11 +21,13 @@ def _make_adapter(
     group_allowed_chats=None,
     guest_mode=None,
     observe_unmentioned_group_messages=None,
+    voice_trigger_keywords=None,
+    voice_trigger_aliases=None,
     bot_username="hermes_bot",
 ):
     from gateway.platforms.telegram import TelegramAdapter
 
-    extra = {}
+    extra = {"show_transcription": False, "audio_trigger": False}
     if require_mention is not None:
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
@@ -62,6 +64,10 @@ def _make_adapter(
         extra["guest_mode"] = guest_mode
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
+    if voice_trigger_keywords is not None:
+        extra["voice_trigger_keywords"] = voice_trigger_keywords
+    if voice_trigger_aliases is not None:
+        extra["voice_trigger_aliases"] = voice_trigger_aliases
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -191,6 +197,89 @@ def test_unmentioned_group_messages_can_be_observed_without_dispatching():
     asyncio.run(_run())
 
 
+def test_unmentioned_group_observe_defaults_on_for_mention_gated_chats(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=[],
+        group_allowed_chats=[],
+    )
+
+    assert adapter._telegram_observe_unmentioned_group_messages() is True
+    assert adapter._should_observe_unmentioned_group_message(_group_message("side chatter")) is True
+
+
+def test_unmentioned_group_observe_can_still_be_disabled_explicitly():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=False,
+    )
+
+    assert adapter._telegram_observe_unmentioned_group_messages() is False
+    assert adapter._should_observe_unmentioned_group_message(_group_message("side chatter")) is False
+
+
+def test_observed_group_context_does_not_require_chat_allowlists(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=[],
+        group_allowed_chats=[],
+    )
+
+    assert adapter._should_observe_unmentioned_group_message(_group_message("side chatter")) is True
+
+
+def test_allowed_topics_still_limit_observed_group_context(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=[],
+        group_allowed_chats=[],
+        allowed_topics=["7"],
+    )
+
+    assert adapter._should_observe_unmentioned_group_message(_group_message("side", thread_id=7)) is True
+    assert adapter._should_observe_unmentioned_group_message(_group_message("side", thread_id=8)) is False
+
+
+def test_observed_group_source_is_profile_scoped_before_persistence():
+    import dataclasses
+
+    class Runner:
+        def _source_with_profile_scope(self, source):
+            return dataclasses.replace(
+                source,
+                profile_name="sila-treh",
+                scope_name="default",
+                memory_scope="default",
+            )
+
+        async def _handle_message(self, event):
+            return None
+
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    adapter._message_handler = Runner()._handle_message
+    store = _FakeSessionStore()
+    adapter._session_store = store
+    event = adapter._build_message_event(_group_message("side chatter"), MessageType.TEXT, update_id=1007)
+
+    adapter._observe_unmentioned_group_event(event)
+
+    assert len(store.sources) == 1
+    assert store.sources[0].user_id is None
+    assert store.sources[0].profile_name == "sila-treh"
+    assert store.sources[0].scope_name == "default"
+    assert store.sources[0].memory_scope == "default"
+
+
 def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions():
     async def _run():
         adapter = _make_adapter(
@@ -217,7 +306,7 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
         assert event.source.chat_type == "group"
         assert event.source.user_id is None
         assert event.source.user_name is None
-        assert event.text == "[Bob Example|222]\nwhat did Alice say?"
+        assert event.text == "[Bob Example|222]\n@hermes_bot what did Alice say?"
         assert "Existing topic prompt" in event.channel_prompt
         assert "observed Telegram group context" in event.channel_prompt
         assert "current new message" in event.channel_prompt
@@ -347,11 +436,12 @@ def test_observed_group_context_preserves_slash_command_text_for_dispatch():
     assert "observed Telegram group context" in attributed.channel_prompt
 
 
-def test_unmentioned_group_observe_requires_chat_allowlist_for_shared_context():
+def test_unmentioned_group_observe_does_not_require_chat_allowlist_for_shared_context():
     async def _run():
         adapter = _make_adapter(
             require_mention=True,
-            allowed_chats=["-100"],
+            allowed_chats=[],
+            group_allowed_chats=[],
             observe_unmentioned_group_messages=True,
         )
         store = _FakeSessionStore()
@@ -365,7 +455,10 @@ def test_unmentioned_group_observe_requires_chat_allowlist_for_shared_context():
         await adapter._handle_text_message(update, SimpleNamespace())
 
         adapter._message_handler.assert_not_awaited()
-        assert store.messages == []
+        assert len(store.messages) == 1
+        _, message, _ = store.messages[0]
+        assert message["content"] == "[Alice Example|111]\nside chatter"
+        assert message["observed"] is True
 
     asyncio.run(_run())
 
@@ -388,7 +481,7 @@ def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkey
     assert runner._is_user_authorized(source) is True
 
 
-def test_unmentioned_group_observe_respects_chat_allowlist():
+def test_unmentioned_group_observe_ignores_response_chat_allowlist():
     async def _run():
         adapter = _make_adapter(
             require_mention=True,
@@ -407,7 +500,10 @@ def test_unmentioned_group_observe_respects_chat_allowlist():
         await adapter._handle_text_message(update, SimpleNamespace())
 
         adapter._message_handler.assert_not_awaited()
-        assert store.messages == []
+        assert len(store.messages) == 1
+        _, message, _ = store.messages[0]
+        assert message["content"] == "[Alice Example|111]\nside chatter"
+        assert message["observed"] is True
 
     asyncio.run(_run())
 
@@ -654,7 +750,68 @@ def test_chat_settings_response_mode_mentions_overrides_free_response(monkeypatc
     ) is True
 
 
-def test_chat_settings_transcribe_audio_on_allows_passive_unmentioned_audio(monkeypatch):
+def test_chat_settings_audio_trigger_on_allows_passive_unmentioned_audio(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {
+        "chat_settings": {
+            "settings": [
+                {"platform": "telegram", "chat_id": "-200", "audio_trigger": "on"}
+            ]
+        }
+    })
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-200"])
+    msg = _group_message("", chat_id=-200)
+    msg.voice = object()
+    msg.audio = None
+
+    assert adapter._should_process_message(msg) is False
+    assert adapter._telegram_passive_audio_transcription_enabled(msg) is True
+
+
+def test_chat_settings_show_transcription_on_allows_passive_unmentioned_audio(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {
+        "chat_settings": {
+            "settings": [
+                {
+                    "platform": "telegram",
+                    "chat_id": "-200",
+                    "audio_trigger": "off",
+                    "show_transcription": "on",
+                }
+            ]
+        }
+    })
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-200"])
+    msg = _group_message("", chat_id=-200)
+    msg.voice = object()
+    msg.audio = None
+
+    assert adapter._should_process_message(msg) is False
+    assert adapter._telegram_passive_audio_transcription_enabled(msg) is True
+
+
+def test_chat_settings_audio_trigger_does_not_bypass_allowed_chats(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {
+        "chat_settings": {
+            "settings": [
+                {"platform": "telegram", "chat_id": "-201", "audio_trigger": "on"}
+            ]
+        }
+    })
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-200"])
+    msg = _group_message("", chat_id=-201)
+    msg.voice = object()
+    msg.audio = None
+
+    assert adapter._telegram_passive_audio_transcription_enabled(msg) is False
+
+
+def test_legacy_chat_settings_transcribe_audio_maps_to_audio_trigger(monkeypatch):
     import hermes_cli.config as hermes_config
 
     monkeypatch.setattr(hermes_config, "load_config", lambda: {
@@ -669,26 +826,7 @@ def test_chat_settings_transcribe_audio_on_allows_passive_unmentioned_audio(monk
     msg.voice = object()
     msg.audio = None
 
-    assert adapter._should_process_message(msg) is False
     assert adapter._telegram_passive_audio_transcription_enabled(msg) is True
-
-
-def test_chat_settings_transcribe_audio_does_not_bypass_allowed_chats(monkeypatch):
-    import hermes_cli.config as hermes_config
-
-    monkeypatch.setattr(hermes_config, "load_config", lambda: {
-        "chat_settings": {
-            "settings": [
-                {"platform": "telegram", "chat_id": "-201", "transcribe_audio": "on"}
-            ]
-        }
-    })
-    adapter = _make_adapter(require_mention=True, allowed_chats=["-200"])
-    msg = _group_message("", chat_id=-201)
-    msg.voice = object()
-    msg.audio = None
-
-    assert adapter._telegram_passive_audio_transcription_enabled(msg) is False
 
 
 def test_audio_transcription_rule_matches_audio_attachments():
@@ -789,6 +927,33 @@ def test_regex_mention_patterns_allow_custom_wake_words():
     assert adapter._should_process_message(_group_message("hey chompy")) is False
 
 
+def test_text_wake_words_mirror_voice_trigger_vocabulary():
+    adapter = _make_adapter(
+        require_mention=True,
+        voice_trigger_keywords=["трипио", "трипи", "tripio", "tripioo"],
+        voice_trigger_aliases=["3p", "3 p си", "три пи о"],
+    )
+
+    assert adapter._should_process_message(_group_message("Трипио, что это?")) is True
+    assert adapter._should_process_message(_group_message("@Tripioo что это?")) is True
+    assert adapter._should_process_message(_group_message("tripioo check")) is True
+    assert adapter._should_process_message(_group_message("3p си проверь")) is True
+    assert adapter._should_process_message(_group_message("три-пи-о проверь")) is True
+    assert adapter._should_process_message(_group_message("просто болтовня")) is False
+
+
+def test_text_wake_words_preserve_custom_regex_patterns():
+    adapter = _make_adapter(
+        require_mention=True,
+        mention_patterns=[r"^\s*chompy\b"],
+        voice_trigger_keywords=["трипио"],
+    )
+
+    assert adapter._should_process_message(_group_message("chompy status")) is True
+    assert adapter._should_process_message(_group_message("трипио статус")) is True
+    assert adapter._should_process_message(_group_message("hey chompy")) is False
+
+
 def test_invalid_regex_patterns_are_ignored():
     adapter = _make_adapter(require_mention=True, mention_patterns=[r"(", r"^\s*chompy\b"])
 
@@ -807,6 +972,11 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "  observe_unmentioned_group_messages: true\n"
         "  mention_patterns:\n"
         "    - \"^\\\\s*chompy\\\\b\"\n"
+        "  voice_trigger_keywords:\n"
+        "    - \"трипио\"\n"
+        "    - tripioo\n"
+        "  voice_trigger_aliases:\n"
+        "    - 3p\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n"
         "  allowed_chats:\n"
@@ -849,6 +1019,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("allowed_topics") == [8]
     assert tg_cfg.extra.get("exclusive_bot_mentions") is True
     assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
+    assert tg_cfg.extra.get("voice_trigger_keywords") == ["трипио", "tripioo"]
+    assert tg_cfg.extra.get("voice_trigger_aliases") == ["3p"]
 
 
 def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):
@@ -1167,6 +1339,57 @@ def test_triggered_voice_message_uses_shared_session_in_observe_mode():
     asyncio.run(_run())
 
 
+def test_show_transcription_marks_voice_as_gateway_transcription_even_when_reply_triggers_agent(monkeypatch):
+    async def _run():
+        import hermes_cli.config as hermes_config
+
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {
+            "chat_settings": {
+                "settings": [
+                    {
+                        "platform": "telegram",
+                        "chat_id": "-100",
+                        "audio_trigger": "on",
+                        "show_transcription": "on",
+                    }
+                ]
+            }
+        })
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            voice_trigger_keywords=["tripioo"],
+        )
+        adapter.handle_message = AsyncMock()
+        file_obj = SimpleNamespace(
+            download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg voice")),
+        )
+        msg = _group_voice_message()
+        msg.reply_to_message = SimpleNamespace(
+            from_user=SimpleNamespace(id=999),
+            message_id=10,
+            text="previous bot reply",
+            caption=None,
+        )
+        msg.voice = SimpleNamespace(get_file=AsyncMock(return_value=file_obj))
+        update = SimpleNamespace(update_id=3003, message=msg, effective_message=None)
+
+        with patch(
+            "gateway.platforms.telegram.cache_audio_from_bytes",
+            return_value="/tmp/voice.ogg",
+        ):
+            await adapter._handle_media_message(update, SimpleNamespace())
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.telegram_passive_audio_transcription is True
+        assert not hasattr(event, "telegram_audio_force_agent_response")
+        assert event.media_urls == ["/tmp/voice.ogg"]
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # Observed-media caching (unmentioned group attachments)
 # ---------------------------------------------------------------------------
@@ -1355,5 +1578,80 @@ def test_unmentioned_voice_with_matching_transcription_rule_dispatches_for_runne
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "-100"
+
+    asyncio.run(_run())
+
+
+def test_boxmap_miniapp_scenario_request_sends_button_without_agent():
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._command_surface_profile_for_message = Mock(return_value="boxmap")
+        adapter._ensure_forum_commands = AsyncMock()
+        adapter._enqueue_text_event = Mock()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7001))
+        update = SimpleNamespace(
+            update_id=4001,
+            message=_group_message("TripiooBot покажи миниап сценарии", thread_id=35),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._enqueue_text_event.assert_not_called()
+        adapter._bot.send_message.assert_awaited_once()
+        kwargs = adapter._bot.send_message.await_args.kwargs
+        assert kwargs["chat_id"] == -100
+        assert kwargs["message_thread_id"] == 35
+        assert kwargs["reply_markup"] is not None
+        assert "BoxMap" in kwargs["text"]
+
+    asyncio.run(_run())
+
+
+def test_boxmap_link_complaint_reply_sends_scenario_button_without_agent():
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._command_surface_profile_for_message = Mock(return_value="boxmap")
+        adapter._ensure_forum_commands = AsyncMock()
+        adapter._enqueue_text_event = Mock()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7002))
+        message = _group_message("TripiooBot где ссылка? нужна кнопка", thread_id=35, reply_to_bot=True)
+        message.reply_to_message.text = "Открой BoxMap-сценарии в миниаппе."
+        update = SimpleNamespace(
+            update_id=4003,
+            message=message,
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._enqueue_text_event.assert_not_called()
+        adapter._bot.send_message.assert_awaited_once()
+        kwargs = adapter._bot.send_message.await_args.kwargs
+        assert kwargs["message_thread_id"] == 35
+        button = kwargs["reply_markup"].inline_keyboard[0][0]
+        assert button.text == "Открыть сценарии"
+        assert button.kwargs.get("url") == "https://t.me/hermes_bot?startapp=boxmap"
+
+    asyncio.run(_run())
+
+
+def test_non_boxmap_miniapp_scenario_request_still_reaches_agent():
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._command_surface_profile_for_message = Mock(return_value="default")
+        adapter._ensure_forum_commands = AsyncMock()
+        adapter._enqueue_text_event = Mock()
+        adapter._bot.send_message = AsyncMock()
+        update = SimpleNamespace(
+            update_id=4002,
+            message=_group_message("TripiooBot покажи миниапп сценарии", thread_id=35),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._bot.send_message.assert_not_called()
+        adapter._enqueue_text_event.assert_called_once()
 
     asyncio.run(_run())

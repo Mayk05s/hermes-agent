@@ -31,6 +31,16 @@ from cron.jobs import (
     trigger_job,
     update_job,
 )
+from cron.access_control import (
+    CronAccessError,
+    access_context_note,
+    canonicalize_skills_for_context,
+    current_access_context,
+    ensure_job_manage_allowed,
+    filter_jobs_for_context,
+    job_access_context,
+    origin_from_session,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +117,34 @@ _CRON_INVISIBLE_CHARS = {
     '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
     '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
 }
+
+_CRON_CALENDAR_MUTATION_RE = re.compile(
+    r"(?is)(?:"
+    r"\b(?:create|add|schedule|book|reschedule|move|update|change|delete|remove|cancel)"
+    r"\b(?:\W+\w+){0,8}\W+\b(?:calendar\s+event|event|meeting|appointment)\b|"
+    r"\b(?:calendar\s+event|event|meeting|appointment)\b"
+    r"(?:\W+\w+){0,8}\W+\b(?:create|add|schedule|book|reschedule|move|update|change|delete|remove|cancel)\b|"
+    r"(?:созда(?:й|ть)|добав(?:ь|ить)|запиш(?:и|ите|ись|ем|у)|"
+    r"постав(?:ь|ить)|запланиру(?:й|йте|ть)|заброниру(?:й|йте|ть)|"
+    r"перенес(?:и|ти)|измен(?:и|ить)|удал(?:и|ить)|отмен(?:и|ить))"
+    r"(?:\W+\w+){0,8}\W+(?:событи\w*|встреч\w*|запис\w*|календар\w*)|"
+    r"(?:событи\w*|встреч\w*|запис\w*|календар\w*)"
+    r"(?:\W+\w+){0,8}\W+(?:созда(?:й|ть)|добав(?:ь|ить)|запиш(?:и|ите|ись|ем|у)|"
+    r"постав(?:ь|ить)|запланиру(?:й|йте|ть)|заброниру(?:й|йте|ть)|"
+    r"перенес(?:и|ти)|измен(?:и|ить)|удал(?:и|ить)|отмен(?:и|ить))"
+    r")"
+)
+
+
+def _cron_calendar_mutation_error(*texts: str) -> str:
+    """Reject cron as a substitute for an immediate Calendar mutation."""
+    if any(_CRON_CALENDAR_MUTATION_RE.search(str(text or "")) for text in texts):
+        return (
+            "Calendar event writes must use the live google_calendar tool directly. "
+            "Do not create or run a cron job to create, update, move, or delete a "
+            "Calendar event."
+        )
+    return ""
 
 # U+200D Zero-Width Joiner is also a legitimate, required part of many
 # Unicode emoji sequences (for example 👨‍👩‍👧, 🏳️‍🌈, ❤️‍🩹, 🧑‍💻).
@@ -267,23 +305,7 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
-    from gateway.session_context import get_session_env
-    origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
-    origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
-    if origin_platform and origin_chat_id:
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
-        if thread_id:
-            logger.debug(
-                "Cron origin captured thread_id=%s for %s:%s",
-                thread_id, origin_platform, origin_chat_id,
-            )
-        return {
-            "platform": origin_platform,
-            "chat_id": origin_chat_id,
-            "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
-            "thread_id": thread_id,
-        }
-    return None
+    return origin_from_session()
 
 
 def _repeat_display(job: Dict[str, Any]) -> str:
@@ -453,7 +475,27 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["workdir"] = job["workdir"]
     if job.get("profile"):
         result["profile"] = job["profile"]
+    if job.get("access_context"):
+        result["access_context"] = access_context_note(job["access_context"])
     return result
+
+
+def _validate_requested_toolsets(
+    requested: Optional[List[str]], access_context: Dict[str, Any]
+) -> Optional[List[str]]:
+    if not requested:
+        return None
+    normalized_requested = [str(item).strip() for item in requested if str(item).strip()]
+    if not normalized_requested:
+        return None
+    allowed = {str(item).strip() for item in access_context.get("enabled_toolsets") or [] if str(item).strip()}
+    blocked = [item for item in normalized_requested if allowed and item not in allowed]
+    if blocked:
+        raise CronAccessError(
+            "Cron job cannot request toolset(s) outside the creator chat/topic: "
+            + ", ".join(blocked)
+        )
+    return normalized_requested
 
 
 def cronjob(
@@ -478,6 +520,7 @@ def cronjob(
     profile: Optional[str] = None,
     no_agent: Optional[bool] = None,
     task_id: str = None,
+    user_task: str = "",
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -488,7 +531,18 @@ def cronjob(
         if normalized == "create":
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
-            canonical_skills = _canonical_skills(skill, skills)
+            calendar_error = _cron_calendar_mutation_error(user_task, prompt or "")
+            if calendar_error:
+                return tool_error(calendar_error, success=False)
+            access_context = current_access_context(requested_profile=profile)
+            requested_toolsets = _validate_requested_toolsets(enabled_toolsets, access_context)
+            if requested_toolsets is not None:
+                access_context = dict(access_context)
+                access_context["enabled_toolsets"] = requested_toolsets
+            canonical_skills = canonicalize_skills_for_context(
+                _canonical_skills(skill, skills),
+                access_context,
+            )
             _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
@@ -515,17 +569,20 @@ def cronjob(
                 if script_error:
                     return tool_error(script_error, success=False)
 
-            # Validate context_from references existing jobs
+            # Validate context_from references existing jobs and keep chained
+            # context inside the same creator chat/topic/profile boundary.
             if context_from:
                 from cron.jobs import get_job as _get_job
                 refs = [context_from] if isinstance(context_from, str) else context_from
                 for ref_id in refs:
-                    if not _get_job(ref_id):
+                    ref_job = _get_job(ref_id)
+                    if not ref_job:
                         return tool_error(
                             f"context_from job '{ref_id}' not found. "
                             "Use cronjob(action='list') to see available jobs.",
                             success=False,
                         )
+                    ensure_job_manage_allowed(ref_job, access_context)
 
             job = create_job(
                 prompt=prompt or "",
@@ -540,9 +597,10 @@ def cronjob(
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
                 context_from=context_from,
-                enabled_toolsets=enabled_toolsets or None,
+                enabled_toolsets=access_context.get("enabled_toolsets") or None,
                 workdir=_normalize_optional_job_value(workdir),
-                profile=_normalize_optional_job_value(profile),
+                profile=access_context.get("profile"),
+                access_context=access_context,
                 no_agent=_no_agent,
             )
             return json.dumps(
@@ -557,13 +615,19 @@ def cronjob(
                     "deliver": job.get("deliver", "local"),
                     "next_run_at": job["next_run_at"],
                     "job": _format_job(job),
+                    "access_context": access_context_note(access_context),
                     "message": f"Cron job '{job['name']}' created.",
                 },
                 indent=2,
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            access_context = current_access_context()
+            visible_jobs = filter_jobs_for_context(
+                list_jobs(include_disabled=include_disabled),
+                access_context,
+            )
+            jobs = [_format_job(job) for job in visible_jobs]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
@@ -593,6 +657,8 @@ def cronjob(
                 {"success": False, "error": f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
                 indent=2,
             )
+        access_context = current_access_context()
+        ensure_job_manage_allowed(job, access_context)
         # Resolve to canonical ID (supports name-based lookup)
         job_id = job["id"]
 
@@ -627,7 +693,11 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            target_context = job_access_context(job)
             if prompt is not None:
+                calendar_error = _cron_calendar_mutation_error(user_task, prompt)
+                if calendar_error:
+                    return tool_error(calendar_error, success=False)
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
                     return tool_error(scan_error, success=False)
@@ -637,7 +707,10 @@ def cronjob(
             if deliver is not None:
                 updates["deliver"] = _normalize_deliver_param(deliver)
             if skills is not None or skill is not None:
-                canonical_skills = _canonical_skills(skill, skills)
+                canonical_skills = canonicalize_skills_for_context(
+                    _canonical_skills(skill, skills),
+                    target_context,
+                )
                 updates["skills"] = canonical_skills
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
             if model is not None:
@@ -664,23 +737,29 @@ def cronjob(
                 if refs:
                     from cron.jobs import get_job as _get_job
                     for ref_id in refs:
-                        if not _get_job(ref_id):
+                        ref_job = _get_job(ref_id)
+                        if not ref_job:
                             return tool_error(
                                 f"context_from job '{ref_id}' not found. "
                                 "Use cronjob(action='list') to see available jobs.",
                                 success=False,
                             )
+                        ensure_job_manage_allowed(ref_job, access_context)
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
-                updates["enabled_toolsets"] = enabled_toolsets or None
+                return tool_error(
+                    "Cron job toolsets are bound to the creator chat/topic and cannot be updated.",
+                    success=False,
+                )
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
             if profile is not None:
-                # Empty string clears the field (restores old behaviour);
-                # otherwise pass raw — update_job() validates / normalizes.
-                updates["profile"] = _normalize_optional_job_value(profile) or None
+                return tool_error(
+                    "Cron job profile is bound to the creator chat/topic and cannot be updated.",
+                    success=False,
+                )
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -730,7 +809,12 @@ Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
+Jobs run in a fresh cron session, but their profile, scoped memory, skill
+visibility, and toolset ceiling are bound to the chat/topic/profile that
+created the job. Prompts must still be self-contained.
+Do not use cron jobs to create, update, move, or delete Calendar events.
+Those mutations must execute immediately through the interactive Calendar
+write path, including one-shot requests.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
@@ -828,7 +912,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "enabled_toolsets": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
+                "description": "Optional create-time toolset restriction. The scheduler binds the job to this requested subset after verifying every requested toolset is allowed by the creator chat/topic/profile. If omitted, the job uses the full current route toolset ceiling. Toolsets cannot be changed on update."
             },
             "workdir": {
                 "type": "string",
@@ -836,7 +920,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "profile": {
                 "type": "string",
-                "description": "Optional Hermes profile name to run the job under. When set, the scheduler resolves that profile, applies a context-local Hermes home override, loads that profile's config/.env for the run, and bridges HERMES_HOME into subprocesses. Any temporary process-environment changes from profile .env loading are restored after the job exits. Use 'default' for the root Hermes profile. Named profiles must already exist. When unset (default), preserves the scheduler's existing profile. On update, pass an empty string to clear. Jobs with profile run sequentially (not parallel) to keep profile-scoped runtime state isolated."
+                "description": "Administrative/local Hermes profile create-time override only. When called from a gateway chat/topic, the job profile is automatically bound to the creator route and any different profile is rejected. Profiles cannot be changed on update. The scheduler applies a context-local Hermes home override and loads that profile's config/.env for the run."
             },
         },
         "required": ["action"]
@@ -895,6 +979,7 @@ registry.register(
         profile=args.get("profile"),
         no_agent=args.get("no_agent"),
         task_id=kw.get("task_id"),
+        user_task=kw.get("user_task", ""),
     ))(),
     check_fn=check_cronjob_requirements,
     emoji="⏰",

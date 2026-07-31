@@ -1403,6 +1403,16 @@ def list_authenticated_providers(
                     has_creds = True
             except Exception as exc:
                 logger.debug("Auth store check failed for %s: %s", pid, exc)
+        # Some OAuth/external providers keep their canonical credential state
+        # outside the shared auth store/pool. Ask auth.py's dispatcher before
+        # deciding the picker should show an unconfigured skeleton row.
+        if not has_creds and overlay.auth_type in {"oauth_device_code", "oauth_external", "external_process"}:
+            try:
+                from hermes_cli.auth import get_auth_status
+                status = get_auth_status(hermes_slug)
+                has_creds = bool(status.get("logged_in") or status.get("configured"))
+            except Exception as exc:
+                logger.debug("Auth status check failed for %s: %s", hermes_slug, exc)
         # Fallback: check the credential pool with full auto-seeding.
         # This catches credentials that exist in external stores (e.g.
         # Codex CLI ~/.codex/auth.json) which _seed_from_singletons()

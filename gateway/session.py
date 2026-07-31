@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,10 @@ class SessionSource:
     profile_name: Optional[str] = None  # Resolved Hermes profile for isolation/routing
     scope_name: Optional[str] = None  # Resolved profile-local topic scope
     memory_scope: Optional[str] = None  # Resolved profile-local memory scope
+    # False shares the profile/memory recall boundary across topics.  The
+    # execution session remains topic-local so sibling topics can run in
+    # parallel without racing on one mutable transcript.
+    topic_isolation: bool = True
     
     @property
     def description(self) -> str:
@@ -143,6 +147,7 @@ class SessionSource:
             d["scope_name"] = self.scope_name
         if self.memory_scope:
             d["memory_scope"] = self.memory_scope
+        d["topic_isolation"] = self.topic_isolation
         return d
 
     @classmethod
@@ -164,6 +169,7 @@ class SessionSource:
             profile_name=data.get("profile_name"),
             scope_name=data.get("scope_name"),
             memory_scope=data.get("memory_scope"),
+            topic_isolation=data.get("topic_isolation", True) is not False,
         )
     
 
@@ -304,6 +310,13 @@ def build_session_context_prompt(
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
+    if context.source.thread_id and not context.source.topic_isolation:
+        lines.append(
+            "**Topic context:** Memory and recall are shared across opted-in "
+            "topics in this same chat. Each topic keeps an independent live "
+            "execution lane, so use session_search when details from a sibling "
+            "topic are relevant. The chat itself remains a hard delivery boundary."
+        )
 
     # User identity.
     # In shared multi-user sessions (shared threads OR shared non-thread groups
@@ -384,6 +397,32 @@ def build_session_context_prompt(
             "You CAN send private (DM) messages via the send_message tool. "
             "Use target='yuanbao:direct:<account_id>' for DM "
             "and target='yuanbao:group:<group_code>' for group chat."
+        )
+    elif context.source.platform == Platform.TELEGRAM:
+        lines.append("")
+        lines.append(
+            "**Platform notes:** You are running inside Telegram. "
+            "Use Telegram native message reactions for small social acknowledgements "
+            "where a text bubble would be redundant: thanks, agreement, laughter, "
+            "approval, celebration, sympathy, or a quick acknowledgement. "
+            "To react without a text reply, make your entire final response exactly "
+            "`[[reaction:<emoji>]]`, choosing one appropriate Telegram reaction emoji such as "
+            "`[[reaction:\U0001f44d]]`, `[[reaction:\u2705]]`, `[[reaction:\u2764\ufe0f]]`, "
+            "`[[reaction:\U0001f602]]`, or `[[reaction:\U0001f44f]]`; the gateway will react "
+            "to the triggering message instead of sending a message. To react and "
+            "also send a textual answer, put the same marker at the beginning or "
+            "end of the answer; the gateway will remove the marker and keep the "
+            "reaction as a native chat reaction. Do not send a bare emoji text bubble "
+            "when it is only meant as a reaction. If nothing "
+            "should be visible at all, make your "
+            "entire final response exactly `[[silent]]`. Do not narrate that "
+            "you are staying silent, leaving someone else to answer, or not "
+            "intervening. If you decide that a request is a long-running plan, "
+            "research task, or multi-step tool task, include the hidden marker "
+            "`[[processing:eyes]]` once before starting that work; the gateway "
+            "will consume the marker and set a temporary 👀 reaction. Do not "
+            "use that marker for quick questions or simple one-tool actions, "
+            "and do not describe processing-status reactions in text."
         )
 
     # Connected platforms
@@ -479,6 +518,16 @@ class SessionEntry:
     # context-note prepend — both wrong for an explicit manual reset.
     # See issue #6508.
     is_fresh_reset: bool = False
+    # Topic/channel skills that have already been injected into this session.
+    # This lets newly configured topic skills backfill into existing sessions
+    # exactly once after a config update, without repeating the full skill body
+    # on every subsequent message.
+    auto_loaded_skills: List[str] = field(default_factory=list)
+    # Content hashes for topic/channel skills injected into this session.
+    # A changed SKILL.md must be injected again even when its name is already
+    # present in ``auto_loaded_skills``; otherwise long-lived Telegram topics
+    # keep following stale instructions until the user resets the session.
+    auto_loaded_skill_versions: Dict[str, str] = field(default_factory=dict)
     
     # Set by the background expiry watcher after it finalizes an expired
     # session (invoking on_session_finalize hooks and evicting the cached
@@ -530,6 +579,8 @@ class SessionEntry:
                 else None
             ),
             "is_fresh_reset": self.is_fresh_reset,
+            "auto_loaded_skills": list(self.auto_loaded_skills or []),
+            "auto_loaded_skill_versions": dict(self.auto_loaded_skill_versions or {}),
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
@@ -582,6 +633,16 @@ class SessionEntry:
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
+            auto_loaded_skills=[
+                str(item).strip()
+                for item in (data.get("auto_loaded_skills") or [])
+                if str(item).strip()
+            ],
+            auto_loaded_skill_versions={
+                str(name).strip(): str(version).strip()
+                for name, version in (data.get("auto_loaded_skill_versions") or {}).items()
+                if str(name).strip() and str(version).strip()
+            },
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
@@ -956,6 +1017,14 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "access_scope": json.dumps(
+                    {
+                        "session_key": session_key,
+                        "origin": source.to_dict(),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             }
 
         # SQLite operations outside the lock
@@ -1326,6 +1395,34 @@ class SessionStore:
             return self._db.get_messages_as_conversation(session_id)
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)
+            return []
+
+    def load_previous_transcript_for_session_key(
+        self,
+        session_key: str,
+        current_session_id: str,
+        *,
+        max_messages: int = 80,
+    ) -> List[Dict[str, Any]]:
+        """Load the previous transcript for the exact same gateway scope."""
+        if not self._db:
+            return []
+        try:
+            previous_id = self._db.find_previous_session_id_for_access_key(
+                session_key,
+                exclude_session_id=current_session_id,
+            )
+            if not previous_id:
+                return []
+            messages = self._db.get_messages_as_conversation(previous_id)
+            limit = max(1, int(max_messages))
+            return list(messages[-limit:])
+        except Exception as e:
+            logger.debug(
+                "Could not load previous transcript for %s: %s",
+                session_key,
+                e,
+            )
             return []
 
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:

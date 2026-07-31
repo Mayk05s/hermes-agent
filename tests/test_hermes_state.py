@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import json
 import sqlite3
 import time
 import pytest
@@ -77,6 +78,32 @@ class TestSessionLifecycle:
         assert session["source"] == "cli"
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
+
+    def test_find_previous_session_id_uses_exact_access_key(self, db):
+        wanted_scope = json.dumps({"session_key": "profile:personal:chat:1:topic:2"})
+        other_scope = json.dumps({"session_key": "profile:personal:chat:9:topic:2"})
+        db.create_session("old", "telegram", access_scope=wanted_scope)
+        db.append_message("old", "user", "Напоминания есть?")
+        db.create_session("other", "telegram", access_scope=other_scope)
+        db.append_message("other", "user", "Unrelated newer topic")
+        db.create_session("current", "telegram", access_scope=wanted_scope)
+
+        assert db.find_previous_session_id_for_access_key(
+            "profile:personal:chat:1:topic:2",
+            exclude_session_id="current",
+        ) == "old"
+        assert db.find_previous_session_id_for_access_key(
+            "profile:personal:chat:missing",
+            exclude_session_id="current",
+        ) is None
+
+    def test_create_session_persists_access_scope(self, db):
+        scope = '{"origin":{"platform":"telegram","thread_id":"777"}}'
+        db.create_session(session_id="s1", source="telegram", access_scope=scope)
+
+        session = db.get_session("s1")
+
+        assert session["access_scope"] == scope
 
 
     def test_get_nonexistent_session(self, db):

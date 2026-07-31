@@ -2673,6 +2673,8 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("triage_specifier", "Triage specifier", "kanban spec fleshing"),
     ("kanban_decomposer", "Kanban decomposer", "task decomposition"),
     ("profile_describer", "Profile describer", "auto profile descriptions"),
+    ("mempalace_extractor", "MemPalace extractor", "graph memory extraction"),
+    ("mempalace_validator", "MemPalace validator", "graph validation and cleanup"),
     ("curator", "Curator", "skill-usage review pass"),
 ]
 

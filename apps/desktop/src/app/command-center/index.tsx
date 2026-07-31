@@ -69,6 +69,7 @@ const AUX_TASKS: readonly AuxTaskMeta[] = [
   { key: 'approval', label: 'Approval', hint: 'Smart auto-approve' },
   { key: 'mcp', label: 'MCP', hint: 'MCP tool routing' },
   { key: 'title_generation', label: 'Title gen', hint: 'Session titles' },
+  { key: 'mempalace_extractor', label: 'MemPalace', hint: 'Graph memory extraction' },
   { key: 'curator', label: 'Curator', hint: 'Skill-usage review' }
 ]
 

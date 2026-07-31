@@ -280,6 +280,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  setAuxiliaryFallbackChain: (body: AuxiliaryFallbackChainRequest) =>
+    fetchJSON<ModelAssignmentResponse>("/api/model/auxiliary/fallback-chain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   saveConfig: (config: Record<string, unknown>) =>
     fetchJSON<{ ok: boolean }>("/api/config", {
       method: "PUT",
@@ -292,6 +298,14 @@ export const api = {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ yaml_text }),
+    }),
+  getGeminiTtsVoices: () =>
+    fetchJSON<GeminiTtsVoicesResponse>("/api/audio/gemini/voices"),
+  saveGeminiTtsSettings: (body: GeminiTtsSettingsRequest) =>
+    fetchJSON<GeminiTtsSettingsResponse>("/api/audio/gemini/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
   getEnvVars: () => fetchJSON<Record<string, EnvVarInfo>>("/api/env"),
   setEnvVar: (key: string, value: string) =>
@@ -410,7 +424,7 @@ export const api = {
       },
     ),
   getProfileSoul: (name: string) =>
-    fetchJSON<{ content: string; exists: boolean }>(
+    fetchJSON<{ content: string; exists: boolean; file: string }>(
       `/api/profiles/${encodeURIComponent(name)}/soul`,
     ),
   updateProfileSoul: (name: string, content: string) =>
@@ -420,6 +434,36 @@ export const api = {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content }),
+      },
+    ),
+  getProfileMemoryFiles: (name: string) =>
+    fetchJSON<{ profile: string; files: ProfileMemoryFile[] }>(
+      `/api/profiles/${encodeURIComponent(name)}/memory-files`,
+    ),
+  updateProfileMemoryFile: (name: string, fileId: ProfileMemoryFileId, content: string) =>
+    fetchJSON<ProfileMemoryFile & { ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/memory-files/${encodeURIComponent(fileId)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      },
+    ),
+  getProfileDisplaySettings: (name: string) =>
+    fetchJSON<ProfileDisplaySettingsResponse>(
+      `/api/profiles/${encodeURIComponent(name)}/display-settings`,
+    ),
+  getProfileResolvedDisplaySettings: (name: string, platform = "telegram", chatId = "") =>
+    fetchJSON<ProfileResolvedDisplaySettingsResponse>(
+      `/api/profiles/${encodeURIComponent(name)}/resolved-display-settings?platform=${encodeURIComponent(platform)}&chat_id=${encodeURIComponent(chatId)}`,
+    ),
+  updateProfileDisplaySettings: (name: string, settings: ProfileDisplaySettings) =>
+    fetchJSON<ProfileDisplaySettingsResponse & { ok: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/display-settings`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
       },
     ),
   getProfileCommunicationStyle: (name: string) =>
@@ -1013,6 +1057,7 @@ export interface PairingApproveRequest {
   platform: string;
   code?: string;
   entry_id?: string;
+  approval_scope?: "chat" | "topic";
   profile?: string;
   create_profile?: boolean;
   new_profile_name?: string;
@@ -1266,6 +1311,59 @@ export interface EnvVarInfo {
   advanced: boolean;
 }
 
+export interface GeminiTtsVoiceInfo {
+  name: string;
+  sample_url: string | null;
+  sample_filename: string;
+  sample_kind: string;
+  is_nanoclaw: boolean;
+}
+
+export interface GeminiTtsProfileInfo {
+  name: string;
+  path: string;
+  provider: string;
+  voice: string;
+  model: string;
+  fallback_model: string;
+  has_gemini_override: boolean;
+}
+
+export interface GeminiTtsReferenceInfo {
+  provider: string;
+  model: string;
+  voice: string;
+  style: string;
+}
+
+export interface GeminiTtsVoicesResponse {
+  available: boolean;
+  provider: string;
+  voice: string;
+  model: string;
+  fallback_model: string;
+  style: string;
+  voice_samples_dir: string;
+  reference: GeminiTtsReferenceInfo;
+  voices: GeminiTtsVoiceInfo[];
+  profiles: GeminiTtsProfileInfo[];
+  updated_profiles?: string[];
+}
+
+export interface GeminiTtsSettingsRequest {
+  provider?: string;
+  voice?: string;
+  model?: string;
+  fallback_model?: string;
+  style?: string;
+  apply_to_profiles?: boolean;
+}
+
+export interface GeminiTtsSettingsResponse extends GeminiTtsVoicesResponse {
+  ok: boolean;
+  updated_profiles: string[];
+}
+
 export interface SessionMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string | null;
@@ -1369,11 +1467,59 @@ export interface ProfileCommunicationStyleOption {
   exists: boolean;
 }
 
+export type ProfileMemoryFileId = "user" | "memory";
+
+export interface ProfileMemoryFile {
+  id: ProfileMemoryFileId;
+  label: string;
+  description: string;
+  file: string;
+  exists: boolean;
+  content: string;
+}
+
 export interface ProfileSkillInfo {
   name: string;
   description: string;
   category: string;
   enabled: boolean;
+}
+
+export interface ProfileDisplaySettings {
+  tool_progress: "off" | "new" | "all" | "verbose";
+  interim_assistant_messages: boolean;
+  cleanup_progress: boolean;
+  tool_preview_length: number;
+}
+
+export interface ProfileDisplaySettingsResponse {
+  profile: string;
+  path: string;
+  settings: ProfileDisplaySettings;
+}
+
+export interface ProfileResolvedDisplaySettings {
+  response_mode: "mentions" | "all" | string;
+  audio_trigger: boolean;
+  transcribe_audio?: "on" | "off" | "standard" | string;
+  show_transcription: boolean;
+  reply_to_mode: "off" | "first" | "all" | string;
+  tool_progress: "off" | "new" | "all" | "verbose" | string;
+  show_reasoning: boolean;
+  tool_preview_length: number;
+  interim_assistant_messages: boolean;
+  long_running_notifications: boolean;
+  busy_ack_detail: boolean;
+  cleanup_progress: boolean;
+  streaming: boolean;
+  gateway_restart_notification: boolean;
+}
+
+export interface ProfileResolvedDisplaySettingsResponse {
+  profile: string;
+  platform: string;
+  path: string;
+  settings: ProfileResolvedDisplaySettings;
 }
 
 export interface ProfileRoute {
@@ -1419,7 +1565,9 @@ export interface ProfileChatSetting {
   chat_id?: string;
   label?: string;
   response_mode: "default" | "mentions" | "all" | string;
-  transcribe_audio: "default" | "on" | "off" | string;
+  audio_trigger: "default" | "on" | "off" | string;
+  transcribe_audio?: "default" | "on" | "off" | string;
+  show_transcription: "default" | "on" | "off" | string;
   reply_to_mode: "default" | "off" | "first" | "all" | string;
   tool_progress: "default" | "off" | "new" | "all" | "verbose" | string;
   show_reasoning: "default" | "on" | "off" | string;
@@ -1451,6 +1599,7 @@ export interface ProfileScope {
   scope: string;
   label?: string;
   memory_scope?: string;
+  topic_isolation?: boolean;
   skill_sets?: ProfileScopeSkillSet;
 }
 
@@ -1571,10 +1720,13 @@ export interface ModelOptionProvider {
   name: string;
   slug: string;
   models?: string[];
+  pricing?: Record<string, ModelPricingInfo>;
   total_models?: number;
   is_current?: boolean;
   is_user_defined?: boolean;
   authenticated?: boolean;
+  auth_type?: string;
+  key_env?: string;
   source?: string;
   warning?: string;
 }
@@ -1585,16 +1737,36 @@ export interface ModelOptionsResponse {
   providers?: ModelOptionProvider[];
 }
 
+export interface ModelPricingInfo {
+  label?: string;
+  input?: string;
+  output?: string;
+  cache?: string | null;
+  free?: boolean;
+  included?: boolean;
+  source?: string;
+  version?: string;
+}
+
+export interface AuxiliaryFallbackEntry {
+  provider: string;
+  model: string;
+  base_url?: string;
+  pricing?: ModelPricingInfo;
+}
+
 export interface AuxiliaryTaskAssignment {
   task: string;
   provider: string;
   model: string;
   base_url: string;
+  pricing?: ModelPricingInfo;
+  fallback_chain?: AuxiliaryFallbackEntry[];
 }
 
 export interface AuxiliaryModelsResponse {
   tasks: AuxiliaryTaskAssignment[];
-  main: { provider: string; model: string };
+  main: { provider: string; model: string; pricing?: ModelPricingInfo };
 }
 
 export interface ModelAssignmentRequest {
@@ -1612,6 +1784,13 @@ export interface ModelAssignmentResponse {
   model?: string;
   tasks?: string[];
   reset?: boolean;
+  task?: string;
+  fallback_chain?: AuxiliaryFallbackEntry[];
+}
+
+export interface AuxiliaryFallbackChainRequest {
+  task: string;
+  fallback_chain: AuxiliaryFallbackEntry[];
 }
 
 // ── OAuth provider types ────────────────────────────────────────────────

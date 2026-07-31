@@ -58,6 +58,24 @@ def test_aux_tasks_keys_all_exist_in_default_config():
     )
 
 
+def test_mempalace_auxiliary_defaults_use_separate_extractor_and_validator_models():
+    extractor = DEFAULT_CONFIG["auxiliary"]["mempalace_extractor"]
+    assert extractor["provider"] == "openai-codex"
+    assert extractor["model"] == "gpt-5.4"
+    assert extractor["fallback_chain"] == [
+        {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+        {"provider": "auto", "model": ""},
+    ]
+
+    validator = DEFAULT_CONFIG["auxiliary"]["mempalace_validator"]
+    assert validator["provider"] == "openai-codex"
+    assert validator["model"] == "gpt-5.5"
+    assert validator["fallback_chain"] == [
+        {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+        {"provider": "auto", "model": ""},
+    ]
+
+
 # ── _format_aux_current ─────────────────────────────────────────────────────
 
 
@@ -210,7 +228,7 @@ def test_reset_aux_to_auto_clears_routing_preserves_timeouts(tmp_path, monkeypat
     save_config(cfg)
 
     n = _reset_aux_to_auto()
-    assert n == 2  # both changed
+    assert n == 4  # two configured tasks plus pinned MemPalace defaults changed
 
     cfg = load_config()
     for task in ("vision", "compression"):
@@ -232,6 +250,7 @@ def test_reset_aux_to_auto_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     (tmp_path / ".hermes").mkdir(exist_ok=True)
 
+    assert _reset_aux_to_auto() == 2  # fresh config has pinned MemPalace aux defaults
     assert _reset_aux_to_auto() == 0
     _save_aux_choice("vision", provider="nous", model="gemini-3-flash")
     assert _reset_aux_to_auto() == 1

@@ -34,6 +34,7 @@ included here — only the slash-command access split.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Iterable, Optional, Tuple
 
@@ -51,6 +52,45 @@ _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
     "help",
     "whoami",
 })
+
+
+# Commands with host/service/process impact must never inherit access from a
+# chat-scoped allowlist. If a group is allowed by chat ID, regular members may
+# talk to the bot, but they still are not operators.
+_OPERATOR_ONLY_COMMANDS: FrozenSet[str] = frozenset({
+    "approve",
+    "debug",
+    "deny",
+    "platform",
+    "reload-mcp",
+    "reload-skills",
+    "restart",
+    "sethome",
+    "stop",
+    "update",
+    "yolo",
+})
+
+
+_PLATFORM_OWNER_ALLOWLIST_ENVS: dict[str, tuple[str, ...]] = {
+    "telegram": ("TELEGRAM_ALLOWED_USERS",),
+    "discord": ("DISCORD_ALLOWED_USERS",),
+    "whatsapp": ("WHATSAPP_ALLOWED_USERS",),
+    "slack": ("SLACK_ALLOWED_USERS",),
+    "signal": ("SIGNAL_ALLOWED_USERS",),
+    "email": ("EMAIL_ALLOWED_USERS",),
+    "sms": ("SMS_ALLOWED_USERS",),
+    "mattermost": ("MATTERMOST_ALLOWED_USERS",),
+    "matrix": ("MATRIX_ALLOWED_USERS",),
+    "dingtalk": ("DINGTALK_ALLOWED_USERS",),
+    "feishu": ("FEISHU_ALLOWED_USERS",),
+    "wecom": ("WECOM_ALLOWED_USERS",),
+    "wecom_callback": ("WECOM_CALLBACK_ALLOWED_USERS",),
+    "weixin": ("WEIXIN_ALLOWED_USERS",),
+    "bluebubbles": ("BLUEBUBBLES_ALLOWED_USERS",),
+    "qqbot": ("QQ_ALLOWED_USERS",),
+    "yuanbao": ("YUANBAO_ALLOWED_USERS",),
+}
 
 
 @dataclass(frozen=True)
@@ -222,8 +262,60 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
     return policy_from_extra(extra, scope)
 
 
+def is_operator_only_command(canonical_cmd: str) -> bool:
+    """Return True for slash commands that require operator/admin identity."""
+    return str(canonical_cmd or "").strip().lower() in _OPERATOR_ONLY_COMMANDS
+
+
+def _platform_value(source: Any) -> str:
+    platform = getattr(source, "platform", None)
+    return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
+def _owner_allowlist_ids(gateway_config: Any, source: Any) -> FrozenSet[str]:
+    """Return platform-wide owner/operator IDs for fallback admin checks.
+
+    This intentionally ignores chat-scoped group allowlists such as
+    TELEGRAM_GROUP_ALLOWED_CHATS. A chat allowlist authorizes conversation
+    traffic, not service operations.
+    """
+    ids: set[str] = set()
+
+    platforms = getattr(gateway_config, "platforms", None)
+    platform_config = None
+    if platforms is not None and source is not None:
+        try:
+            platform_config = platforms.get(source.platform)
+        except Exception:
+            platform_config = None
+    extra = _platform_extra(platform_config)
+    ids.update(_coerce_id_list(extra.get("allow_from")))
+
+    for env_key in _PLATFORM_OWNER_ALLOWLIST_ENVS.get(_platform_value(source), ()):
+        ids.update(_coerce_id_list(os.getenv(env_key, "")))
+    ids.update(_coerce_id_list(os.getenv("GATEWAY_ALLOWED_USERS", "")))
+
+    # A wildcard allowlist is user access, not operator identity.
+    ids.discard("*")
+    return frozenset(ids)
+
+
+def is_operator_for_source(gateway_config: Any, source: Any) -> bool:
+    """Return True when ``source`` has explicit slash-operator privileges."""
+    if source is None or not getattr(source, "user_id", None):
+        return False
+
+    policy = policy_for_source(gateway_config, source)
+    if policy.enabled:
+        return policy.is_admin(source.user_id)
+
+    return str(source.user_id) in _owner_allowlist_ids(gateway_config, source)
+
+
 __all__ = [
     "SlashAccessPolicy",
+    "is_operator_for_source",
+    "is_operator_only_command",
     "policy_from_extra",
     "policy_for_source",
 ]

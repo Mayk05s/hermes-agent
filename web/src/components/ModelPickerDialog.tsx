@@ -36,9 +36,19 @@ interface ModelOptionProvider {
   name: string;
   slug: string;
   models?: string[];
+  pricing?: Record<string, ModelPricingInfo>;
   total_models?: number;
   is_current?: boolean;
   warning?: string;
+}
+
+interface ModelPricingInfo {
+  label?: string;
+  input?: string;
+  output?: string;
+  cache?: string | null;
+  free?: boolean;
+  included?: boolean;
 }
 
 interface ModelOptionsResponse {
@@ -274,6 +284,7 @@ export function ModelPickerDialog(props: Props) {
             provider={selectedProvider}
             models={filteredModels}
             allModels={models}
+            pricing={selectedProvider?.pricing ?? {}}
             selectedModel={selectedModel}
             currentModel={currentModel}
             currentProviderSlug={currentProviderSlug}
@@ -401,6 +412,7 @@ function ModelColumn({
   provider,
   models,
   allModels,
+  pricing,
   selectedModel,
   currentModel,
   currentProviderSlug,
@@ -410,6 +422,7 @@ function ModelColumn({
   provider: ModelOptionProvider | null;
   models: { model: string; positions: number[] }[];
   allModels: string[];
+  pricing: Record<string, ModelPricingInfo>;
   selectedModel: string;
   currentModel: string;
   currentProviderSlug: string;
@@ -445,6 +458,8 @@ function ModelColumn({
           const active = m === selectedModel;
           const isCurrent =
             m === currentModel && provider.slug === currentProviderSlug;
+          const price = pricing[m];
+          const priceLabel = modelPriceLabel(price);
 
           return (
             <ListItem
@@ -460,6 +475,11 @@ function ModelColumn({
               <span className="flex-1 truncate">
                 <HighlightedText text={m} positions={positions} />
               </span>
+              {priceLabel && (
+                <span className="shrink-0 text-[10px] text-text-tertiary">
+                  {priceLabel}
+                </span>
+              )}
               {isCurrent && <CurrentTag />}
             </ListItem>
           );
@@ -467,6 +487,17 @@ function ModelColumn({
       )}
     </div>
   );
+}
+
+function modelPriceLabel(price?: ModelPricingInfo): string {
+  if (!price) return "price unknown";
+  if (price.label) return price.label;
+  if (price.included) return "included";
+  if (price.free) return "free";
+  if (price.input || price.output) {
+    return `${price.input || "?"} in / ${price.output || "?"} out`;
+  }
+  return "price unknown";
 }
 
 function CurrentTag() {

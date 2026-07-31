@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
 from hermes_cli.config import get_hermes_home
+from gateway.platforms.base import parse_agent_control_response
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,20 @@ class DeliveryRouter:
         # platform adapter regardless of which persona's prompt failed.
         # Local/file delivery (_deliver_local) is a separate path and is never
         # filtered — saved silence has no loop risk.
+        control_response = parse_agent_control_response(content)
+        if control_response is not None:
+            logger.warning(
+                "Dropped agent control response outbound to %s (chat=%s): %s",
+                target.platform.value,
+                target.chat_id,
+                control_response.action,
+            )
+            return {
+                "success": True,
+                "filtered": f"control_{control_response.action}",
+                "delivered": False,
+            }
+
         if self._filter_silence_narration_enabled() and _is_silence_narration(content):
             logger.warning(
                 "Dropped silence-narration outbound to %s (chat=%s): %r",
@@ -427,7 +442,6 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
 
 
 

@@ -190,6 +190,38 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_TTS_PREBUILT_VOICES = (
+    "Achernar",
+    "Achird",
+    "Algenib",
+    "Algieba",
+    "Alnilam",
+    "Aoede",
+    "Autonoe",
+    "Callirrhoe",
+    "Charon",
+    "Despina",
+    "Enceladus",
+    "Erinome",
+    "Fenrir",
+    "Gacrux",
+    "Iapetus",
+    "Kore",
+    "Laomedeia",
+    "Leda",
+    "Orus",
+    "Puck",
+    "Pulcherrima",
+    "Rasalgethi",
+    "Sadachbia",
+    "Sadaltager",
+    "Schedar",
+    "Sulafat",
+    "Umbriel",
+    "Vindemiatrix",
+    "Zephyr",
+    "Zubenelgenubi",
+)
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -321,6 +353,43 @@ def _load_tts_config() -> Dict[str, Any]:
 def _get_provider(tts_config: Dict[str, Any]) -> str:
     """Get the configured TTS provider name."""
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+
+
+def _with_tts_overrides(
+    tts_config: Dict[str, Any],
+    *,
+    voice: Optional[str] = None,
+    style: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a per-request TTS config without changing the user's defaults.
+
+    Gemini accepts both a named prebuilt voice and a natural-language style.
+    Other built-ins support either ``voice`` or ``voice_id``; apply the voice
+    override to the convention used by the selected provider. The copy is
+    deliberately scoped to the selected provider: TTS generation must never
+    persist a caller's request.
+    """
+    if not voice and not style:
+        return tts_config
+
+    config = dict(tts_config) if isinstance(tts_config, dict) else {}
+    provider = _get_provider(config)
+    provider_config = dict(_get_provider_section(config, provider))
+
+    if voice:
+        voice_value = str(voice).strip()
+        if voice_value:
+            if provider in {"elevenlabs", "mistral", "minimax", "xai"}:
+                provider_config["voice_id"] = voice_value
+            else:
+                provider_config["voice"] = voice_value
+    if style:
+        style_value = str(style).strip()
+        if style_value:
+            provider_config["style"] = style_value
+
+    config[provider] = provider_config
+    return config
 
 
 # ===========================================================================
@@ -1391,6 +1460,39 @@ def _wrap_pcm_as_wav(
     return riff_header + fmt_chunk + data_chunk_header + pcm_bytes
 
 
+def _gemini_tts_prompt_text(text: str, style: str) -> str:
+    """Mirror NanoClaw's Gemini TTS style prompt convention."""
+    style = str(style or "").strip()
+    return f"{text}\n\nStyle: {style}" if style else text
+
+
+def _gemini_tts_feedback_detail(data: Dict[str, Any]) -> str:
+    feedback = data.get("promptFeedback") if isinstance(data, dict) else None
+    if not isinstance(feedback, dict):
+        return ""
+    reason = feedback.get("blockReason")
+    if reason:
+        return f" (promptFeedback blockReason={reason})"
+    return " (promptFeedback present)"
+
+
+def _extract_gemini_tts_audio_b64(data: Dict[str, Any]) -> str:
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, TypeError) as e:
+        detail = _gemini_tts_feedback_detail(data)
+        raise RuntimeError(f"Gemini TTS response was malformed: {e}{detail}") from e
+
+    audio_part = next((p for p in parts if "inlineData" in p or "inline_data" in p), None)
+    if audio_part is None:
+        raise RuntimeError("Gemini TTS response contained no audio data")
+    inline = audio_part.get("inlineData") or audio_part.get("inline_data") or {}
+    audio_b64 = inline.get("data", "")
+    if not audio_b64:
+        raise RuntimeError("Gemini TTS returned empty audio data")
+    return audio_b64
+
+
 def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """Generate audio using Google Gemini TTS.
 
@@ -1418,7 +1520,9 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
     gemini_config = tts_config.get("gemini", {})
     model = str(gemini_config.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
+    fallback_model = str(gemini_config.get("fallback_model", "")).strip()
     voice = str(gemini_config.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
+    style = str(gemini_config.get("style", "")).strip()
     base_url = str(
         gemini_config.get("base_url")
         or get_env_value("GEMINI_BASE_URL")
@@ -1426,7 +1530,7 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     ).strip().rstrip("/")
 
     payload: Dict[str, Any] = {
-        "contents": [{"parts": [{"text": text}]}],
+        "contents": [{"parts": [{"text": _gemini_tts_prompt_text(text, style)}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
@@ -1437,38 +1541,53 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         },
     }
 
-    endpoint = f"{base_url}/models/{model}:generateContent"
-    response = requests.post(
-        endpoint,
-        params={"key": api_key},
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=60,
-    )
-    if response.status_code != 200:
-        # Surface the API error message when present
-        try:
-            err = response.json().get("error", {})
-            detail = err.get("message") or response.text[:300]
-        except Exception:
-            detail = response.text[:300]
-        raise RuntimeError(
-            f"Gemini TTS API error (HTTP {response.status_code}): {detail}"
+    attempt_models = [model]
+    if fallback_model and fallback_model not in attempt_models:
+        attempt_models.append(fallback_model)
+
+    last_error = ""
+    audio_b64 = ""
+    used_model = model
+    for attempt_model in attempt_models:
+        endpoint = f"{base_url}/models/{attempt_model}:generateContent"
+        response = requests.post(
+            endpoint,
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=60,
         )
+        if response.status_code != 200:
+            # Surface the API error message when present.
+            try:
+                err = response.json().get("error", {})
+                detail = err.get("message") or response.text[:300]
+            except Exception:
+                detail = response.text[:300]
+            last_error = (
+                f"Gemini TTS API error (HTTP {response.status_code}): {detail}"
+            )
+        else:
+            try:
+                audio_b64 = _extract_gemini_tts_audio_b64(response.json())
+                used_model = attempt_model
+                break
+            except RuntimeError as e:
+                last_error = str(e)
 
-    try:
-        data = response.json()
-        parts = data["candidates"][0]["content"]["parts"]
-        audio_part = next((p for p in parts if "inlineData" in p or "inline_data" in p), None)
-        if audio_part is None:
-            raise RuntimeError("Gemini TTS response contained no audio data")
-        inline = audio_part.get("inlineData") or audio_part.get("inline_data") or {}
-        audio_b64 = inline.get("data", "")
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Gemini TTS response was malformed: {e}") from e
+        if attempt_model != attempt_models[-1]:
+            logger.warning(
+                "Gemini TTS attempt with model %s failed; retrying %s: %s",
+                attempt_model,
+                attempt_models[attempt_models.index(attempt_model) + 1],
+                last_error,
+            )
+            continue
 
-    if not audio_b64:
-        raise RuntimeError("Gemini TTS returned empty audio data")
+        raise RuntimeError(last_error)
+
+    if used_model != model:
+        logger.info("Gemini TTS used fallback model %s after %s failed", used_model, model)
 
     pcm_bytes = base64.b64decode(audio_b64)
     wav_bytes = _wrap_pcm_as_wav(pcm_bytes)
@@ -1837,12 +1956,15 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
+    voice: Optional[str] = None,
+    style: Optional[str] = None,
 ) -> str:
     """
     Convert text to speech audio.
 
     Reads provider/voice config from ~/.hermes/config.yaml (tts: section).
-    The model sends text; the user configures voice and provider.
+    ``voice`` and ``style`` are one-request overrides; they never modify the
+    configured default voice or style.
 
     On messaging platforms, the returned MEDIA:<path> tag is intercepted
     by the send pipeline and delivered as a native voice message.
@@ -1851,6 +1973,8 @@ def text_to_speech_tool(
     Args:
         text: The text to convert to speech.
         output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
+        voice: Optional one-request provider voice or voice ID.
+        style: Optional one-request natural-language delivery instruction.
 
     Returns:
         str: JSON result with success, file_path, and optionally MEDIA tag.
@@ -1858,7 +1982,7 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    tts_config = _load_tts_config()
+    tts_config = _with_tts_overrides(_load_tts_config(), voice=voice, style=style)
     provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
@@ -2521,7 +2645,7 @@ from tools.registry import registry, tool_error
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected.",
+    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Uses the configured default voice unless the user explicitly requests a different voice or delivery style; then pass voice and/or style as one-request overrides without changing defaults.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2532,6 +2656,14 @@ TTS_SCHEMA = {
             "output_path": {
                 "type": "string",
                 "description": f"Optional custom file path to save the audio. Defaults to {display_hermes_home()}/audio_cache/<timestamp>.mp3"
+            },
+            "voice": {
+                "type": "string",
+                "description": "Optional one-request voice override. For Gemini use a prebuilt voice name (for example, Kore or Aoede); for providers with voice IDs, pass that ID. Use only when the user requests a different voice."
+            },
+            "style": {
+                "type": "string",
+                "description": "Optional one-request delivery instruction, such as 'спокойный женский голос, тёплая интонация' or 'как новостной диктор'. Use only when the user requests a different style; it does not change the default."
             }
         },
         "required": ["text"]
@@ -2544,7 +2676,9 @@ registry.register(
     schema=TTS_SCHEMA,
     handler=lambda args, **kw: text_to_speech_tool(
         text=args.get("text", ""),
-        output_path=args.get("output_path")),
+        output_path=args.get("output_path"),
+        voice=args.get("voice"),
+        style=args.get("style")),
     check_fn=check_tts_requirements,
     emoji="🔊",
 )

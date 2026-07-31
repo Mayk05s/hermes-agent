@@ -363,15 +363,82 @@ class TestAspectRatioNormalization:
 
 class TestRegistryIntegration:
 
-    def test_schema_exposes_only_prompt_and_aspect_ratio_to_agent(self, image_tool):
+    def test_schema_exposes_prompt_aspect_ratio_and_references_to_agent(self, image_tool):
         """The agent-facing schema must stay tight — model selection is a
         user-level config choice, not an agent-level arg."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
-        assert set(props.keys()) == {"prompt", "aspect_ratio"}
+        assert set(props.keys()) == {
+            "prompt",
+            "aspect_ratio",
+            "reference_images",
+        }
 
     def test_aspect_ratio_enum_is_three_values(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
         assert set(enum) == {"landscape", "square", "portrait"}
+
+    def test_reference_images_schema_is_ordered_and_bounded(self, image_tool):
+        refs = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["reference_images"]
+        assert refs["type"] == "array"
+        assert refs["items"] == {"type": "string"}
+        assert refs["maxItems"] == image_tool.MAX_REFERENCE_IMAGES
+
+    def test_schema_tells_agent_to_reuse_existing_images(self, image_tool):
+        desc = image_tool.IMAGE_GENERATE_SCHEMA["description"].lower()
+        assert "do not call this tool" in desc
+        assert "reuse the exact url or file path" in desc
+
+    def test_handler_forwards_explicit_reference_images(self, image_tool, monkeypatch):
+        captured = {}
+
+        def _dispatch(prompt, aspect_ratio, reference_images=None):
+            captured.update({
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "reference_images": reference_images,
+            })
+            return '{"success": true}'
+
+        monkeypatch.setattr(image_tool, "_dispatch_to_plugin_provider", _dispatch)
+
+        result = image_tool._handle_image_generate({
+            "prompt": "Use reference 1 as the cat and reference 2 as the scene",
+            "aspect_ratio": "square",
+            "reference_images": ["/tmp/cat.png", "/tmp/scene.png"],
+        })
+
+        assert result == '{"success": true}'
+        assert captured["reference_images"] == ["/tmp/cat.png", "/tmp/scene.png"]
+
+    def test_handler_recovers_current_turn_image_handles(
+        self,
+        image_tool,
+        monkeypatch,
+        tmp_path,
+    ):
+        cat = tmp_path / "cat.png"
+        scene = tmp_path / "scene.png"
+        cat.write_bytes(b"placeholder")
+        scene.write_bytes(b"placeholder")
+        captured = {}
+
+        def _dispatch(prompt, aspect_ratio, reference_images=None):
+            captured["reference_images"] = reference_images
+            return '{"success": true}'
+
+        monkeypatch.setattr(image_tool, "_dispatch_to_plugin_provider", _dispatch)
+
+        result = image_tool._handle_image_generate(
+            {"prompt": "Put this cat into this scene"},
+            user_task=(
+                "Create a new image.\n\n"
+                f"[Image attached at: {cat}]\n"
+                f"[Image attached at: {scene}]"
+            ),
+        )
+
+        assert result == '{"success": true}'
+        assert captured["reference_images"] == [str(cat), str(scene)]
 
 
 # ---------------------------------------------------------------------------

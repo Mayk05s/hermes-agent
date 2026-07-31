@@ -77,6 +77,43 @@ class TestWrapPcmAsWav:
         assert len(wav) == 44 + len(pcm)
 
 
+def test_prebuilt_voice_list_matches_nanoclaw_samples():
+    from tools.tts_tool import GEMINI_TTS_PREBUILT_VOICES
+
+    assert GEMINI_TTS_PREBUILT_VOICES == (
+        "Achernar",
+        "Achird",
+        "Algenib",
+        "Algieba",
+        "Alnilam",
+        "Aoede",
+        "Autonoe",
+        "Callirrhoe",
+        "Charon",
+        "Despina",
+        "Enceladus",
+        "Erinome",
+        "Fenrir",
+        "Gacrux",
+        "Iapetus",
+        "Kore",
+        "Laomedeia",
+        "Leda",
+        "Orus",
+        "Puck",
+        "Pulcherrima",
+        "Rasalgethi",
+        "Sadachbia",
+        "Sadaltager",
+        "Schedar",
+        "Sulafat",
+        "Umbriel",
+        "Vindemiatrix",
+        "Zephyr",
+        "Zubenelgenubi",
+    )
+
+
 class TestGenerateGeminiTts:
     def test_missing_api_key_raises_value_error(self, tmp_path):
         from tools.tts_tool import _generate_gemini_tts
@@ -163,6 +200,36 @@ class TestGenerateGeminiTts:
         endpoint = mock_post.call_args[0][0]
         assert "gemini-2.5-pro-preview-tts" in endpoint
 
+    def test_custom_style_appended_like_nanoclaw(
+        self, tmp_path, monkeypatch, mock_gemini_response
+    ):
+        from tools.tts_tool import _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        config = {"gemini": {"style": "warm, calm Russian voice"}}
+
+        with patch("requests.post", return_value=mock_gemini_response) as mock_post:
+            _generate_gemini_tts("Привет", str(tmp_path / "test.wav"), config)
+
+        payload = mock_post.call_args[1]["json"]
+        assert payload["contents"][0]["parts"][0]["text"] == (
+            "Привет\n\nStyle: warm, calm Russian voice"
+        )
+
+    def test_blank_style_keeps_plain_text(
+        self, tmp_path, monkeypatch, mock_gemini_response
+    ):
+        from tools.tts_tool import _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        config = {"gemini": {"style": "  "}}
+
+        with patch("requests.post", return_value=mock_gemini_response) as mock_post:
+            _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), config)
+
+        payload = mock_post.call_args[1]["json"]
+        assert payload["contents"][0]["parts"][0]["text"] == "Hi"
+
     def test_response_modality_is_audio(self, tmp_path, monkeypatch, mock_gemini_response):
         from tools.tts_tool import _generate_gemini_tts
 
@@ -213,6 +280,35 @@ class TestGenerateGeminiTts:
         with patch("requests.post", return_value=resp):
             with pytest.raises(RuntimeError, match="malformed"):
                 _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), {})
+
+    def test_fallback_model_after_prompt_feedback_block(
+        self, tmp_path, monkeypatch, mock_gemini_response
+    ):
+        from tools.tts_tool import _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        blocked = MagicMock()
+        blocked.status_code = 200
+        blocked.json.return_value = {
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+        }
+        config = {
+            "gemini": {
+                "model": "gemini-3.1-flash-tts-preview",
+                "fallback_model": "gemini-2.5-flash-preview-tts",
+                "style": "warm",
+            }
+        }
+
+        with patch(
+            "requests.post",
+            side_effect=[blocked, mock_gemini_response],
+        ) as mock_post:
+            _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), config)
+
+        assert "gemini-3.1-flash-tts-preview" in mock_post.call_args_list[0][0][0]
+        assert "gemini-2.5-flash-preview-tts" in mock_post.call_args_list[1][0][0]
+        assert (tmp_path / "test.wav").read_bytes()[:4] == b"RIFF"
 
     def test_snake_case_inline_data_accepted(self, tmp_path, monkeypatch, fake_pcm_bytes):
         """Some Gemini SDK versions return inline_data instead of inlineData."""

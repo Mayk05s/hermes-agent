@@ -160,6 +160,96 @@ class TestGenerate:
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1
 
+    def test_reference_images_are_sent_as_ordered_input_image_parts(
+        self,
+        tmp_path,
+    ):
+        cat = tmp_path / "cat.png"
+        cat.write_bytes(bytes.fromhex(_PNG_HEX))
+        reference_parts = codex_plugin._prepare_reference_image_parts([
+            str(cat),
+            "https://example.com/scene.png",
+        ])
+
+        payload = codex_plugin._build_responses_payload(
+            prompt=(
+                "Reference image 1 is the cat whose appearance must be preserved. "
+                "Reference image 2 supplies the scene."
+            ),
+            size="1024x1024",
+            quality="medium",
+            reference_image_parts=reference_parts,
+        )
+
+        content = payload["input"][0]["content"]
+        assert [part["type"] for part in content] == [
+            "input_text",
+            "input_image",
+            "input_image",
+        ]
+        assert content[1]["image_url"].startswith("data:image/png;base64,")
+        assert content[1]["detail"] == "auto"
+        assert content[2] == {
+            "type": "input_image",
+            "image_url": "https://example.com/scene.png",
+            "detail": "auto",
+        }
+
+    def test_generate_forwards_reference_images_to_stream(
+        self,
+        provider,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        cat = tmp_path / "cat.png"
+        scene = tmp_path / "scene.png"
+        cat.write_bytes(bytes.fromhex(_PNG_HEX))
+        scene.write_bytes(bytes.fromhex(_PNG_HEX))
+        captured = {}
+
+        def _collect(token, **kwargs):
+            captured.update(kwargs)
+            return _b64_png()
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
+
+        result = provider.generate(
+            "Keep the cat from reference 1 in the scene from reference 2",
+            reference_images=[str(cat), str(scene)],
+        )
+
+        assert result["success"] is True
+        assert result["reference_images_count"] == 2
+        assert len(captured["reference_image_parts"]) == 2
+        assert all(
+            part["type"] == "input_image"
+            for part in captured["reference_image_parts"]
+        )
+
+    def test_invalid_reference_image_is_rejected_before_request(
+        self,
+        provider,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        collect_calls = []
+        monkeypatch.setattr(
+            codex_plugin,
+            "_collect_image_b64",
+            lambda *args, **kwargs: collect_calls.append(kwargs),
+        )
+
+        result = provider.generate(
+            "Use this missing reference",
+            reference_images=[str(tmp_path / "missing.png")],
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_reference_image"
+        assert collect_calls == []
+
     def test_partial_image_event_used_when_done_missing(self):
         """If output_item.done is missing, partial_image_b64 is accepted."""
         payload = {
@@ -183,6 +273,35 @@ class TestGenerate:
             "item": {"type": "image_generation_call", "result": "abc"},
         }]
 
+    def test_sse_error_event_is_extracted(self):
+        payload = {
+            "type": "error",
+            "error": {
+                "type": "input-images",
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached for gpt-image-2-codex",
+            },
+        }
+        assert codex_plugin._extract_codex_error(payload) == (
+            "Rate limit reached for gpt-image-2-codex",
+            "rate_limit_exceeded",
+        )
+
+    def test_response_failed_error_is_extracted(self):
+        payload = {
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "Rate limit reached for gpt-image-2-codex",
+                },
+            },
+        }
+        assert codex_plugin._extract_codex_error(payload) == (
+            "Rate limit reached for gpt-image-2-codex",
+            "rate_limit_exceeded",
+        )
+
     def test_final_response_sweep_recovers_image(self):
         """Completed response output is found by recursive payload scanning."""
         payload = {
@@ -205,6 +324,26 @@ class TestGenerate:
         result = provider.generate("a cat")
         assert result["success"] is False
         assert result["error_type"] == "empty_response"
+
+    def test_rate_limit_stream_error_returns_rate_limit(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        monkeypatch.setattr(codex_plugin.time, "sleep", lambda delay: None)
+        calls = []
+
+        def _rate_limit(*args, **kwargs):
+            calls.append(1)
+            raise codex_plugin.CodexImageGenerationError(
+                "Rate limit reached for gpt-image-2-codex",
+                code="rate_limit_exceeded",
+            )
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _rate_limit)
+
+        result = provider.generate("a cat")
+        assert result["success"] is False
+        assert result["error_type"] == "rate_limit"
+        assert "Rate limit reached" in result["error"]
+        assert len(calls) == len(codex_plugin._RATE_LIMIT_RETRY_DELAYS) + 1
 
     def test_stream_exception_returns_api_error(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")

@@ -6,15 +6,16 @@ re-implementation in the test). Uses the same ``object.__new__`` runner
 construction pattern as test_status_command.py.
 
 Coverage targets:
-  - Backward compat: no ``allow_admin_from`` set → behaves exactly as before
-    (no denial messages, dispatch reaches the real handler).
+  - Backward compat: no ``allow_admin_from`` set → ordinary commands behave
+    as before, while operator-only commands stay owner/admin-only.
   - Admin path: user in ``allow_admin_from`` runs anything.
   - User path: user not in admin list, but command in
     ``user_allowed_commands`` → allowed.
   - User denied: command not in either list → returns the ⛔ denial.
-  - Always-allowed floor: /help and /whoami reachable for non-admins
+  - Always-allowed floor: /help and /whoami reachable in DMs for non-admins
     even with empty user_allowed_commands.
-  - DM vs group scope isolation.
+  - Private-chat boundary: slash commands are denied outside DMs before any
+    side-effecting handler can run.
 """
 from __future__ import annotations
 
@@ -165,8 +166,7 @@ async def test_non_admin_denied_for_unlisted_command():
     result = await runner._handle_message(_make_event("/stop", _make_source(user_id="999")))
     assert result is not None
     assert "⛔" in result
-    assert "/stop is admin-only here" in result
-    assert "/status" in result  # denial preview shows what they CAN run
+    assert "/stop is owner-only here" in result
 
 
 @pytest.mark.asyncio
@@ -180,7 +180,7 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
     # /stop denied
     result = await runner._handle_message(_make_event("/stop", _make_source(user_id="999")))
     assert "⛔" in result
-    assert "No slash commands are enabled" in result
+    assert "/stop is owner-only here" in result
     # /whoami still works (always-allowed floor)
     whoami_result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
     assert "Tier: user" in whoami_result
@@ -235,6 +235,178 @@ async def test_backward_compat_no_admin_list_means_no_gate():
     assert "Tier: unrestricted" in result
 
 
+@pytest.mark.asyncio
+async def test_operator_only_command_denied_without_admin_or_owner_allowlist(monkeypatch):
+    """High-impact commands must not inherit unrestricted slash access."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={})  # no admin list
+    runner._handle_restart_command = AsyncMock(return_value="restart-handled")
+
+    result = await runner._handle_message(
+        _make_event("/restart", _make_source(user_id="999"))
+    )
+
+    assert result is not None
+    assert "⛔" in result
+    assert "/restart is owner-only here" in result
+    runner._handle_restart_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_operator_only_command_allows_platform_owner_allowlist_in_dm(monkeypatch):
+    """Platform-wide user allowlists are accepted as legacy owner fallback."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
+    runner._handle_restart_command = AsyncMock(return_value="restart-handled")
+
+    src = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="111",
+        chat_type="dm",
+        chat_id="111-dm",
+    )
+    result = await runner._handle_message(_make_event("/restart", src))
+
+    assert result == "restart-handled"
+    runner._handle_restart_command.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slash_command_denied_in_group_even_for_owner(monkeypatch):
+    """The emergency boundary is chat shape first: no slash commands in groups."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
+    runner._handle_restart_command = AsyncMock(return_value="restart-handled")
+
+    src = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="111",
+        chat_type="group",
+        chat_id="-1001",
+    )
+    result = await runner._handle_message(_make_event("/restart", src))
+
+    assert result is not None
+    assert "⛔" in result
+    assert "Slash commands are disabled outside private chat" in result
+    runner._handle_restart_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_group_start_is_silent_not_private_chat_denial(monkeypatch):
+    """Telegram /start in an approved group is an onboarding ping, not a command."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
+    runner.session_store.get_or_create_session.side_effect = AssertionError(
+        "group /start should not enter session dispatch"
+    )
+
+    src = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="111",
+        chat_type="group",
+        chat_id="-1001",
+    )
+    result = await runner._handle_message(_make_event("/start", src))
+
+    assert result is None
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_telegram_attributed_group_start_is_silent(monkeypatch):
+    """Mention-style group onboarding pings can arrive after sender attribution."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
+    runner.session_store.get_or_create_session.side_effect = AssertionError(
+        "attributed group /start should not enter session dispatch"
+    )
+
+    src = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="111",
+        chat_type="group",
+        chat_id="-1001",
+    )
+    result = await runner._handle_message(
+        _make_event("[Наталия|367599252] @TripiooBot /start", src)
+    )
+
+    assert result is None
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_operator_can_run_approve(monkeypatch):
+    """The owner can approve from a group without reopening every command."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
+    runner._handle_approve_command = AsyncMock(return_value="approve-handled")
+
+    src = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="111",
+        chat_type="group",
+        chat_id="-1001",
+    )
+    result = await runner._handle_message(_make_event("/approve", src))
+
+    assert result == "approve-handled"
+    runner._handle_approve_command.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_group_member_cannot_run_approve_from_chat_allowlist(monkeypatch):
+    """Group chat authorization is not enough to approve commands."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1001")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
+    runner._handle_approve_command = AsyncMock(return_value="approve-handled")
+
+    src = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="999",
+        chat_type="group",
+        chat_id="-1001",
+    )
+    result = await runner._handle_message(_make_event("/approve", src))
+
+    assert result is not None
+    assert "⛔" in result
+    assert "Slash commands are disabled outside private chat" in result
+    runner._handle_approve_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_operator_only_command_denies_group_member_from_chat_allowlist(monkeypatch):
+    """A chat-scoped group allowlist cannot enable slash command execution."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1001")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
+    runner._handle_restart_command = AsyncMock(return_value="restart-handled")
+
+    src = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="999",
+        chat_type="group",
+        chat_id="-1001",
+    )
+    result = await runner._handle_message(_make_event("/restart", src))
+
+    assert result is not None
+    assert "⛔" in result
+    assert "Slash commands are disabled outside private chat" in result
+    runner._handle_restart_command.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Scope isolation — DM vs group
 # ---------------------------------------------------------------------------
@@ -249,12 +421,13 @@ async def test_dm_admin_is_not_group_admin():
             "group_user_allowed_commands": [],
         }
     )
-    # User 111 is DM admin. In group context they're a non-admin with no
-    # listed commands → /stop denied.
+    # User 111 is DM admin. In group context slash commands are disabled before
+    # admin/user command lists are considered.
     result = await runner._handle_message(
         _make_event("/stop", _make_source(user_id="111", chat_type="group"))
     )
     assert "⛔" in result
+    assert "Slash commands are disabled outside private chat" in result
 
 
 @pytest.mark.asyncio
@@ -344,7 +517,7 @@ async def test_running_agent_fastpath_blocks_non_admin_command():
     result = await runner._handle_message(_make_event("/restart", src))
     assert result is not None
     assert "⛔" in result
-    assert "/restart is admin-only here" in result
+    assert "/restart is owner-only here" in result
 
 
 @pytest.mark.asyncio
@@ -372,9 +545,8 @@ async def test_running_agent_fastpath_allows_admin_command():
 
 
 @pytest.mark.asyncio
-async def test_running_agent_fastpath_status_always_works():
-    """/status is intentionally pre-gate on the fast-path so users can
-    always see session state, even non-admins."""
+async def test_running_agent_fastpath_status_always_works_in_dm():
+    """/status is reachable in DMs even while an agent is running."""
     runner = _make_runner(
         platform_extra={
             "allow_admin_from": ["111"],
@@ -390,6 +562,28 @@ async def test_running_agent_fastpath_status_always_works():
     result = await runner._handle_message(_make_event("/status", src))
     assert result == "status-handled"
     assert "⛔" not in (result or "")
+
+
+@pytest.mark.asyncio
+async def test_running_agent_fastpath_status_blocked_in_group():
+    """The private-chat boundary applies before active-session fast paths."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    src = _make_source(user_id="111", chat_type="group", chat_id="g1")
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+    runner._handle_status_command = AsyncMock(return_value="status-handled")
+
+    result = await runner._handle_message(_make_event("/status", src))
+    assert result is not None
+    assert "⛔" in result
+    assert "Slash commands are disabled outside private chat" in result
+    runner._handle_status_command.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -467,12 +661,12 @@ async def test_dm_admin_blocked_in_group_with_separate_admin_list():
             "group_user_allowed_commands": ["status"],
         }
     )
-    # User 111 is DM admin. In a group, they're a non-admin and can only
-    # run group_user_allowed_commands. /restart is not in that list → denied.
+    # User 111 is DM admin. In a group, slash commands are denied before
+    # per-scope admin lists or command allowlists are consulted.
     grp_src = _make_source(user_id="111", chat_type="group", chat_id="g1")
     result = await runner._handle_message(_make_event("/restart", grp_src))
     assert "⛔" in result
-    assert "/restart is admin-only here" in result
+    assert "Slash commands are disabled outside private chat" in result
 
 
 # ---------------------------------------------------------------------------

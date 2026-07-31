@@ -8,6 +8,7 @@ user message. If either anchor is unavailable or rejected, the adapter must
 avoid retrying with a partial topic route that can render outside the lane.
 """
 
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -61,6 +62,11 @@ class _FakeInlineKeyboardMarkup:
         self.inline_keyboard = inline_keyboard
 
 
+class _FakeWebAppInfo:
+    def __init__(self, url):
+        self.url = url
+
+
 class _FakeInputMediaPhoto:
     def __init__(self, media, caption=None, **kwargs):
         self.media = media
@@ -74,6 +80,7 @@ _fake_telegram.Bot = object
 _fake_telegram.Message = object
 _fake_telegram.InlineKeyboardButton = _FakeInlineKeyboardButton
 _fake_telegram.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup
+_fake_telegram.WebAppInfo = _FakeWebAppInfo
 _fake_telegram.InputMediaPhoto = _FakeInputMediaPhoto
 _fake_telegram_error = types.ModuleType("telegram.error")
 _fake_telegram_error.NetworkError = FakeNetworkError
@@ -372,8 +379,8 @@ async def test_send_typing_falls_back_without_thread_on_bad_request():
 
 
 @pytest.mark.asyncio
-async def test_send_retries_without_thread_on_thread_not_found():
-    """When message_thread_id keeps failing, retry once then fall back."""
+async def test_group_send_fails_closed_when_thread_not_found():
+    """A stale forum topic must never leak the message into General."""
     adapter = _make_adapter()
 
     call_log = []
@@ -381,9 +388,7 @@ async def test_send_retries_without_thread_on_thread_not_found():
     async def mock_send_message(**kwargs):
         call_log.append(dict(kwargs))
         tid = kwargs.get("message_thread_id")
-        if tid is not None:
-            raise FakeBadRequest("Message thread not found")
-        return SimpleNamespace(message_id=42)
+        raise FakeBadRequest("Message thread not found")
 
     adapter._bot = SimpleNamespace(send_message=mock_send_message)
 
@@ -393,15 +398,12 @@ async def test_send_retries_without_thread_on_thread_not_found():
         metadata={"thread_id": "99999"},
     )
 
-    assert result.success is True
-    assert result.message_id == "42"
-    assert result.raw_response["requested_thread_id"] == 99999
-    assert result.raw_response["thread_fallback"] is True
-    # First two calls keep the configured thread, then final fallback drops it.
-    assert len(call_log) == 3
+    assert result.success is False
+    assert result.retryable is False
+    # A same-topic retry is safe; no call may omit the topic.
+    assert len(call_log) == 2
     assert call_log[0]["message_thread_id"] == 99999
     assert call_log[1]["message_thread_id"] == 99999
-    assert call_log[2]["message_thread_id"] is None
 
 
 @pytest.mark.asyncio
@@ -1199,6 +1201,705 @@ async def test_send_without_thread_id_unaffected():
 
 
 @pytest.mark.asyncio
+async def test_send_converts_supported_miniapp_link_to_url_button():
+    """Health/planning/menu Telegram Mini App deep links render as Web App buttons in DMs."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+
+    result = await adapter.send(
+        chat_id="123",
+        content="Готово.\nhttps://t.me/TripiooBot?startapp=nutrition",
+    )
+
+    assert result.success is True
+    assert len(call_log) == 1
+    assert "https://t.me" not in call_log[0]["text"]
+    assert "reply_markup" in call_log[0]
+    button = call_log[0]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Открыть питание"
+    web_app = button.kwargs.get("web_app")
+    assert web_app.url == "https://miniapp.mayk05.pro/?startapp=nutrition"
+
+
+@pytest.mark.asyncio
+async def test_send_converts_menu_miniapp_link_to_button():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+
+    result = await adapter.send(
+        chat_id="123",
+        content="https://t.me/TripiooBot?startapp=menu",
+    )
+
+    assert result.success is True
+    assert len(call_log) == 1
+    assert call_log[0]["text"] == "Открой семейное меню в миниаппе\\."
+    button = call_log[0]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Открыть меню"
+    web_app = button.kwargs.get("web_app")
+    assert web_app.url == "https://miniapp.mayk05.pro/?startapp=menu"
+
+
+@pytest.mark.asyncio
+async def test_send_keeps_supported_miniapp_link_as_url_button_in_groups():
+    """Group buttons keep t.me startapp because Web App buttons are DM-only."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="Готово.\nhttps://t.me/TripiooBot?startapp=planning",
+    )
+
+    assert result.success is True
+    button = call_log[0]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Открыть планирование"
+    assert button.kwargs.get("url") == "https://t.me/TripiooBot?startapp=planning"
+    assert button.kwargs.get("web_app") is None
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_infer_menu_button_from_success_wording():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+
+    result = await adapter.send(
+        chat_id="-1003966683704",
+        content=(
+            "Готово, добавил в семейное меню на сегодня, завтрак:\n\n"
+            "• Хлеб в аэрогриле с яйцом\n"
+            "• Бутерброды с творожным сыром"
+        ),
+    )
+
+    assert result.success is True
+    assert len(call_log) == 1
+    assert "reply_markup" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_add_menu_button_for_plain_menu_word():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+
+    result = await adapter.send(
+        chat_id="-1003966683704",
+        content="В меню ресторана сегодня суп и салат.",
+    )
+
+    assert result.success is True
+    assert len(call_log) == 1
+    assert "reply_markup" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_send_converts_boxmap_miniapp_link_to_scenario_button():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="Открыть сценарии BoxMap:\nhttps://t.me/TripiooBot?startapp=boxmap",
+    )
+
+    assert result.success is True
+    assert len(call_log) == 1
+    assert "https://t.me" not in call_log[0]["text"]
+    button = call_log[0]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Открыть сценарии"
+    assert button.kwargs.get("url") == "https://t.me/TripiooBot?startapp=boxmap"
+    assert button.kwargs.get("web_app") is None
+
+
+def test_miniapp_request_uses_configured_planning_topic_context():
+    adapter = _make_adapter()
+    adapter.config.extra = {
+        "group_topics": [
+            {
+                "chat_id": -1003735932411,
+                "topics": [
+                    {
+                        "name": "planning",
+                        "thread_id": 313,
+                        "skill": "telegram_planning/telegram_planning_context",
+                    },
+                ],
+            },
+        ],
+    }
+
+    message = SimpleNamespace(
+        text="покажи миниапп",
+        chat=SimpleNamespace(id=-1003735932411),
+        message_thread_id=313,
+    )
+
+    assert adapter._miniapp_start_param_for_request(message) == "planning"
+
+
+def test_planning_topic_open_today_plans_uses_miniapp_without_saying_miniapp():
+    adapter = _make_adapter()
+    adapter.config.extra = {
+        "group_topics": [
+            {
+                "chat_id": -1003735932411,
+                "topics": [
+                    {
+                        "name": "planning",
+                        "thread_id": 313,
+                        "skill": "telegram_planning/telegram_planning_context",
+                    },
+                ],
+            },
+        ],
+    }
+
+    message = SimpleNamespace(
+        text="Открой планы на сегодня",
+        chat=SimpleNamespace(id=-1003735932411),
+        message_thread_id=313,
+    )
+
+    assert adapter._miniapp_start_param_for_request(message) == "planning"
+
+
+def test_open_plan_outside_planning_topic_still_uses_planning_app():
+    adapter = _make_adapter()
+
+    message = SimpleNamespace(
+        text="Открой план проекта",
+        chat=SimpleNamespace(id=123),
+        message_thread_id=None,
+    )
+
+    assert adapter._miniapp_start_param_for_request(message) == "planning"
+
+
+def test_miniapp_data_actions_map_to_app_sections_without_saying_miniapp():
+    adapter = _make_adapter()
+    adapter.config.extra = {
+        "group_topics": [
+            {
+                "chat_id": -1003735932411,
+                "topics": [
+                    {"name": "health", "thread_id": 321},
+                    {"name": "planning", "thread_id": 313},
+                ],
+            },
+            {
+                "chat_id": -1003966683704,
+                "topics": [{"name": "family-menu", "thread_id": 1636}],
+            },
+        ],
+    }
+
+    cases = [
+        (-1003735932411, 313, "Добавь задачу купить молоко", "planning"),
+        (-1003735932411, 321, "Покажи тренировки на сегодня", "fitness"),
+        (-1003735932411, 321, "Сделал 20 отжиманий", "fitness"),
+        (-1003735932411, 321, "Запиши прием лекарства", "meds"),
+        (-1003735932411, 321, "Принял розувастатин", "meds"),
+        (-1003735932411, 321, "Добавь завтрак: творог и ягоды", "nutrition"),
+        (-1003735932411, 321, "Съел борщ", "nutrition"),
+        (-1003966683704, 1636, "Добавь борщ на ужин", "menu"),
+        (-1003966683704, 1636, "Добавь молоко в покупки", "shopping"),
+    ]
+
+    for chat_id, thread_id, text, expected in cases:
+        message = SimpleNamespace(
+            text=text,
+            chat=SimpleNamespace(id=chat_id),
+            message_thread_id=thread_id,
+        )
+        assert adapter._miniapp_start_param_for_request(message) == expected
+
+
+def test_miniapp_engineering_request_is_not_treated_as_data_interaction():
+    adapter = _make_adapter()
+
+    message = SimpleNamespace(
+        text="Почини форму планирования, там ошибка в коде",
+        chat=SimpleNamespace(id=123),
+        message_thread_id=None,
+    )
+
+    assert adapter._miniapp_start_param_for_request(message) is None
+
+
+def test_direct_social_miniapp_request_uses_social_surface():
+    adapter = _make_adapter()
+    message = SimpleNamespace(
+        text="Открой миниапп с черновиками публикаций",
+        chat=SimpleNamespace(id=123),
+        message_thread_id=None,
+    )
+
+    assert adapter._miniapp_start_param_for_request(message) == "social"
+
+
+@pytest.mark.asyncio
+async def test_successful_miniapp_mcp_write_attaches_button_to_final_response():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100 + len(call_log))
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+    adapter.begin_miniapp_turn("-1003735932411", "313")
+    recorded = adapter.record_miniapp_tool_completion(
+        "-1003735932411",
+        "313",
+        "mcp_health_actions_create_planning_task",
+        is_error=False,
+        result='{"result":"{\\"ok\\":true}"}',
+    )
+
+    progress = await adapter.send(
+        chat_id="-1003735932411",
+        content="⏳ Добавляю задачу…",
+        metadata={"thread_id": "313"},
+    )
+    interim = await adapter.send(
+        chat_id="-1003735932411",
+        content="Проверил результат записи.",
+        metadata={"thread_id": "313"},
+    )
+    final = await adapter.send(
+        chat_id="-1003735932411",
+        content="Готово.",
+        metadata={"thread_id": "313", "notify": True},
+    )
+    unrelated = await adapter.send(
+        chat_id="-1003735932411",
+        content="Хорошего дня.",
+        metadata={"thread_id": "313"},
+    )
+
+    assert recorded == "planning"
+    assert progress.success is True
+    assert interim.success is True
+    assert final.success is True
+    assert unrelated.success is True
+    assert "reply_markup" not in call_log[0]
+    assert "reply_markup" not in call_log[1]
+    final_button = call_log[2]["reply_markup"].inline_keyboard[0][0]
+    assert final_button.text == "Открыть планирование"
+    assert final_button.kwargs.get("url") == "https://t.me/TripiooBot?startapp=planning"
+    assert "reply_markup" not in call_log[3]
+
+
+@pytest.mark.asyncio
+async def test_streaming_final_edit_attaches_miniapp_mcp_button_once():
+    adapter = _make_adapter()
+    edit_log = []
+
+    async def mock_edit_message_text(**kwargs):
+        edit_log.append(dict(kwargs))
+        return True
+
+    adapter._bot = SimpleNamespace(
+        edit_message_text=mock_edit_message_text,
+        username="TripiooBot",
+    )
+    adapter.begin_miniapp_turn("-1003735932411", "313")
+    adapter.record_miniapp_tool_completion(
+        "-1003735932411",
+        "313",
+        "mcp_health_actions_update_planning_task",
+    )
+
+    interim = await adapter.edit_message(
+        chat_id="-1003735932411",
+        message_id="900",
+        content="Готов",
+        finalize=False,
+        metadata={"thread_id": "313"},
+    )
+    final = await adapter.edit_message(
+        chat_id="-1003735932411",
+        message_id="900",
+        content="Готово.",
+        finalize=True,
+        metadata={"thread_id": "313", "hermes_turn_final": True},
+    )
+
+    assert interim.success is True
+    assert final.success is True
+    assert "reply_markup" not in edit_log[0]
+    button = edit_log[1]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Открыть планирование"
+    assert button.kwargs.get("url") == "https://t.me/TripiooBot?startapp=planning"
+    assert adapter._pending_miniapp_buttons == {}
+
+
+@pytest.mark.asyncio
+async def test_send_never_infers_buttons_from_response_wording():
+    contents = [
+        "Добавил задачу «Купить молоко».",
+        "Записал тренировку и 20 повторов.",
+        "Обновил список покупок.",
+        "Записал прием лекарства.",
+        (
+            "Не удалось создать событие: инструмент Google Calendar недоступен. "
+            "Событие не создано."
+        ),
+    ]
+
+    for content in contents:
+        adapter = _make_adapter()
+        call_log = []
+
+        async def mock_send_message(**kwargs):
+            call_log.append(dict(kwargs))
+            return SimpleNamespace(message_id=100)
+
+        adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+        result = await adapter.send(chat_id="-100123", content=content)
+
+        assert result.success is True
+        assert "reply_markup" not in call_log[0]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_param"),
+    [
+        ("mcp_health_actions_create_workout_slots", "fitness"),
+        ("mcp.health-actions.record-completed-set", "fitness"),
+        ("mcp_health_actions_create_planning_task", "planning"),
+        ("mcp_health_actions_add_shopping_items", "shopping"),
+        ("mcp_health_actions_replace_menu_entries", "menu"),
+    ],
+)
+def test_mutating_miniapp_mcp_tools_map_to_changed_app(tool_name, expected_param):
+    adapter = _make_adapter()
+
+    assert adapter._miniapp_param_for_mutating_mcp_tool(tool_name) == expected_param
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp_health_actions_list_planning_tasks",
+        "mcp_health_actions_list_menu_entries",
+        "mcp_google_calendar_create_event",
+        "terminal",
+    ],
+)
+def test_reads_and_non_miniapp_tools_do_not_map_to_buttons(tool_name):
+    adapter = _make_adapter()
+
+    assert adapter._miniapp_param_for_mutating_mcp_tool(tool_name) is None
+
+
+@pytest.mark.parametrize(
+    ("start_param", "expected_label"),
+    [
+        ("fitness", "Открыть тренировки"),
+        ("nutrition", "Открыть питание"),
+        ("medications", "Открыть лекарства"),
+        ("planning", "Открыть планирование"),
+        ("menu", "Открыть меню"),
+        ("shopping", "Открыть покупки"),
+        ("boxmap", "Открыть сценарии"),
+        ("social", "Открыть публикации"),
+    ],
+)
+def test_full_miniapp_catalog_has_supported_buttons(start_param, expected_label):
+    adapter = _make_adapter()
+
+    assert adapter._is_supported_inline_miniapp_param(start_param) is True
+    assert adapter._miniapp_button_label(start_param) == expected_label
+
+
+@pytest.mark.asyncio
+async def test_generic_miniapp_mutation_contract_supports_boxmap_and_social():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+    adapter.begin_miniapp_turn("-100123")
+    boxmap = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "mcp_miniapps_update_scenario",
+        result=json.dumps(
+            {
+                "result": "Scenario updated",
+                "structuredContent": {
+                    "_miniapp": {
+                        "changed": True,
+                        "start_param": "boxmap",
+                    }
+                },
+            }
+        ),
+    )
+    social = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "social_post",
+        result=json.dumps(
+            {
+                "ok": True,
+                "_miniapp": {
+                    "changed": True,
+                    "start_param": "social",
+                },
+            }
+        ),
+    )
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="Готово.",
+        metadata={"hermes_turn_final": True},
+    )
+
+    assert boxmap == "boxmap"
+    assert social == "social"
+    assert result.success is True
+    rows = call_log[0]["reply_markup"].inline_keyboard
+    assert [row[0].text for row in rows] == [
+        "Открыть сценарии",
+        "Открыть публикации",
+    ]
+
+
+def test_explicit_unchanged_contract_overrides_legacy_tool_mapping():
+    adapter = _make_adapter()
+
+    recorded = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "mcp_health_actions_create_workout_slots",
+        result=json.dumps(
+            {
+                "structuredContent": {
+                    "_miniapp": {
+                        "changed": False,
+                        "start_param": "fitness",
+                    }
+                }
+            }
+        ),
+    )
+
+    assert recorded is None
+    assert getattr(adapter, "_pending_miniapp_buttons", {}) == {}
+
+
+def test_plain_miniapp_url_without_mutation_contract_does_not_add_button():
+    adapter = _make_adapter()
+
+    recorded = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "social_post",
+        result=json.dumps(
+            {
+                "drafts": [],
+                "miniapp_url": "https://t.me/TripiooBot?startapp=social",
+            }
+        ),
+    )
+
+    assert recorded is None
+    assert getattr(adapter, "_pending_miniapp_buttons", {}) == {}
+
+
+def test_non_mcp_tool_cannot_claim_miniapp_mutation_contract():
+    adapter = _make_adapter()
+
+    recorded = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "terminal",
+        result=json.dumps(
+            {
+                "_miniapp": {
+                    "changed": True,
+                    "start_param": "boxmap",
+                }
+            }
+        ),
+    )
+
+    assert recorded is None
+    assert getattr(adapter, "_pending_miniapp_buttons", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_or_read_only_miniapp_mcp_does_not_attach_button():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+    adapter.begin_miniapp_turn("-100123")
+    failed = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "mcp_health_actions_create_planning_task",
+        is_error=True,
+        result='{"error":"write failed"}',
+    )
+    read_only = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "mcp_health_actions_list_planning_tasks",
+        is_error=False,
+        result='{"result":"[]"}',
+    )
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="Событие не создано.",
+    )
+
+    assert failed is None
+    assert read_only is None
+    assert result.success is True
+    assert "reply_markup" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_multiple_miniapp_mcp_writes_attach_only_changed_apps():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+    adapter.begin_miniapp_turn("-100123")
+    adapter.record_miniapp_tool_completion(
+        "-100123", None, "mcp_health_actions_add_menu_entries"
+    )
+    adapter.record_miniapp_tool_completion(
+        "-100123", None, "mcp_health_actions_add_shopping_items"
+    )
+    adapter.record_miniapp_tool_completion(
+        "-100123", None, "mcp_google_calendar_create_event"
+    )
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="Готово.",
+        metadata={"hermes_turn_final": True},
+    )
+
+    assert result.success is True
+    rows = call_log[0]["reply_markup"].inline_keyboard
+    assert [row[0].text for row in rows] == ["Открыть меню", "Открыть покупки"]
+
+
+@pytest.mark.asyncio
+async def test_send_suppresses_inline_miniapp_buttons_for_disabled_dm():
+    adapter = _make_adapter()
+    adapter.config.extra = {
+        "inline_miniapp_buttons": {"disabled_chat_ids": ["179555559"]},
+    }
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+    pending_key = adapter._miniapp_pending_key("179555559")
+    adapter._pending_miniapp_buttons = {pending_key: ["planning"]}
+    result = await adapter.send(chat_id="179555559", content="Создал техническую задачу.")
+
+    assert result.success is True
+    assert "reply_markup" not in call_log[0]
+    assert adapter._pending_miniapp_buttons == {}
+
+
+def test_miniapp_request_uses_family_menu_section_in_family_topic():
+    adapter = _make_adapter()
+    adapter.config.extra = {
+        "group_topics": [
+            {
+                "chat_id": -1003966683704,
+                "topics": [
+                    {
+                        "name": "family",
+                        "thread_id": 1636,
+                        "skill": "telegram_family/telegram_family_context",
+                    },
+                ],
+            },
+        ],
+    }
+
+    message = SimpleNamespace(
+        text="сделай миниапп секцию для меню которое можно будет конвертировать в список продуктов",
+        chat=SimpleNamespace(id=-1003966683704),
+        message_thread_id=1636,
+    )
+
+    assert adapter._miniapp_start_param_for_request(message) == "menu"
+
+
+def test_miniapp_engineering_edit_request_is_not_shortcut_outside_family():
+    adapter = _make_adapter()
+
+    message = SimpleNamespace(
+        text="почини миниапп меню, там сломалась форма",
+        chat=SimpleNamespace(id=123),
+        message_thread_id=None,
+    )
+
+    assert adapter._miniapp_start_param_for_request(message) is None
+
+
+@pytest.mark.asyncio
 async def test_send_retries_network_errors_normally():
     """Real transient network errors (not BadRequest) should still be retried."""
     adapter = _make_adapter()
@@ -1362,8 +2063,8 @@ async def test_send_marks_pool_timeout_retryable_after_exhaustion():
 
 
 @pytest.mark.asyncio
-async def test_thread_fallback_only_fires_once():
-    """After clearing thread_id, subsequent chunks should also use None."""
+async def test_multichunk_group_send_never_falls_back_to_general():
+    """A failed first topic chunk stops the send before anything reaches General."""
     adapter = _make_adapter()
 
     call_log = []
@@ -1385,11 +2086,10 @@ async def test_thread_fallback_only_fires_once():
         metadata={"thread_id": "99999"},
     )
 
-    assert result.success is True
-    # First chunk: attempt with thread → fail → retry without → succeed
-    # Second chunk: should use thread_id=None directly (effective_thread_id
-    # was cleared per-chunk but the metadata doesn't change between chunks)
-    # The key point: the message was delivered despite the invalid thread
+    assert result.success is False
+    assert result.retryable is False
+    assert len(call_log) == 2
+    assert all(call["message_thread_id"] == 99999 for call in call_log)
 
 
 @pytest.mark.asyncio

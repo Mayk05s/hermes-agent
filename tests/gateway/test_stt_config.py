@@ -106,6 +106,15 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
 
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = GatewayConfig(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_trigger": True,
+            "show_transcription": False,
+            "voice_trigger_keywords": ["tripio"],
+        },
+    )
     runner.adapters = {}
     runner._model = "test-model"
     runner._base_url = ""
@@ -128,7 +137,7 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
         "tools.transcription_tools.transcribe_audio",
         return_value={
             "success": True,
-            "transcript": "queued voice transcript",
+            "transcript": "Tripio queued voice transcript",
             "provider": "local_command",
         },
     ):
@@ -139,7 +148,7 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
         )
 
     assert result is not None
-    assert "queued voice transcript" in result
+    assert "Tripio queued voice transcript" in result
     assert "voice message" in result.lower()
 
 
@@ -150,6 +159,11 @@ async def test_prepare_inbound_message_text_passive_audio_sends_plain_transcript
     adapter = SimpleNamespace(send=AsyncMock())
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = GatewayConfig(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={"show_transcription": True, "audio_trigger": False},
+    )
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._model = "test-model"
     runner._base_url = ""
@@ -201,6 +215,7 @@ async def test_prepare_inbound_message_text_passive_audio_runs_ai_on_asr_trigger
         token="test",
         extra={
             "show_transcription": True,
+            "audio_trigger": True,
             "voice_trigger_keywords": ["трипио", "tripio"],
             "voice_trigger_aliases": ["3p", "3p си", "3p вот"],
         },
@@ -243,5 +258,64 @@ async def test_prepare_inbound_message_text_passive_audio_runs_ai_on_asr_trigger
     assert result is not None
     assert "voice transcription rule matched" in result
     assert transcript in result
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[1] == transcript
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_message_text_addressed_voice_stays_gateway_only_without_keyword():
+    from gateway.run import GatewayRunner
+
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "show_transcription": True,
+            "audio_trigger": True,
+            "voice_trigger_keywords": ["tripio"],
+        },
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+    runner._gateway_chat_settings_raw = lambda: {}
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="group",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/free-response-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+    event.telegram_passive_audio_transcription = True
+    # A stale event from an older gateway process may still carry this legacy
+    # marker. It must not bypass the post-STT keyword gate.
+    event.telegram_audio_force_agent_response = True
+
+    transcript = "обычное голосовое без ключевого слова"
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": transcript,
+            "provider": "groq",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is None
     adapter.send.assert_awaited_once()
     assert adapter.send.await_args.args[1] == transcript

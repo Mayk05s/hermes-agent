@@ -75,6 +75,7 @@ def _make_runner(platform: Platform, config: GatewayConfig, *, enforces: bool):
     runner.adapters = {platform: adapter}
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
+    runner.pairing_store.is_chat_approved.return_value = False
     runner.pairing_store._is_rate_limited.return_value = False
     return runner, adapter
 
@@ -205,6 +206,54 @@ def test_telegram_config_group_allowed_chats_authorizes_group_senders(monkeypatc
 
     assert runner._is_user_authorized(allowed) is True
     assert runner._is_user_authorized(denied) is False
+
+
+def test_telegram_observed_group_shared_source_authorized_by_default(monkeypatch):
+    """Observed Telegram group turns use a shared source with no sender id."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="t",
+                extra={},
+            )
+        }
+    )
+    runner, _adapter = _make_runner(Platform.TELEGRAM, config, enforces=False)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_id="-1002",
+        user_name=None,
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_telegram_observed_group_shared_source_denied_when_disabled(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="t",
+                extra={"observe_unmentioned_group_messages": False},
+            )
+        }
+    )
+    runner, _adapter = _make_runner(Platform.TELEGRAM, config, enforces=False)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_id="-1002",
+        user_name=None,
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is False
 
 
 def test_env_allowlist_still_takes_precedence_for_own_policy_platform(monkeypatch):

@@ -1,7 +1,14 @@
 """Telegram-specific gateway filtering for noisy status/error output."""
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
 from gateway.config import Platform
 from gateway.run import (
+    GatewayRunner,
+    _format_fallback_activation_dm,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
@@ -81,3 +88,127 @@ def test_telegram_final_response_keeps_normal_answers():
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
+
+
+def test_telegram_final_response_blocks_corrupted_reasoning_leak():
+    """Garbled provider output must never be delivered as a normal answer."""
+    raw = (
+        "We need to answer.,im/data?][ayicalai_f/b/profile(--\n"
+        "//+$b FIRST false somev the/ [\ufffdical\n\n"
+        + "\n".join(["& & &", "[", "]", "==", "� ;"] * 20)
+    )
+
+    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
+
+    assert "corrupted response" in sanitized.lower()
+    assert "we need to answer" not in sanitized.lower()
+
+
+def _fallback_event():
+    return {
+        "primary_model": "gpt-5.6-terra",
+        "primary_provider": "openai-codex",
+        "fallback_model": "gemini-3.5-flash",
+        "fallback_provider": "gemini",
+        "reason": "auth",
+        "detail": "Codex token refresh failed: Invalid refresh token.",
+    }
+
+
+def test_fallback_activation_dm_names_models_and_reason():
+    message = _format_fallback_activation_dm(_fallback_event())
+
+    assert "Включён резервный провайдер" in message
+    assert "gpt-5.6-terra (openai-codex)" in message
+    assert "gemini-3.5-flash (gemini)" in message
+    assert "ошибка авторизации" in message
+    assert "Invalid refresh token" in message
+    assert "один раз" in message
+
+
+@pytest.mark.asyncio
+async def test_fallback_activation_dm_is_sent_once_until_primary_recovers(tmp_path):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._fallback_notification_state_path = (
+        tmp_path / ".fallback_provider_notification.json"
+    )
+    runner._active_fallback_notification = None
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(success=True))
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.config = SimpleNamespace(
+        get_home_channel=lambda _platform: SimpleNamespace(chat_id="179555559")
+    )
+    user_config = {
+        "model": {
+            "default": "gpt-5.6-terra",
+            "provider": "openai-codex",
+        }
+    }
+
+    await runner._notify_fallback_activation_once(
+        _fallback_event(),
+        user_config=user_config,
+        actual_model="gemini-3.5-flash",
+    )
+    await runner._notify_fallback_activation_once(
+        _fallback_event(),
+        user_config=user_config,
+        actual_model="gemini-3.5-flash",
+    )
+    assert adapter.send.await_count == 1
+    adapter.send.assert_awaited_with(
+        "179555559",
+        _format_fallback_activation_dm(_fallback_event()),
+    )
+
+    await runner._notify_fallback_activation_once(
+        None,
+        user_config=user_config,
+        actual_model="gpt-5.6-terra",
+    )
+    await runner._notify_fallback_activation_once(
+        _fallback_event(),
+        user_config=user_config,
+        actual_model="gemini-3.5-flash",
+    )
+    assert adapter.send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fallback_activation_dedupe_survives_gateway_restart(tmp_path):
+    state_path = tmp_path / ".fallback_provider_notification.json"
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(success=True))
+    )
+    config = SimpleNamespace(
+        get_home_channel=lambda _platform: SimpleNamespace(chat_id="179555559")
+    )
+    user_config = {"model": {"default": "gpt-5.6-terra"}}
+
+    first = GatewayRunner.__new__(GatewayRunner)
+    first._fallback_notification_state_path = state_path
+    first._active_fallback_notification = None
+    first.adapters = {Platform.TELEGRAM: adapter}
+    first.config = config
+    await first._notify_fallback_activation_once(
+        _fallback_event(),
+        user_config=user_config,
+        actual_model="gemini-3.5-flash",
+    )
+
+    restarted = GatewayRunner.__new__(GatewayRunner)
+    restarted._fallback_notification_state_path = state_path
+    restarted._active_fallback_notification = (
+        restarted._load_fallback_notification_state()
+    )
+    restarted.adapters = {Platform.TELEGRAM: adapter}
+    restarted.config = config
+    await restarted._notify_fallback_activation_once(
+        _fallback_event(),
+        user_config=user_config,
+        actual_model="gemini-3.5-flash",
+    )
+
+    assert adapter.send.await_count == 1

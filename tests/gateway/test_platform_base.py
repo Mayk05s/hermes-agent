@@ -1,8 +1,10 @@
 """Tests for gateway/platforms/base.py — MessageEvent, media extraction, message truncation."""
 
+import asyncio
 import os
 import time
 from unittest.mock import patch
+from urllib.parse import quote
 
 import pytest
 
@@ -10,6 +12,10 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
+    MessageType,
+    SendResult,
+    extract_agent_reaction_control,
+    parse_agent_control_response,
     safe_url_for_log,
     utf16_len,
     _log_safe_path,
@@ -22,6 +28,268 @@ class TestSecretCaptureGuidance:
         message = GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
         assert "local cli" in message.lower()
         assert "~/.hermes/.env" in message
+
+
+class TestAgentControlResponse:
+    def test_parses_reaction_marker(self):
+        parsed = parse_agent_control_response("[[reaction:\U0001f389]]")
+
+        assert parsed is not None
+        assert parsed.action == "reaction"
+        assert parsed.emoji == "\U0001f389"
+
+    def test_extracts_inline_reaction_marker_prefix(self):
+        parsed, remaining, bare = extract_agent_reaction_control(
+            "[[reaction:\U0001f44d]]\nDone."
+        )
+
+        assert parsed is not None
+        assert parsed.action == "reaction"
+        assert parsed.emoji == "\U0001f44d"
+        assert remaining == "Done."
+        assert bare is False
+
+    def test_extracts_inline_reaction_marker_suffix(self):
+        parsed, remaining, bare = extract_agent_reaction_control(
+            "Done.\n[[react:\U0001f44f]]"
+        )
+
+        assert parsed is not None
+        assert parsed.action == "reaction"
+        assert parsed.emoji == "\U0001f44f"
+        assert remaining == "Done."
+        assert bare is False
+
+    def test_extracts_bare_telegram_reaction_emoji_when_enabled(self):
+        parsed, remaining, bare = extract_agent_reaction_control(
+            "\U0001f44d",
+            include_bare_telegram_emoji=True,
+        )
+
+        assert parsed is not None
+        assert parsed.action == "reaction"
+        assert parsed.emoji == "\U0001f44d"
+        assert remaining == ""
+        assert bare is True
+
+    def test_parses_silent_marker(self):
+        parsed = parse_agent_control_response("[[silent]]")
+
+        assert parsed is not None
+        assert parsed.action == "silent"
+        assert parsed.emoji is None
+
+    def test_parses_legacy_silence_narration(self):
+        parsed = parse_agent_control_response(
+            "*(silent)*",
+            include_legacy_silence=True,
+        )
+
+        assert parsed is not None
+        assert parsed.action == "silent"
+
+    @pytest.mark.parametrize("content", ["ok", "\U0001f44d", "Silent install completed"])
+    def test_does_not_capture_normal_short_replies(self, content):
+        assert parse_agent_control_response(content) is None
+
+    @pytest.mark.asyncio
+    async def test_background_pipeline_consumes_control_marker_without_send(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.session import SessionSource, build_session_key
+
+        class StubAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(
+                    PlatformConfig(enabled=True, token="test"),
+                    Platform.TELEGRAM,
+                )
+                self.sent = []
+                self.controls = []
+
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.sent.append(
+                    {
+                        "chat_id": chat_id,
+                        "content": content,
+                        "reply_to": reply_to,
+                        "metadata": metadata,
+                    }
+                )
+                return SendResult(success=True, message_id="sent")
+
+            async def get_chat_info(self, *a):
+                return {}
+
+            async def handle_agent_control_response(self, event, control):
+                self.controls.append((event.message_id, control.action))
+                result = await super().handle_agent_control_response(event, control)
+                if control.action == "reaction":
+                    result.raw_response["reaction_sent"] = True
+                return result
+
+        adapter = StubAdapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="42",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="456",
+        )
+        session_key = build_session_key(source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        async def handler(_event):
+            return "[[silent]]"
+
+        adapter.set_message_handler(handler)
+
+        await adapter._process_message_background(event, session_key)
+
+        assert adapter.sent == []
+        assert adapter.controls == [("456", "silent")]
+
+    @pytest.mark.asyncio
+    async def test_background_pipeline_consumes_inline_reaction_and_sends_text(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.session import SessionSource, build_session_key
+
+        class StubAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(
+                    PlatformConfig(enabled=True, token="test"),
+                    Platform.TELEGRAM,
+                )
+                self.sent = []
+                self.controls = []
+
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.sent.append(
+                    {
+                        "chat_id": chat_id,
+                        "content": content,
+                        "reply_to": reply_to,
+                        "metadata": metadata,
+                    }
+                )
+                return SendResult(success=True, message_id="sent")
+
+            async def get_chat_info(self, *a):
+                return {}
+
+            async def handle_agent_control_response(self, event, control):
+                self.controls.append((event.message_id, control.action, control.emoji))
+                result = await super().handle_agent_control_response(event, control)
+                result.raw_response["reaction_sent"] = True
+                return result
+
+        adapter = StubAdapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="42",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="456",
+        )
+        session_key = build_session_key(source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        async def handler(_event):
+            return "[[reaction:\U0001f44d]]\nDone."
+
+        adapter.set_message_handler(handler)
+
+        await adapter._process_message_background(event, session_key)
+
+        assert adapter.controls == [("456", "reaction", "\U0001f44d")]
+        assert adapter.sent == [
+            {
+                "chat_id": "123",
+                "content": "Done.",
+                "reply_to": "456",
+                "metadata": {"notify": True},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_background_pipeline_converts_bare_emoji_to_telegram_reaction(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.session import SessionSource, build_session_key
+
+        class StubAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(
+                    PlatformConfig(enabled=True, token="test"),
+                    Platform.TELEGRAM,
+                )
+                self.sent = []
+                self.controls = []
+
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.sent.append(content)
+                return SendResult(success=True, message_id="sent")
+
+            async def get_chat_info(self, *a):
+                return {}
+
+            async def handle_agent_control_response(self, event, control):
+                self.controls.append((event.message_id, control.action, control.emoji))
+                result = await super().handle_agent_control_response(event, control)
+                result.raw_response["reaction_sent"] = True
+                return result
+
+        adapter = StubAdapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="42",
+        )
+        event = MessageEvent(
+            text="nice",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="456",
+        )
+        session_key = build_session_key(source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        async def handler(_event):
+            return "\U0001f44d"
+
+        adapter.set_message_handler(handler)
+
+        await adapter._process_message_background(event, session_key)
+
+        assert adapter.controls == [("456", "reaction", "\U0001f44d")]
+        assert adapter.sent == []
 
 
 class TestSafeUrlForLog:
@@ -166,6 +434,17 @@ class TestExtractImages:
         assert len(images) == 1
         assert images[0][0] == "https://example.com/img.webp"
         assert images[0][1] == ""
+
+    def test_local_markdown_image_path_is_extracted_as_file_uri(self, tmp_path):
+        image_path = tmp_path / "poster.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        images, cleaned = BasePlatformAdapter.extract_images(
+            f"Post copy\n\n![poster]({image_path})"
+        )
+
+        assert images == [(f"file://{quote(str(image_path))}", "poster")]
+        assert cleaned == "Post copy"
 
     def test_fal_media_cdn(self):
         content = "![gen](https://fal.media/files/abc123/output.png)"

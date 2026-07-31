@@ -82,6 +82,30 @@ def _write_sessions_index(root: Path, entries: dict[str, dict]) -> None:
     (sessions_dir / "sessions.json").write_text(json.dumps(entries), encoding="utf-8")
 
 
+def _fake_mempalace_llm(messages, **_kwargs) -> str:
+    raw = messages[-1]["content"].split("\n\n", 1)[1]
+    payload = json.loads(raw)
+    text = "\n".join(item.get("content", "") for item in payload.get("messages", []))
+    entities = []
+    facts = []
+    relations = []
+    if "Alpha Health Plan" in text:
+        entities.append({"name": "Alpha Health Plan", "type": "project", "description": "Health planning memory", "confidence": 0.92})
+        facts.append({"subject": "Alpha Health Plan", "predicate": "belongs_in", "object": "MemPalace history graph", "confidence": 0.9, "evidence_message_ids": [1]})
+    if "Beta Dashboard" in text:
+        entities.append({"name": "Beta Dashboard", "type": "project", "description": "Dashboard project", "confidence": 0.91})
+        facts.append({"subject": "Beta Dashboard", "predicate": "prefers", "object": "weekly status summaries", "confidence": 0.88, "evidence_message_ids": [2]})
+    if "Mobile health-check endpoint" in text or "mobile health-check endpoint" in text:
+        entities.extend(
+            [
+                {"name": "BoxMap", "type": "project", "description": "Project with backend milestone tracking", "confidence": 0.92},
+                {"name": "Mobile health-check endpoint", "type": "service", "description": "/api/healthz", "confidence": 0.9},
+            ]
+        )
+        relations.append({"subject": "BoxMap", "predicate": "uses", "object": "Mobile health-check endpoint", "confidence": 0.86, "evidence_message_ids": [1]})
+    return json.dumps({"entities": entities, "facts": facts, "relations": relations, "contradictions": []}, ensure_ascii=False)
+
+
 def test_generate_from_markdown_creates_profile_scoped_palace(tmp_path: Path):
     profile_home = tmp_path / "profile"
     tenant_root = tmp_path / "tenants"
@@ -257,12 +281,12 @@ def test_generate_from_history_extracts_chat_facts_by_profile_origin(tmp_path: P
 
     assert result["sessions"] == 1
     assert result["facts"] == 2
-    assert [row["palace"] for row in result["palaces"]] == ["history_telegram"]
+    assert [row["palace"] for row in result["palaces"]] == ["telegram_planning"]
     assert mempalace.search(
         "BoxMap",
         profile="family-chat",
         profile_home=family_home,
-        palace="history_telegram",
+        palace="telegram_planning",
     )["results"]
 
     default_home = tmp_path / "default-profile"
@@ -279,6 +303,285 @@ def test_generate_from_history_extracts_chat_facts_by_profile_origin(tmp_path: P
         profile_home=default_home,
         palace="history_telegram",
     )["results"]
+
+
+def test_history_palace_uses_json_origin_topic_and_thread_fallback(tmp_path: Path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    db_path = _create_state_db(
+        state_root,
+        sessions=[
+            {
+                "id": "cv-topic",
+                "source": "telegram",
+                "title": "CV work",
+                "message_count": 1,
+                "access_scope": json.dumps(
+                    {
+                        "session_key": "agent:main:telegram:group:-1001:777",
+                        "origin": {
+                            "platform": "telegram",
+                            "chat_id": "-1001",
+                            "chat_type": "group",
+                            "thread_id": "777",
+                            "chat_topic": "CV",
+                            "profile_name": "default",
+                        },
+                    }
+                ),
+            },
+            {
+                "id": "raw-topic",
+                "source": "telegram",
+                "title": "Raw topic",
+                "message_count": 1,
+                "access_scope": json.dumps(
+                    {
+                        "session_key": "agent:main:telegram:group:-1001:888",
+                        "origin": {
+                            "platform": "telegram",
+                            "chat_id": "-1001",
+                            "chat_type": "group",
+                            "thread_id": "888",
+                            "profile_name": "default",
+                        },
+                    }
+                ),
+            },
+        ],
+        messages=[
+            {
+                "id": 1,
+                "session_id": "cv-topic",
+                "role": "user",
+                "content": "Important remember: CV topic tracks resume rewrite and Java recruiter replies.",
+            },
+            {
+                "id": 2,
+                "session_id": "raw-topic",
+                "role": "user",
+                "content": "Important remember: raw Telegram topic keeps deployment notes separate.",
+            },
+        ],
+    )
+    profile_home = tmp_path / "profile"
+
+    result = mempalace.generate_from_history(
+        profile="default",
+        profile_home=profile_home,
+        state_db_path=db_path,
+        auto_clean=False,
+    )
+
+    palaces = {row["palace"] for row in result["palaces"]}
+    assert "telegram_cv" in palaces
+    assert "tg_1001_888" in palaces
+    assert mempalace.search(
+        "resume rewrite",
+        profile="default",
+        profile_home=profile_home,
+        palace="telegram_cv",
+    )["results"]
+
+
+def test_consolidate_profile_uses_llm_extractor_and_cursor(tmp_path: Path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    db_path = _create_state_db(
+        state_root,
+        sessions=[
+            {
+                "id": "family-session",
+                "source": "telegram",
+                "title": "Family project planning",
+                "message_count": 1,
+            },
+        ],
+        messages=[
+            {
+                "id": 1,
+                "session_id": "family-session",
+                "role": "user",
+                "content": "Important remember: BoxMap uses the Mobile health-check endpoint /api/healthz.",
+            },
+        ],
+    )
+    _write_sessions_index(
+        state_root,
+        {
+            "agent:main:telegram:group:-1001:42": {
+                "session_id": "family-session",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1001",
+                    "chat_type": "group",
+                    "thread_id": "42",
+                    "profile_name": "family-chat",
+                },
+            },
+        },
+    )
+    profile_home = tmp_path / "family-profile"
+
+    result = mempalace.consolidate_profile(
+        profile="family-chat",
+        profile_home=profile_home,
+        state_db_path=db_path,
+        force=True,
+        auto_clean=False,
+        llm_call=_fake_mempalace_llm,
+    )
+
+    assert result["processed_messages"] == 1
+    assert result["cursor_message_id"] == 1
+    assert result["triples"] == 1
+    assert "Mobile health-check endpoint" in mempalace.recall_context(
+        "health-check",
+        profile="family-chat",
+        profile_home=profile_home,
+    )
+
+    skipped = mempalace.consolidate_profile(
+        profile="family-chat",
+        profile_home=profile_home,
+        state_db_path=db_path,
+        force=True,
+        auto_clean=False,
+        llm_call=_fake_mempalace_llm,
+    )
+    assert skipped["processed_messages"] == 0
+
+
+def test_consolidate_profile_dry_run_does_not_write_cursor(tmp_path: Path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    db_path = _create_state_db(
+        state_root,
+        sessions=[{"id": "history-session", "source": "telegram", "title": "History", "message_count": 1}],
+        messages=[
+            {
+                "id": 1,
+                "session_id": "history-session",
+                "role": "user",
+                "content": "Important remember: Alpha Health Plan belongs in MemPalace history graph.",
+            },
+        ],
+    )
+    _write_sessions_index(
+        state_root,
+        {
+            "agent:main:telegram:dm:alpha": {
+                "session_id": "history-session",
+                "origin": {"platform": "telegram", "chat_id": "alpha", "chat_type": "dm", "profile_name": "default"},
+            }
+        },
+    )
+    profile_home = tmp_path / "profile"
+
+    preview = mempalace.consolidate_profile(
+        profile="default",
+        profile_home=profile_home,
+        state_db_path=db_path,
+        dry_run=True,
+        force=True,
+        llm_call=_fake_mempalace_llm,
+    )
+
+    assert preview["processed_messages"] == 1
+    assert preview["batches"][0]["palaces"][0]["entities"] == 1
+    assert mempalace.consolidator_status(
+        profile="default",
+        profile_home=profile_home,
+        state_db_path=db_path,
+    )["cursor_message_id"] == 0
+    assert mempalace.recall_context("Alpha Health Plan", profile="default", profile_home=profile_home) == ""
+
+
+def test_consolidate_profile_auto_clean_uses_validator_not_deterministic_clean(tmp_path: Path, monkeypatch):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    db_path = _create_state_db(
+        state_root,
+        sessions=[{"id": "history-session", "source": "telegram", "title": "History", "message_count": 1}],
+        messages=[
+            {
+                "id": 1,
+                "session_id": "history-session",
+                "role": "user",
+                "content": "Important remember: Volatile Project status is ready by 2026-06-10.",
+            },
+        ],
+    )
+    _write_sessions_index(
+        state_root,
+        {
+            "agent:main:telegram:dm:volatile": {
+                "session_id": "history-session",
+                "origin": {"platform": "telegram", "chat_id": "volatile", "chat_type": "dm", "profile_name": "default"},
+            }
+        },
+    )
+    profile_home = tmp_path / "profile"
+
+    def fake_extractor(_messages, **_kwargs):
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "Volatile Project", "type": "project", "description": "Status-only candidate", "confidence": 0.9}
+                ],
+                "facts": [
+                    {
+                        "subject": "Volatile Project",
+                        "predicate": "status",
+                        "object": "ready by 2026-06-10",
+                        "confidence": 0.8,
+                        "evidence_message_ids": [1],
+                    }
+                ],
+                "relations": [],
+                "contradictions": [],
+            },
+            ensure_ascii=False,
+        )
+
+    def fail_deterministic_clean(**_kwargs):
+        raise AssertionError("deterministic clean_noise must not run from consolidator auto-clean")
+
+    validator_calls = []
+
+    def fake_validator(messages, **_kwargs):
+        validator_calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        assert any(item["label"] == "Volatile Project" for item in payload["candidates"])
+        return json.dumps(
+            {
+                "delete": [],
+                "keep": [{"id": item["id"], "reason": "needs review"} for item in payload["candidates"]],
+                "summary": "kept by validator",
+            }
+        )
+
+    monkeypatch.setattr(mempalace, "clean_noise", fail_deterministic_clean)
+    monkeypatch.setattr(mempalace, "_call_validator_llm", fake_validator)
+    monkeypatch.setattr(mempalace, "_profile_route_lookup", lambda: ("default", {}))
+
+    result = mempalace.consolidate_profile(
+        profile="default",
+        profile_home=profile_home,
+        state_db_path=db_path,
+        force=True,
+        auto_clean=True,
+        llm_call=fake_extractor,
+    )
+
+    assert validator_calls
+    assert result["auto_clean"][0]["validator"] is True
+    assert result["auto_clean"][0]["deleted_entities"] == 0
+    assert "Volatile Project" in mempalace.recall_context(
+        "Volatile Project",
+        profile="default",
+        profile_home=profile_home,
+    )
 
 
 def test_profile_graph_subgraph_and_tree_work_without_required_palace(tmp_path: Path):
@@ -382,8 +685,8 @@ def test_clean_noise_previews_backs_up_and_deletes_low_signal_entities(tmp_path:
         dry_run=True,
     )
 
-    assert preview["total_candidates"] == 1
-    assert preview["candidates"][0]["label"] == "Вася"
+    assert preview["total_candidates"] == 2
+    assert {item["label"] for item in preview["candidates"]} == {"Вася", "готов, sonnet"}
 
     result = mempalace.clean_noise(
         profile="default",
@@ -393,9 +696,9 @@ def test_clean_noise_previews_backs_up_and_deletes_low_signal_entities(tmp_path:
         max_delete=10,
     )
 
-    assert result["deleted_entities"] == 1
+    assert result["deleted_entities"] == 2
     assert result["deleted_triples"] == 1
-    assert result["deleted_orphans"] >= 1
+    assert result["deleted_orphans"] == 0
     assert result["backup_root"]
     assert Path(result["backup_root"]).exists()
 
@@ -405,7 +708,7 @@ def test_clean_noise_previews_backs_up_and_deletes_low_signal_entities(tmp_path:
         assert conn.execute("SELECT 1 FROM entities WHERE id = 'backend_tester'").fetchone()
 
 
-def test_generate_from_markdown_auto_cleans_noise_in_touched_palace(tmp_path: Path):
+def test_generate_from_markdown_auto_clean_uses_validator_not_deterministic_clean(tmp_path: Path, monkeypatch):
     profile_home = tmp_path / "profile"
     tenant_root = tmp_path / "tenants"
     memory_dir = tenant_root / "telegram_boxmap" / "memory"
@@ -431,6 +734,20 @@ def test_generate_from_markdown_auto_cleans_noise_in_touched_palace(tmp_path: Pa
         )
         conn.commit()
 
+    def fail_deterministic_clean(**_kwargs):
+        raise AssertionError("deterministic clean_noise must not run from markdown auto-clean")
+
+    validator_calls = []
+
+    def fake_validator(messages, **_kwargs):
+        validator_calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        assert any(item["label"] == "Вася" for item in payload["candidates"])
+        return json.dumps({"delete": [], "keep": [], "summary": "kept by validator"})
+
+    monkeypatch.setattr(mempalace, "clean_noise", fail_deterministic_clean)
+    monkeypatch.setattr(mempalace, "_call_validator_llm", fake_validator)
+
     result = mempalace.generate_from_markdown(
         profile="default",
         profile_home=profile_home,
@@ -440,17 +757,22 @@ def test_generate_from_markdown_auto_cleans_noise_in_touched_palace(tmp_path: Pa
     auto_clean = result["auto_clean"]
     assert len(auto_clean) == 1
     assert auto_clean[0]["palace"] == "telegram_boxmap"
-    assert auto_clean[0]["deleted_entities"] == 1
-    assert auto_clean[0]["deleted_triples"] == 1
-    assert auto_clean[0]["backup_root"]
+    assert auto_clean[0]["validator"] is True
+    assert auto_clean[0]["deleted_entities"] == 0
+    assert validator_calls
 
     with mempalace._connect_readonly(db_path) as conn:
-        assert conn.execute("SELECT 1 FROM entities WHERE id = 'вася'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM entities WHERE id = 'вася'").fetchone()
         assert conn.execute("SELECT 1 FROM triples WHERE id = 't_vasya_status'").fetchone() is None
+        props = json.loads(conn.execute("SELECT properties FROM entities WHERE id = 'вася'").fetchone()[0])
+        assert any(
+            item.get("predicate") == "status" and item.get("value") == "готов, sonnet"
+            for item in props.get("literal_facts", [])
+        )
         assert conn.execute("SELECT COUNT(*) FROM triples WHERE source_file LIKE '%knowledge.md'").fetchone()[0] >= 1
 
 
-def test_import_auto_cleans_only_copied_palaces(tmp_path: Path):
+def test_import_auto_clean_uses_validator_not_deterministic_clean(tmp_path: Path, monkeypatch):
     import_root = tmp_path / "imports"
     source_paths = mempalace.PalacePaths(
         profile="snapshot",
@@ -489,6 +811,20 @@ def test_import_auto_cleans_only_copied_palaces(tmp_path: Path):
         )
         conn.commit()
 
+    def fail_deterministic_clean(**_kwargs):
+        raise AssertionError("deterministic clean_noise must not run from import auto-clean")
+
+    validator_calls = []
+
+    def fake_validator(messages, **_kwargs):
+        validator_calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        assert any(item["label"] == "Вася" for item in payload["candidates"])
+        return json.dumps({"delete": [], "keep": [], "summary": "kept by validator"})
+
+    monkeypatch.setattr(mempalace, "clean_noise", fail_deterministic_clean)
+    monkeypatch.setattr(mempalace, "_call_validator_llm", fake_validator)
+
     result = mempalace.copy_import_to_profile(
         profile="default",
         profile_home=profile_home,
@@ -498,13 +834,186 @@ def test_import_auto_cleans_only_copied_palaces(tmp_path: Path):
 
     assert result["copied"] == 1
     assert result["auto_clean"][0]["palace"] == "telegram_boxmap"
-    assert result["auto_clean"][0]["deleted_entities"] == 1
+    assert result["auto_clean"][0]["validator"] is True
+    assert result["auto_clean"][0]["deleted_entities"] == 0
+    assert validator_calls
 
     copied_db = mempalace._db_path(dest_paths, "telegram_boxmap")
     with mempalace._connect_readonly(copied_db) as conn:
-        assert conn.execute("SELECT 1 FROM entities WHERE id = 'вася'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM entities WHERE id = 'вася'").fetchone()
     with mempalace._connect_readonly(existing_db) as conn:
         assert conn.execute("SELECT 1 FROM entities WHERE id = 'петя'").fetchone()
+
+
+def test_generate_from_history_auto_clean_uses_validator_not_deterministic_clean(tmp_path: Path, monkeypatch):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    db_path = _create_state_db(
+        state_root,
+        sessions=[{"id": "history-session", "source": "telegram", "title": "History", "message_count": 1}],
+        messages=[
+            {
+                "id": 1,
+                "session_id": "history-session",
+                "role": "user",
+                "content": "Important remember: BoxMap uses the Mobile health-check endpoint /api/healthz.",
+            },
+        ],
+    )
+    _write_sessions_index(
+        state_root,
+        {
+            "agent:main:telegram:dm:boxmap": {
+                "session_id": "history-session",
+                "origin": {"platform": "telegram", "chat_id": "boxmap", "chat_type": "dm", "profile_name": "default"},
+            }
+        },
+    )
+    profile_home = tmp_path / "profile"
+
+    def fail_deterministic_clean(**_kwargs):
+        raise AssertionError("deterministic clean_noise must not run from history auto-clean")
+
+    validator_calls = []
+
+    def fake_validator(messages, **_kwargs):
+        validator_calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        assert payload["candidates"]
+        return json.dumps({"delete": [], "keep": [], "summary": "kept by validator"})
+
+    monkeypatch.setattr(mempalace, "clean_noise", fail_deterministic_clean)
+    monkeypatch.setattr(mempalace, "_call_validator_llm", fake_validator)
+    monkeypatch.setattr(mempalace, "_profile_route_lookup", lambda: ("default", {}))
+
+    result = mempalace.generate_from_history(
+        profile="default",
+        profile_home=profile_home,
+        state_db_path=db_path,
+    )
+
+    assert validator_calls
+    assert result["auto_clean"][0]["validator"] is True
+    assert result["auto_clean"][0]["deleted_entities"] == 0
+    assert mempalace.search(
+        "BoxMap",
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+    )["results"]
+
+
+def test_partition_import_auto_clean_uses_validator_not_deterministic_clean(tmp_path: Path, monkeypatch):
+    import_root = tmp_path / "imports"
+    source_paths = mempalace.PalacePaths(
+        profile="snapshot",
+        profile_home=tmp_path / "snapshot-profile",
+        storage_root=import_root / "snap-1" / "mcp-storage",
+    )
+    source_db = mempalace._db_path(source_paths, "telegram_boxmap")
+    with mempalace._connect_rw(source_db) as conn:
+        mempalace._upsert_entity(conn, "вася", "Вася", "person", {"description": "backend tester"})
+        mempalace._upsert_entity(conn, "готов,_sonnet", "готов, sonnet", "unknown", {})
+        mempalace._upsert_triple(
+            conn,
+            "t_vasya_status",
+            "вася",
+            "status",
+            "готов,_sonnet",
+            source_closet="tg:-1003735932411:6827",
+            adapter_name="",
+        )
+        conn.commit()
+
+    profile_root = tmp_path / "profiles"
+
+    def fake_palace_paths(profile="default", *, profile_home=None):
+        home = Path(profile_home) if profile_home is not None else profile_root / profile
+        return mempalace.PalacePaths(
+            profile=profile,
+            profile_home=home,
+            storage_root=home / "mempalace" / "mcp-storage",
+        )
+
+    def fail_deterministic_clean(**_kwargs):
+        raise AssertionError("deterministic cleanup must not run from partition auto-clean")
+
+    validator_calls = []
+
+    def fake_validator(messages, **_kwargs):
+        validator_calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        assert any(item["label"] == "Вася" for item in payload["candidates"])
+        return json.dumps({"delete": [], "keep": [], "summary": "kept by validator"})
+
+    monkeypatch.setattr(mempalace, "list_profiles", lambda: [{"name": "default"}])
+    monkeypatch.setattr(mempalace, "palace_paths", fake_palace_paths)
+    monkeypatch.setattr(mempalace, "_profile_route_chat_map", lambda: {})
+    monkeypatch.setattr(mempalace, "clean_noise", fail_deterministic_clean)
+    monkeypatch.setattr(mempalace, "auto_clean_noise", fail_deterministic_clean)
+    monkeypatch.setattr(mempalace, "_call_validator_llm", fake_validator)
+
+    result = mempalace.partition_import_to_profiles(
+        snapshot="snap-1",
+        import_root=import_root,
+        backup=False,
+        regenerate=False,
+    )
+
+    assert validator_calls
+    assert result["auto_clean"][0]["validator"] is True
+    assert result["auto_clean"][0]["deleted_entities"] == 0
+    copied_db = profile_root / "default" / "mempalace" / "mcp-storage" / "telegram_boxmap" / "mempalace" / "knowledge_graph.sqlite3"
+    with mempalace._connect_readonly(copied_db) as conn:
+        assert conn.execute("SELECT 1 FROM entities WHERE id = 'вася'").fetchone()
+
+
+def test_refresh_if_due_auto_clean_uses_validator_not_deterministic_clean(tmp_path: Path, monkeypatch):
+    profile_home = tmp_path / "profile"
+    memories = profile_home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text(
+        "# Profile\n"
+        "- Refresh keeps curated profile memory.\n",
+        encoding="utf-8",
+    )
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    db_path = _create_state_db(state_root, sessions=[], messages=[])
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    palace_db = mempalace._db_path(paths, "hermes_profile")
+    with mempalace._connect_rw(palace_db) as conn:
+        mempalace._upsert_entity(conn, "вася", "Вася", "person", {"description": "backend tester"})
+        mempalace._upsert_entity(conn, "готов,_sonnet", "готов, sonnet", "unknown", {})
+        mempalace._upsert_triple(conn, "t_vasya_status", "вася", "status", "готов,_sonnet")
+        conn.commit()
+
+    def fail_deterministic_clean(**_kwargs):
+        raise AssertionError("deterministic clean_noise must not run from refresh auto-clean")
+
+    validator_calls = []
+
+    def fake_validator(messages, **_kwargs):
+        validator_calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        assert any(item["label"] == "Вася" for item in payload["candidates"])
+        return json.dumps({"delete": [], "keep": [], "summary": "kept by validator"})
+
+    monkeypatch.setattr(mempalace, "clean_noise", fail_deterministic_clean)
+    monkeypatch.setattr(mempalace, "_call_validator_llm", fake_validator)
+    monkeypatch.setattr(mempalace, "_profile_route_lookup", lambda: ("default", {}))
+
+    result = mempalace.refresh_if_due(
+        profile="default",
+        profile_home=profile_home,
+        state_db_path=db_path,
+        force=True,
+    )
+
+    assert result["refreshed"] is True
+    assert validator_calls
+    with mempalace._connect_readonly(palace_db) as conn:
+        assert conn.execute("SELECT 1 FROM entities WHERE id = 'вася'").fetchone()
 
 
 def test_rebuild_from_markdown_replaces_existing_storage(tmp_path: Path):
@@ -654,6 +1163,7 @@ def test_refresh_if_due_rebuilds_only_after_interval_and_source_change(tmp_path:
     state = mempalace._read_refresh_state(paths)
     state["last_checked_epoch"] = 0
     mempalace._write_refresh_state(paths, state)
+    mempalace.set_consolidator_auto_enabled(profile="default", profile_home=profile_home, enabled=True)
 
     refreshed = mempalace.refresh_if_due(
         profile="default",
@@ -670,7 +1180,8 @@ def test_refresh_if_due_rebuilds_only_after_interval_and_source_change(tmp_path:
     )
 
 
-def test_refresh_if_due_rebuilds_when_chat_history_changes(tmp_path: Path):
+def test_refresh_if_due_consolidates_when_chat_history_changes(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(mempalace, "_call_history_llm", _fake_mempalace_llm)
     profile_home = tmp_path / "profile"
     state_root = tmp_path / "state"
     state_root.mkdir()
@@ -742,6 +1253,7 @@ def test_refresh_if_due_rebuilds_when_chat_history_changes(tmp_path: Path):
     state = mempalace._read_refresh_state(paths)
     state["last_checked_epoch"] = 0
     mempalace._write_refresh_state(paths, state)
+    mempalace.set_consolidator_auto_enabled(profile="default", profile_home=profile_home, enabled=True)
 
     refreshed = mempalace.refresh_if_due(
         profile="default",
@@ -751,9 +1263,443 @@ def test_refresh_if_due_rebuilds_when_chat_history_changes(tmp_path: Path):
     )
 
     assert refreshed["refreshed"] is True
-    assert refreshed["history_facts"] == 2
+    assert refreshed["history_messages_processed"] == 1
     assert "Beta Dashboard" in mempalace.recall_context(
         "Beta Dashboard",
         profile="default",
         profile_home=profile_home,
     )
+
+
+def test_scan_noise_includes_unknown_boolean_literals_and_validator_receives_them(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "boxmap", "BoxMap", "project", {"source_file": "curated.md"})
+        mempalace._upsert_entity(conn, "literal_true", "true", "unknown", {})
+        mempalace._upsert_entity(conn, "literal_false", "false", "unknown", {})
+        mempalace._upsert_triple(conn, "t_true", "boxmap", "enabled", "literal_true")
+        mempalace._upsert_triple(conn, "t_false", "boxmap", "active", "literal_false")
+        conn.commit()
+
+    preview = mempalace.scan_noise(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+    )
+
+    candidate_ids = {item["id"] for item in preview["candidates"]}
+    assert {"literal_true", "literal_false"} <= candidate_ids
+
+    calls = []
+
+    def fake_validator(messages, **_kwargs):
+        calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        seen_ids = {item["id"] for item in payload["candidates"]}
+        assert {"literal_true", "literal_false"} <= seen_ids
+        return json.dumps({"delete": [], "keep": [], "summary": "checked"})
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        dry_run=True,
+        llm_call=fake_validator,
+    )
+
+    assert calls
+    assert result["total_candidates"] >= 2
+
+
+def test_scan_noise_flags_transient_predicate_candidates(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "alex", "Alex", "person", {})
+        mempalace._upsert_entity(conn, "home", "home", "unknown", {})
+        mempalace._upsert_triple(conn, "t_today", "alex", "today", "home")
+        conn.commit()
+
+    preview = mempalace.scan_noise(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+    )
+
+    by_id = {item["id"]: item for item in preview["candidates"]}
+    assert by_id["alex"]["reason"] == "transient predicate"
+
+
+def test_validator_accepts_delete_string_id(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "boxmap", "BoxMap", "project", {})
+        mempalace._upsert_entity(conn, "literal_true", "true", "unknown", {})
+        mempalace._upsert_triple(conn, "t_true", "boxmap", "enabled", "literal_true")
+        conn.commit()
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        dry_run=True,
+        llm_call=lambda _messages, **_kwargs: json.dumps({"delete": ["literal_true"], "keep": [], "summary": "delete exact id"}),
+    )
+
+    assert result["status"] == "success"
+    assert result["validator_contract_error"] is False
+    assert [item["id"] for item in result["selected"]] == ["literal_true"]
+    assert result["selected"][0]["validator_matched_by"] == "id"
+
+
+def test_validator_maps_unique_label_delete_conservatively(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "unique_subject", "Unique Status Subject", "project", {})
+        mempalace._upsert_entity(conn, "literal_ready", "ready", "unknown", {})
+        mempalace._upsert_triple(conn, "t_ready", "unique_subject", "status", "literal_ready")
+        conn.commit()
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        dry_run=True,
+        llm_call=lambda _messages, **_kwargs: json.dumps(
+            {"delete": [{"name": "Unique Status Subject", "reason": "status-only"}], "keep": [], "summary": "delete by unique label"}
+        ),
+    )
+
+    assert result["status"] == "success"
+    assert result["validator_contract_error"] is False
+    assert [item["id"] for item in result["selected"]] == ["unique_subject"]
+    assert result["selected"][0]["validator_matched_by"] == "unique_label"
+
+
+def test_validator_does_not_delete_ambiguous_label_without_exact_id(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "boxmap_a", "BoxMap A", "project", {})
+        mempalace._upsert_entity(conn, "boxmap_b", "BoxMap B", "project", {})
+        mempalace._upsert_entity(conn, "literal_true_a", "true", "unknown", {})
+        mempalace._upsert_entity(conn, "literal_true_b", "true", "unknown", {})
+        mempalace._upsert_triple(conn, "t_true_a", "boxmap_a", "enabled", "literal_true_a")
+        mempalace._upsert_triple(conn, "t_true_b", "boxmap_b", "enabled", "literal_true_b")
+        conn.commit()
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        dry_run=True,
+        llm_call=lambda _messages, **_kwargs: json.dumps(
+            {"delete": [{"label": "true", "reason": "boolean literal"}], "keep": [], "summary": "delete true"}
+        ),
+    )
+
+    assert result["status"] == "contract_error"
+    assert result["validator_contract_error"] is True
+    assert result["selected"] == []
+    assert "ambiguous delete label" in result["validator_contract_errors"][0]
+
+
+def test_validator_contract_error_when_summary_implies_delete_without_ids(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "boxmap", "BoxMap", "project", {})
+        mempalace._upsert_entity(conn, "literal_true", "true", "unknown", {})
+        mempalace._upsert_triple(conn, "t_true", "boxmap", "enabled", "literal_true")
+        conn.commit()
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        dry_run=True,
+        llm_call=lambda _messages, **_kwargs: json.dumps(
+            {"delete": [], "keep": [], "summary": "Delete all obvious transient/status/debris candidates."}
+        ),
+    )
+
+    assert result["status"] == "contract_error"
+    assert result["validator_contract_error"] is True
+    assert result["selected"] == []
+    assert "summary implies deletion" in result["validator_contract_errors"][0]
+
+
+def test_validator_compacts_kept_boolean_and_numeric_leaf_literals(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "mikhail", "Mikhail Shokolov", "person", {})
+        mempalace._upsert_entity(conn, "literal_100", "100", "unknown", {})
+        mempalace._upsert_entity(conn, "literal_true", "true", "unknown", {})
+        mempalace._upsert_triple(
+            conn,
+            "t_protein",
+            "mikhail",
+            "daily_protein_goal_g",
+            "literal_100",
+            source_closet="state.db:history_telegram:1",
+            adapter_name="hermes_history_llm",
+        )
+        mempalace._upsert_triple(
+            conn,
+            "t_mcp",
+            "mikhail",
+            "wants_custom_mcp_endpoints_for_regular_actions",
+            "literal_true",
+            source_closet="state.db:history_telegram:2",
+            adapter_name="hermes_history_llm",
+        )
+        conn.commit()
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        llm_call=lambda _messages, **_kwargs: json.dumps(
+            {"delete": [], "keep": [{"candidate_id": "literal_100"}, {"candidate_id": "literal_true"}], "summary": "keep useful facts"}
+        ),
+    )
+
+    assert result["status"] == "success"
+    assert result["deleted_entities"] == 0
+    assert result["compacted_literals"] == 2
+    assert result["compacted_triples"] == 2
+    assert result["compaction_backup_root"]
+    with mempalace._connect_readonly(db_path) as conn:
+        assert conn.execute("SELECT 1 FROM entities WHERE id = 'literal_100'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM triples WHERE id IN ('t_protein', 't_mcp')").fetchone() is None
+        props = json.loads(conn.execute("SELECT properties FROM entities WHERE id = 'mikhail'").fetchone()[0])
+    facts = props["literal_facts"]
+    assert {item["predicate"]: item["value"] for item in facts} == {
+        "daily_protein_goal_g": "100",
+        "wants_custom_mcp_endpoints_for_regular_actions": "true",
+    }
+    assert mempalace.scan_noise(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+    )["total_candidates"] == 0
+    assert "daily_protein_goal_g: 100" in mempalace.recall_context(
+        "daily_protein_goal",
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+    )
+
+
+def test_validator_does_not_compact_non_leaf_literal(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "mikhail", "Mikhail Shokolov", "person", {})
+        mempalace._upsert_entity(conn, "literal_100", "100", "unknown", {})
+        mempalace._upsert_entity(conn, "grams", "grams", "concept", {})
+        mempalace._upsert_triple(conn, "t_protein", "mikhail", "daily_protein_goal_g", "literal_100")
+        mempalace._upsert_triple(conn, "t_unit", "literal_100", "has_unit", "grams")
+        conn.commit()
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        llm_call=lambda _messages, **_kwargs: json.dumps(
+            {"delete": [], "keep": [{"candidate_id": "literal_100"}], "summary": "keep non-leaf"}
+        ),
+    )
+
+    assert result["compacted_literals"] == 0
+    with mempalace._connect_readonly(db_path) as conn:
+        assert conn.execute("SELECT 1 FROM entities WHERE id = 'literal_100'").fetchone()
+        assert conn.execute("SELECT 1 FROM triples WHERE id = 't_protein'").fetchone()
+    assert mempalace.scan_noise(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+    )["total_candidates"] >= 1
+
+
+def test_validator_status_records_last_validation(tmp_path: Path, monkeypatch):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_rw(db_path) as conn:
+        mempalace._upsert_entity(conn, "boxmap", "BoxMap", "project", {})
+        mempalace._upsert_entity(conn, "literal_true", "true", "unknown", {})
+        mempalace._upsert_triple(conn, "t_true", "boxmap", "enabled", "literal_true")
+        conn.commit()
+    monkeypatch.setattr(mempalace, "_profile_route_lookup", lambda: ("default", {}))
+
+    result = mempalace.validate_and_clean_noise_with_llm(
+        profile="default",
+        profile_home=profile_home,
+        palace="history_telegram",
+        llm_call=lambda _messages, **_kwargs: json.dumps({"delete": [], "keep": [], "summary": "kept and compacted"}),
+    )
+    status = mempalace.consolidator_status(profile="default", profile_home=profile_home)
+
+    assert result["finished_at"]
+    assert status["last_validation_finished_at"] == result["finished_at"]
+    assert status["last_validation_status"] == "success"
+    assert status["last_validation_summary"] == "kept and compacted"
+    assert status["last_validation_compacted_literals"] == 1
+
+
+def test_llm_extraction_skips_boolean_literals_low_signal_relations_and_records_evidence(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    extraction = {
+        "entities": [
+            {"name": "BoxMap", "type": "project", "description": "Project memory", "confidence": 0.94},
+            {
+                "name": "Mobile health-check endpoint",
+                "type": "service",
+                "description": "/api/healthz",
+                "confidence": 0.9,
+            },
+            {"name": "true", "type": "unknown", "description": "true", "confidence": 0.2},
+        ],
+        "facts": [
+            {
+                "subject": "BoxMap",
+                "predicate": "uses",
+                "object": "Mobile health-check endpoint",
+                "confidence": 0.88,
+                "evidence_message_ids": [42],
+            },
+            {
+                "subject": "BoxMap",
+                "predicate": "enabled",
+                "object": "true",
+                "confidence": 0.5,
+                "evidence_message_ids": [42],
+            },
+            {
+                "subject": "BoxMap",
+                "predicate": "current_status",
+                "object": "ready",
+                "confidence": 0.5,
+                "evidence_message_ids": [42],
+            },
+        ],
+        "relations": [
+            {
+                "subject": "Alice",
+                "predicate": "talks_to",
+                "object": "Bob",
+                "confidence": 0.4,
+                "evidence_message_ids": [42],
+            }
+        ],
+        "contradictions": [],
+    }
+
+    counts = mempalace._write_llm_extraction(
+        paths=paths,
+        palace="history_telegram",
+        extraction=extraction,
+        batch_messages=[{"id": 42, "content": "Important remember: BoxMap uses the Mobile health-check endpoint."}],
+    )
+
+    assert counts == {"entities": 2, "triples": 1, "skipped": 3}
+
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_readonly(db_path) as conn:
+        assert conn.execute("SELECT 1 FROM entities WHERE LOWER(name) = 'true'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM triples WHERE predicate = 'talks_to'").fetchone() is None
+        row = conn.execute("SELECT predicate, evidence FROM triples WHERE predicate = 'uses'").fetchone()
+
+    assert row["predicate"] == "uses"
+    evidence = json.loads(row["evidence"])
+    assert evidence["message_ids"] == [42]
+    assert evidence["source_closet"] == "state.db:history_telegram:42-42"
+
+
+def test_llm_extraction_requires_explicit_in_batch_triple_evidence(tmp_path: Path):
+    profile_home = tmp_path / "profile"
+    paths = mempalace.palace_paths("default", profile_home=profile_home)
+    extraction = {
+        "entities": [
+            {"name": "BoxMap", "type": "project", "description": "Project memory", "confidence": 0.94},
+            {"name": "Endpoint A", "type": "service", "description": "Valid endpoint", "confidence": 0.9},
+            {"name": "Endpoint B", "type": "service", "description": "No evidence endpoint", "confidence": 0.9},
+            {"name": "Endpoint C", "type": "service", "description": "Wrong evidence endpoint", "confidence": 0.9},
+        ],
+        "facts": [
+            {
+                "subject": "BoxMap",
+                "predicate": "uses",
+                "object": "Endpoint A",
+                "confidence": 0.88,
+                "evidence_message_ids": [42, 99, 42],
+            },
+            {
+                "subject": "BoxMap",
+                "predicate": "uses",
+                "object": "Endpoint B",
+                "confidence": 0.88,
+            },
+            {
+                "subject": "BoxMap",
+                "predicate": "uses",
+                "object": "Endpoint C",
+                "confidence": 0.88,
+                "evidence_message_ids": [12345],
+            },
+        ],
+        "relations": [
+            {
+                "subject": "BoxMap",
+                "predicate": "depends_on",
+                "object": "Endpoint A",
+                "confidence": 0.8,
+                "evidence_message_ids": [99],
+            },
+            {
+                "subject": "Endpoint B",
+                "predicate": "depends_on",
+                "object": "Endpoint C",
+                "confidence": 0.8,
+                "evidence_message_ids": [777],
+            },
+        ],
+        "contradictions": [],
+    }
+
+    counts = mempalace._write_llm_extraction(
+        paths=paths,
+        palace="history_telegram",
+        extraction=extraction,
+        batch_messages=[
+            {"id": 42, "content": "Important remember: BoxMap uses Endpoint A."},
+            {"id": 99, "content": "Important remember: BoxMap depends on Endpoint A."},
+        ],
+    )
+
+    assert counts["triples"] == 2
+    assert counts["skipped"] == 3
+
+    db_path = mempalace._db_path(paths, "history_telegram")
+    with mempalace._connect_readonly(db_path) as conn:
+        rows = conn.execute("SELECT predicate, evidence FROM triples ORDER BY predicate").fetchall()
+
+    evidence_by_predicate = {row["predicate"]: json.loads(row["evidence"])["message_ids"] for row in rows}
+    assert evidence_by_predicate == {
+        "depends_on": [99],
+        "uses": [42, 99],
+    }

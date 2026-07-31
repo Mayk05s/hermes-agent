@@ -57,6 +57,7 @@ def _make_event(platform: Platform, user_id: str, chat_id: str) -> MessageEvent:
 
 def _make_runner(platform: Platform, config: GatewayConfig):
     from gateway.run import GatewayRunner
+    from gateway.profile_routing import normalize_profile_routes_config
 
     runner = object.__new__(GatewayRunner)
     runner.config = config
@@ -64,11 +65,14 @@ def _make_runner(platform: Platform, config: GatewayConfig):
     runner.adapters = {platform: adapter}
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
+    runner.pairing_store.is_chat_approved.return_value = False
     runner.pairing_store._is_rate_limited.return_value = False
+    runner._profile_route_config = lambda: normalize_profile_routes_config(None)
     # Attributes required by _handle_message for the authorized-user path
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._update_prompts = {}
+    runner.session_store = SimpleNamespace()
     runner.hooks = SimpleNamespace(dispatch=AsyncMock(return_value=None))
     runner._sessions = {}
     return runner, adapter
@@ -323,6 +327,167 @@ def test_telegram_group_chat_allowlist_rejects_anonymous_sender_in_other_chat(mo
     )
 
     assert runner._is_user_authorized(source) is False
+
+
+def test_telegram_observed_group_source_respects_config_chat_allowlist(monkeypatch):
+    _clear_auth_env(monkeypatch)
+
+    runner, _adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    token="t",
+                    extra={
+                        "group_allowed_chats": "-1001878443972",
+                        "observe_unmentioned_group_messages": True,
+                    },
+                )
+            }
+        ),
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_id="-5274164515",
+        user_name=None,
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is False
+
+
+def test_telegram_dm_pairing_does_not_authorize_unapproved_group(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1001878443972")
+
+    runner, _adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")}),
+    )
+    runner.pairing_store.is_approved.return_value = True
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="367599252",
+        chat_id="-5274164515",
+        user_name="tester",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is False
+
+
+def test_telegram_explicit_profile_route_authorizes_group(monkeypatch):
+    from gateway.profile_routing import normalize_profile_routes_config
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1001878443972")
+
+    runner, _adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")}),
+    )
+    runner._profile_route_config = lambda: normalize_profile_routes_config(
+        {
+            "routes": [
+                {
+                    "id": "telegram-sila-treh",
+                    "enabled": True,
+                    "platform": "telegram",
+                    "chat_id": "-4534774626",
+                    "profile": "sila-treh",
+                }
+            ]
+        }
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_id="-4534774626",
+        user_name=None,
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_telegram_group_pairing_request_detects_attributed_bot_start(monkeypatch):
+    _clear_auth_env(monkeypatch)
+
+    runner, _adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")}),
+    )
+    event = MessageEvent(
+        text="[Наталия|367599252] @TripiooBot /start",
+        message_id="5763",
+        raw_message=SimpleNamespace(
+            text="@TripiooBot /start",
+            caption=None,
+            from_user=SimpleNamespace(id=367599252, full_name="Наталия"),
+        ),
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=None,
+            chat_id="-5274164515",
+            chat_name="Only me b2+",
+            user_name=None,
+            chat_type="group",
+        ),
+    )
+
+    assert runner._is_group_pairing_start_event(event) is True
+    assert runner._group_pairing_requester(event) == ("367599252", "Наталия")
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_telegram_group_mention_creates_chat_pairing_request(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1001878443972")
+
+    runner, adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")}),
+    )
+    adapter._bot = SimpleNamespace(username="TripiooBot")
+    runner.pairing_store.generate_chat_request.return_value = "pairing-telegram--5274164515-chat"
+
+    event = MessageEvent(
+        text="[Наталия|367599252] @TripiooBot",
+        message_id="5764",
+        raw_message=SimpleNamespace(
+            text="@TripiooBot",
+            caption=None,
+            from_user=SimpleNamespace(id=367599252, full_name="Наталия"),
+        ),
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=None,
+            chat_id="-5274164515",
+            chat_name="Only me b2+",
+            user_name=None,
+            chat_type="group",
+        ),
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    runner.pairing_store.generate_chat_request.assert_called_once_with(
+        "telegram",
+        "-5274164515",
+        "Only me b2+",
+        chat_type="group",
+        thread_id="",
+        requester_user_id="367599252",
+        requester_user_name="Наталия",
+    )
+    adapter.send.assert_awaited_once()
+    assert "Pairing request sent" in adapter.send.await_args.args[1]
 
 
 @pytest.mark.asyncio

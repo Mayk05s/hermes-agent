@@ -19,8 +19,12 @@ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import re
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -79,6 +83,40 @@ _CODEX_INSTRUCTIONS = (
     "You are an assistant that must fulfill image generation requests by "
     "using the image_generation tool when provided."
 )
+_RATE_LIMIT_RETRY_DELAYS = (0.5, 1.5)
+_MAX_REFERENCE_IMAGES = 10
+_MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024
+
+
+class ReferenceImageError(ValueError):
+    """A supplied reference image cannot be safely sent to GPT Image."""
+
+
+class CodexImageGenerationError(RuntimeError):
+    """Structured error raised from Codex image-generation SSE events."""
+
+    def __init__(self, message: str, *, code: str = "api_error") -> None:
+        self.raw_message = message
+        self.code = code
+        self.error_type = _classify_codex_error(code, message)
+        super().__init__(_sanitize_codex_error_message(message))
+
+
+def _classify_codex_error(code: Optional[str], message: str) -> str:
+    text = f"{code or ''} {message or ''}".lower()
+    if "rate_limit" in text or "rate limit" in text:
+        return "rate_limit"
+    if any(marker in text for marker in ("unauthorized", "invalid_grant", "401")):
+        return "auth_error"
+    return "api_error"
+
+
+def _sanitize_codex_error_message(message: str) -> str:
+    """Remove backend-internal identifiers before returning errors to chat."""
+    text = str(message or "").strip()
+    text = re.sub(r"\s+in organization\s+org-[A-Za-z0-9_-]+", "", text)
+    text = re.sub(r"\s+Visit\s+https?://\S+.*$", "", text)
+    return text or "Codex image backend returned an error"
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +181,103 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
-def _build_responses_payload(*, prompt: str, size: str, quality: str) -> Dict[str, Any]:
+def _sniff_reference_image_mime(raw: bytes) -> Optional[str]:
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw[:6] in {b"GIF87a", b"GIF89a"}:
+        return "image/gif"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _prepare_reference_image_parts(reference_images: Any) -> List[Dict[str, Any]]:
+    """Convert ordered local paths/URLs into Responses ``input_image`` parts."""
+    if isinstance(reference_images, str):
+        candidates = [reference_images]
+    elif isinstance(reference_images, (list, tuple)):
+        candidates = list(reference_images)
+    elif reference_images is None:
+        candidates = []
+    else:
+        raise ReferenceImageError("reference_images must be an array of image paths or URLs")
+
+    parts: List[Dict[str, Any]] = []
+    seen = set()
+    for index, candidate in enumerate(candidates, start=1):
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise ReferenceImageError(f"Reference image {index} must be a non-empty string")
+        reference = candidate.strip()
+        if reference in seen:
+            continue
+        seen.add(reference)
+        if len(parts) >= _MAX_REFERENCE_IMAGES:
+            raise ReferenceImageError(
+                f"At most {_MAX_REFERENCE_IMAGES} reference images are supported"
+            )
+
+        if reference.startswith("data:image/"):
+            if ";base64," not in reference[:100]:
+                raise ReferenceImageError(
+                    f"Reference image {index} must be a base64 data:image URL"
+                )
+            image_url = reference
+        elif reference.startswith(("https://", "http://")):
+            image_url = reference
+        else:
+            path = Path(reference).expanduser()
+            if not path.is_absolute():
+                raise ReferenceImageError(
+                    f"Reference image {index} must use an absolute local path"
+                )
+            try:
+                stat = path.stat()
+            except OSError as exc:
+                raise ReferenceImageError(
+                    f"Reference image {index} is not readable: {path}"
+                ) from exc
+            if not path.is_file():
+                raise ReferenceImageError(
+                    f"Reference image {index} is not a file: {path}"
+                )
+            if stat.st_size > _MAX_REFERENCE_IMAGE_BYTES:
+                raise ReferenceImageError(
+                    f"Reference image {index} exceeds the 50 MB limit"
+                )
+            try:
+                raw = path.read_bytes()
+            except OSError as exc:
+                raise ReferenceImageError(
+                    f"Reference image {index} is not readable: {path}"
+                ) from exc
+            mime = _sniff_reference_image_mime(raw)
+            if mime is None:
+                raise ReferenceImageError(
+                    f"Reference image {index} is not a supported PNG, JPEG, GIF, or WebP file"
+                )
+            encoded = base64.b64encode(raw).decode("ascii")
+            image_url = f"data:{mime};base64,{encoded}"
+
+        parts.append({
+            "type": "input_image",
+            "image_url": image_url,
+            "detail": "auto",
+        })
+    return parts
+
+
+def _build_responses_payload(
+    *,
+    prompt: str,
+    size: str,
+    quality: str,
+    reference_image_parts: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Build the Codex Responses request body for an image_generation call."""
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    content.extend(reference_image_parts or [])
     return {
         "model": _CODEX_CHAT_MODEL,
         "store": False,
@@ -152,7 +285,7 @@ def _build_responses_payload(*, prompt: str, size: str, quality: str) -> Dict[st
         "input": [{
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
+            "content": content,
         }],
         "tools": [{
             "type": "image_generation",
@@ -193,6 +326,55 @@ def _extract_image_b64(value: Any) -> Optional[str]:
             if nested:
                 found = nested
     return found
+
+
+def _format_error_detail(value: Any) -> Optional[Tuple[str, str]]:
+    """Return ``(message, code)`` from an OpenAI/Codex error-shaped dict."""
+    if isinstance(value, dict):
+        message = value.get("message")
+        code = value.get("code") or value.get("type") or "api_error"
+        if isinstance(message, str) and message.strip():
+            return message.strip(), str(code)
+        if isinstance(code, str) and code.strip() and code != "api_error":
+            return code.strip(), code.strip()
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip(), "api_error"
+    return None
+
+
+def _extract_codex_error(value: Any) -> Optional[Tuple[str, str]]:
+    """Return the first backend error carried by a streamed Responses event."""
+    if isinstance(value, dict):
+        event_type = value.get("type")
+        if event_type == "error":
+            detail = _format_error_detail(value.get("error") or value)
+            if detail:
+                return detail
+
+        if event_type == "response.failed":
+            response = value.get("response")
+            if isinstance(response, dict):
+                detail = _format_error_detail(response.get("error"))
+                if detail:
+                    return detail
+
+        error = value.get("error")
+        if isinstance(error, dict):
+            detail = _format_error_detail(error)
+            if detail:
+                return detail
+
+        for child in value.values():
+            nested = _extract_codex_error(child)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _extract_codex_error(child)
+            if nested:
+                return nested
+    return None
 
 
 def _iter_sse_json(response: Any):
@@ -242,7 +424,14 @@ def _iter_sse_json(response: Any):
         yield payload
 
 
-def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> Optional[str]:
+def _collect_image_b64(
+    token: str,
+    *,
+    prompt: str,
+    size: str,
+    quality: str,
+    reference_image_parts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     import httpx
     from agent.auxiliary_client import _codex_cloudflare_headers
@@ -253,7 +442,12 @@ def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> O
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     })
-    payload = _build_responses_payload(prompt=prompt, size=size, quality=quality)
+    payload = _build_responses_payload(
+        prompt=prompt,
+        size=size,
+        quality=quality,
+        reference_image_parts=reference_image_parts,
+    )
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
     image_b64: Optional[str] = None
@@ -268,6 +462,11 @@ def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> O
                     f"Codex Responses API returned HTTP {exc.response.status_code}: {body}"
                 ) from exc
             for event in _iter_sse_json(response):
+                error = _extract_codex_error(event)
+                if error:
+                    message, code = error
+                    raise CodexImageGenerationError(message, code=code)
+
                 found = _extract_image_b64(event)
                 if found:
                     image_b64 = found
@@ -367,6 +566,19 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
 
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
+        try:
+            reference_image_parts = _prepare_reference_image_parts(
+                kwargs.get("reference_images")
+            )
+        except ReferenceImageError as exc:
+            return error_response(
+                error=str(exc),
+                error_type="invalid_reference_image",
+                provider="openai-codex",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
 
         token = _read_codex_access_token()
         if not token:
@@ -382,23 +594,57 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        try:
-            b64 = _collect_image_b64(
-                token,
-                prompt=prompt,
-                size=size,
-                quality=meta["quality"],
-            )
-        except Exception as exc:
-            logger.debug("Codex image generation failed", exc_info=True)
-            return error_response(
-                error=f"OpenAI image generation via Codex auth failed: {exc}",
-                error_type="api_error",
-                provider="openai-codex",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
+        b64: Optional[str] = None
+        attempts = len(_RATE_LIMIT_RETRY_DELAYS) + 1
+        for attempt in range(attempts):
+            try:
+                collect_kwargs: Dict[str, Any] = {
+                    "prompt": prompt,
+                    "size": size,
+                    "quality": meta["quality"],
+                }
+                if reference_image_parts:
+                    collect_kwargs["reference_image_parts"] = reference_image_parts
+                b64 = _collect_image_b64(token, **collect_kwargs)
+                break
+            except CodexImageGenerationError as exc:
+                logger.debug(
+                    "Codex image generation failed (code=%s, raw=%s)",
+                    exc.code,
+                    exc.raw_message,
+                    exc_info=True,
+                )
+                if exc.error_type == "rate_limit" and attempt < len(_RATE_LIMIT_RETRY_DELAYS):
+                    delay = _RATE_LIMIT_RETRY_DELAYS[attempt]
+                    logger.info(
+                        "Codex image generation hit rate limit; retrying in %.1fs",
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                prefix = (
+                    "OpenAI image generation rate limit"
+                    if exc.error_type == "rate_limit"
+                    else "OpenAI image generation via Codex auth failed"
+                )
+                return error_response(
+                    error=f"{prefix}: {exc}",
+                    error_type=exc.error_type,
+                    provider="openai-codex",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+            except Exception as exc:
+                logger.debug("Codex image generation failed", exc_info=True)
+                return error_response(
+                    error=f"OpenAI image generation via Codex auth failed: {exc}",
+                    error_type="api_error",
+                    provider="openai-codex",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
 
         if not b64:
             return error_response(
@@ -428,7 +674,11 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             prompt=prompt,
             aspect_ratio=aspect,
             provider="openai-codex",
-            extra={"size": size, "quality": meta["quality"]},
+            extra={
+                "size": size,
+                "quality": meta["quality"],
+                "reference_images_count": len(reference_image_parts),
+            },
         )
 
 

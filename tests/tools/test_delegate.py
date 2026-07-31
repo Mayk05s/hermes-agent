@@ -25,9 +25,11 @@ from tools.delegate_tool import (
     MAX_DEPTH,
     check_delegate_requirements,
     delegate_task,
+    _apply_specialist_contract,
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _toolset_satisfied,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -68,6 +70,16 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("specialist", props)
+        self.assertEqual(
+            props["specialist"]["enum"],
+            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder"],
+        )
+        self.assertIn("specialist", props["tasks"]["items"]["properties"])
+        self.assertEqual(
+            props["tasks"]["items"]["properties"]["specialist"]["enum"],
+            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder"],
+        )
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -154,6 +166,109 @@ class TestStripBlockedTools(unittest.TestCase):
     def test_empty_input(self):
         result = _strip_blocked_tools([])
         self.assertEqual(result, [])
+
+
+class TestHealthSpecialistContracts(unittest.TestCase):
+    def test_explicit_nutrition_specialist_adds_contract_and_toolsets(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Analyze today's meals.",
+                "specialist": "nutrition",
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "nutrition")
+        self.assertEqual(task["_specialist_label"], "🥗 *Питание*")
+        self.assertIn("SPECIALIST CONTRACT", task["goal"])
+        self.assertIn('skill_view(name="telegram_health/nutrition")', task["goal"])
+        self.assertIn("~/tenants/telegram_health/memory/nutrition.md", task["goal"])
+        self.assertEqual(
+            task["toolsets"],
+            ["skills", "file", "health-actions", "health-db"],
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={"specialist_models": {"nutrition": "gpt-5.6-sol"}})
+    def test_specialist_model_override_is_attached_to_matching_specialist(self, _mock_config):
+        task = _apply_specialist_contract(
+            {"goal": "Analyze today's meals.", "specialist": "nutrition"}
+        )
+        self.assertEqual(task["_specialist_model"], "gpt-5.6-sol")
+
+    def test_legacy_fitness_goal_infers_specialist_and_preserves_toolsets(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Действуй как fitness-специалист и составь план.",
+                "toolsets": ["terminal"],
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "fitness")
+        self.assertIn('skill_view(name="telegram_health/fitness")', task["goal"])
+        self.assertEqual(task["toolsets"], ["terminal", "skills", "file", "health-actions", "health-db"])
+
+    def test_health_db_alias_satisfies_required_toolset(self):
+        self.assertTrue(_toolset_satisfied("health-db", ["mcp-health-db"]))
+        self.assertTrue(_toolset_satisfied("mcp-health-db", ["health-db"]))
+
+    def test_registered_mcp_alias_satisfies_required_toolset(self):
+        from tools.registry import registry
+
+        registry.register_toolset_alias("health-actions-test", "mcp-health-actions-test")
+        try:
+            self.assertTrue(_toolset_satisfied("health-actions-test", ["mcp-health-actions-test"]))
+            self.assertTrue(_toolset_satisfied("mcp-health-actions-test", ["health-actions-test"]))
+        finally:
+            with registry._lock:
+                registry._toolset_aliases.pop("health-actions-test", None)
+
+    def test_explicit_miniapp_specialist_adds_contract_and_toolsets(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Исправь отображение отмененных тренировок в Telegram Mini App.",
+                "specialist": "miniapp",
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "miniapp")
+        self.assertEqual(task["_specialist_label"], "🧩 *Mini App*")
+        self.assertIn('skill_view(name="telegram_health/miniapp")', task["goal"])
+        self.assertIn("~/tenants/telegram_health/memory/miniapp.md", task["goal"])
+        self.assertEqual(
+            task["toolsets"],
+            ["skills", "file", "health-actions", "health-db", "terminal"],
+        )
+
+    def test_explicit_miniapp_builder_specialist_adds_contract_and_toolsets(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Создай семейный миниапп для меню.",
+                "specialist": "miniapp_builder",
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "miniapp_builder")
+        self.assertEqual(task["_specialist_label"], "🧩 *Mini App Builder*")
+        self.assertIn('skill_view(name="telegram_family/miniapp-builder")', task["goal"])
+        self.assertIn("telegram_family/memory/miniapp_builder.md", task["goal"])
+        self.assertEqual(
+            task["toolsets"],
+            ["skills", "file", "terminal", "web"],
+        )
+
+    def test_miniapp_builder_aliases_are_distinct_from_health_miniapp(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Build a Telegram Mini App section.",
+                "specialist": "mini app builder",
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "miniapp_builder")
+        self.assertIn('skill_view(name="telegram_family/miniapp-builder")', task["goal"])
+
+    def test_unknown_specialist_leaves_task_unchanged(self):
+        task = {"goal": "Do ordinary research.", "specialist": "sleep"}
+        self.assertEqual(_apply_specialist_contract(dict(task)), task)
 
 
 class TestDelegateTask(unittest.TestCase):
@@ -1871,6 +1986,26 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_specialist_forwarded_by_run_agent_dispatch(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        with patch("tools.delegate_tool.delegate_task", return_value='{"ok": true}') as mock_delegate:
+            result = agent._dispatch_delegate_task(
+                {
+                    "goal": "Log breakfast",
+                    "context": "telegram_user_id=123",
+                    "toolsets": ["skills", "file", "health-db"],
+                    "specialist": "nutrition",
+                    "role": "leaf",
+                }
+            )
+
+        self.assertEqual(result, '{"ok": true}')
+        _, kwargs = mock_delegate.call_args
+        self.assertEqual(kwargs["specialist"], "nutrition")
+        self.assertEqual(kwargs["parent_agent"], agent)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")

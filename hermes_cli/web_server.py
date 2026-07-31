@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -534,6 +535,11 @@ class ModelAssignment(BaseModel):
     provider: str
     model: str
     task: str = ""
+
+
+class AuxiliaryFallbackChainUpdate(BaseModel):
+    task: str
+    fallback_chain: List[Dict[str, Any]] = []
 
 
 _AUDIO_MIME_EXTENSIONS: Dict[str, str] = {
@@ -1206,6 +1212,284 @@ class TTSSpeakRequest(BaseModel):
     text: str
 
 
+class GeminiTTSSettingsUpdate(BaseModel):
+    provider: Optional[str] = None
+    voice: Optional[str] = None
+    model: Optional[str] = None
+    fallback_model: Optional[str] = None
+    style: Optional[str] = None
+    apply_to_profiles: bool = True
+
+
+def _gemini_tts_builtin_voices() -> List[str]:
+    try:
+        from tools.tts_tool import GEMINI_TTS_PREBUILT_VOICES
+
+        return list(GEMINI_TTS_PREBUILT_VOICES)
+    except Exception:
+        return [
+            "Achernar",
+            "Achird",
+            "Algenib",
+            "Algieba",
+            "Alnilam",
+            "Aoede",
+            "Autonoe",
+            "Callirrhoe",
+            "Charon",
+            "Despina",
+            "Enceladus",
+            "Erinome",
+            "Fenrir",
+            "Gacrux",
+            "Iapetus",
+            "Kore",
+            "Laomedeia",
+            "Leda",
+            "Orus",
+            "Puck",
+            "Pulcherrima",
+            "Rasalgethi",
+            "Sadachbia",
+            "Sadaltager",
+            "Schedar",
+            "Sulafat",
+            "Umbriel",
+            "Vindemiatrix",
+            "Zephyr",
+            "Zubenelgenubi",
+        ]
+
+
+def _gemini_tts_samples_dir(config: Optional[Dict[str, Any]] = None) -> Path:
+    cfg = config if isinstance(config, dict) else load_config()
+    configured = cfg_get(cfg, "tts.gemini.voice_samples_dir", "")
+    raw_path = str(configured or "").strip()
+    path = Path(raw_path).expanduser() if raw_path else get_hermes_home() / "voices" / "gemini"
+    if not path.is_absolute():
+        path = get_hermes_home() / path
+    return path.resolve()
+
+
+def _gemini_tts_sample_files(samples_dir: Path) -> Dict[str, Dict[str, Any]]:
+    samples: Dict[str, Dict[str, Any]] = {}
+    if not samples_dir.is_dir():
+        return samples
+
+    for path in sorted(samples_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in {".ogg", ".opus", ".mp3", ".wav"}:
+            continue
+        match = re.match(r"^([A-Za-z0-9]+)(?:_([mwx]))?$", path.stem)
+        if not match:
+            continue
+        name = match.group(1)
+        suffix = match.group(2) or ""
+        samples[name] = {"file": path, "sample_kind": suffix}
+    return samples
+
+
+def _gemini_tts_reference(samples_dir: Path) -> Dict[str, Any]:
+    path = samples_dir / "config.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "provider": str(payload.get("provider") or ""),
+        "model": str(payload.get("model") or ""),
+        "voice": str(payload.get("voice") or ""),
+        "style": str(payload.get("style") or ""),
+    }
+
+
+def _gemini_tts_profile_config_paths() -> List[Tuple[str, Path]]:
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        paths: List[Tuple[str, Path]] = []
+        for info in profiles_mod.list_profiles():
+            name = str(getattr(info, "name", "") or "")
+            is_default = bool(getattr(info, "is_default", False))
+            profile_path = Path(str(getattr(info, "path", "") or ""))
+            if not name or is_default or not profile_path:
+                continue
+            paths.append((name, profile_path / "config.yaml"))
+        return paths
+    except Exception:
+        profiles_root = get_hermes_home() / "profiles"
+        if not profiles_root.is_dir():
+            return []
+        return [
+            (entry.name, entry / "config.yaml")
+            for entry in sorted(profiles_root.iterdir())
+            if entry.is_dir() and re.match(r"^[A-Za-z0-9_.-]+$", entry.name)
+        ]
+
+
+def _read_gemini_tts_profile_rows() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for name, config_path in _gemini_tts_profile_config_paths():
+        data: Dict[str, Any] = {}
+        if config_path.exists():
+            try:
+                loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (yaml.YAMLError, OSError):
+                data = {}
+        tts = data.get("tts") if isinstance(data.get("tts"), dict) else {}
+        gemini = tts.get("gemini") if isinstance(tts.get("gemini"), dict) else {}
+        rows.append(
+            {
+                "name": name,
+                "path": str(config_path),
+                "provider": str(tts.get("provider") or ""),
+                "voice": str(gemini.get("voice") or ""),
+                "model": str(gemini.get("model") or ""),
+                "fallback_model": str(gemini.get("fallback_model") or ""),
+                "has_gemini_override": bool(gemini),
+            }
+        )
+    return rows
+
+
+def _apply_gemini_tts_settings(data: Dict[str, Any], settings: Dict[str, str]) -> Dict[str, Any]:
+    tts = data.setdefault("tts", {})
+    if not isinstance(tts, dict):
+        tts = {}
+        data["tts"] = tts
+    gemini = tts.setdefault("gemini", {})
+    if not isinstance(gemini, dict):
+        gemini = {}
+        tts["gemini"] = gemini
+
+    provider = settings.get("provider")
+    if provider is not None:
+        tts["provider"] = provider
+    for key in ("voice", "model", "fallback_model", "style"):
+        if key in settings:
+            gemini[key] = settings[key]
+    return data
+
+
+def _gemini_tts_response(updated_profiles: Optional[List[str]] = None) -> Dict[str, Any]:
+    config = load_config()
+    samples_dir = _gemini_tts_samples_dir(config)
+    sample_files = _gemini_tts_sample_files(samples_dir)
+    reference = _gemini_tts_reference(samples_dir)
+    tts = config.get("tts") if isinstance(config.get("tts"), dict) else {}
+    gemini = tts.get("gemini") if isinstance(tts.get("gemini"), dict) else {}
+    voices = []
+    for name in _gemini_tts_builtin_voices():
+        sample = sample_files.get(name)
+        sample_url = None
+        sample_filename = ""
+        sample_kind = ""
+        if sample:
+            sample_path = sample["file"]
+            sample_url = f"/api/audio/gemini/voices/{urllib.parse.quote(name, safe='')}/sample"
+            sample_filename = sample_path.name
+            sample_kind = str(sample.get("sample_kind") or "")
+        voices.append(
+            {
+                "name": name,
+                "sample_url": sample_url,
+                "sample_filename": sample_filename,
+                "sample_kind": sample_kind,
+                "is_nanoclaw": reference.get("voice") == name,
+            }
+        )
+
+    return {
+        "available": bool(voices),
+        "provider": str(tts.get("provider") or ""),
+        "voice": str(gemini.get("voice") or ""),
+        "model": str(gemini.get("model") or ""),
+        "fallback_model": str(gemini.get("fallback_model") or ""),
+        "style": str(gemini.get("style") or ""),
+        "voice_samples_dir": str(samples_dir),
+        "reference": reference,
+        "voices": voices,
+        "profiles": _read_gemini_tts_profile_rows(),
+        "updated_profiles": updated_profiles or [],
+    }
+
+
+@app.get("/api/audio/gemini/voices")
+async def get_gemini_tts_voices():
+    return _gemini_tts_response()
+
+
+@app.get("/api/audio/gemini/voices/{voice_name}/sample")
+async def get_gemini_tts_voice_sample(voice_name: str):
+    samples_dir = _gemini_tts_samples_dir()
+    sample = _gemini_tts_sample_files(samples_dir).get(voice_name)
+    if not sample:
+        raise HTTPException(status_code=404, detail="Voice sample not found")
+    sample_path = sample["file"]
+    if not sample_path.is_file():
+        raise HTTPException(status_code=404, detail="Voice sample not found")
+    media_type = {
+        ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".wav": "audio/wav",
+    }.get(sample_path.suffix.lower(), "application/octet-stream")
+    return FileResponse(sample_path, media_type=media_type, filename=sample_path.name)
+
+
+@app.put("/api/audio/gemini/settings")
+async def update_gemini_tts_settings(body: GeminiTTSSettingsUpdate):
+    settings: Dict[str, str] = {}
+    for key in ("provider", "voice", "model", "fallback_model", "style"):
+        value = getattr(body, key)
+        if value is not None:
+            settings[key] = str(value).strip()
+
+    if not settings:
+        raise HTTPException(status_code=400, detail="No TTS settings provided")
+
+    sample_names = set(_gemini_tts_sample_files(_gemini_tts_samples_dir()).keys())
+    valid_voices = set(_gemini_tts_builtin_voices()) | sample_names
+    if settings.get("voice") and settings["voice"] not in valid_voices:
+        raise HTTPException(status_code=400, detail=f"Unknown Gemini voice: {settings['voice']}")
+
+    try:
+        config = load_config()
+        save_config(_apply_gemini_tts_settings(config, settings))
+    except Exception as exc:
+        _log.exception("PUT /api/audio/gemini/settings failed")
+        raise HTTPException(status_code=500, detail=f"Could not save TTS settings: {exc}")
+
+    updated_profiles: List[str] = []
+    if body.apply_to_profiles:
+        for name, config_path in _gemini_tts_profile_config_paths():
+            try:
+                loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+                data = loaded if isinstance(loaded, dict) else {}
+                tts = data.get("tts") if isinstance(data.get("tts"), dict) else {}
+                gemini = tts.get("gemini") if isinstance(tts.get("gemini"), dict) else {}
+                if not gemini:
+                    continue
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                config_path.write_text(
+                    yaml.safe_dump(_apply_gemini_tts_settings(data, settings), sort_keys=False),
+                    encoding="utf-8",
+                )
+                updated_profiles.append(name)
+            except yaml.YAMLError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid profile config for {name}: {exc}")
+            except OSError as exc:
+                _log.exception("Could not update Gemini TTS profile config: %s", name)
+                raise HTTPException(status_code=500, detail=f"Could not update profile {name}: {exc}")
+
+    return {"ok": True, **_gemini_tts_response(updated_profiles=updated_profiles)}
+
+
 def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
     name = str(voice.get("name") or voice.get("voice_id") or "Voice").strip()
     category = str(voice.get("category") or "").strip()
@@ -1600,8 +1884,83 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
     "triage_specifier",
     "kanban_decomposer",
     "profile_describer",
+    "mempalace_extractor",
+    "mempalace_validator",
     "curator",
 )
+
+
+def _format_price_per_million(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number == 0:
+        return "$0"
+    if number >= 1:
+        return f"${number:.2f}"
+    if number >= 0.01:
+        return f"${number:.3f}"
+    return f"${number:.4f}"
+
+
+def _model_pricing_summary(provider: str, model: str, *, base_url: str = "") -> dict:
+    provider = (provider or "").strip()
+    model = (model or "").strip()
+    if not provider:
+        return {}
+    if provider == "auto":
+        return {"label": "main model", "included": True}
+    try:
+        from agent.usage_pricing import get_pricing_entry
+
+        entry = get_pricing_entry(model, provider=provider, base_url=base_url)
+    except Exception:
+        entry = None
+    if entry is None:
+        return {}
+    included = entry.pricing_version == "included-route"
+    if included:
+        label = "included"
+    else:
+        inp = _format_price_per_million(entry.input_cost_per_million)
+        out = _format_price_per_million(entry.output_cost_per_million)
+        label = f"{inp or '?'} in / {out or '?'} out"
+    return {
+        "label": label,
+        "input": _format_price_per_million(entry.input_cost_per_million),
+        "output": _format_price_per_million(entry.output_cost_per_million),
+        "cache": _format_price_per_million(entry.cache_read_cost_per_million),
+        "included": included,
+        "source": entry.source,
+        "version": entry.pricing_version,
+    }
+
+
+def _aux_fallback_entries(slot_cfg: dict) -> list[dict]:
+    raw = slot_cfg.get("fallback_chain")
+    if not isinstance(raw, list):
+        return []
+    entries: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider", "") or "").strip()
+        model = str(item.get("model", "") or "").strip()
+        base_url = str(item.get("base_url", "") or "").strip()
+        if not provider:
+            continue
+        entries.append(
+            {
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "pricing": _model_pricing_summary(provider, model, base_url=base_url),
+            }
+        )
+    return entries
 
 
 @app.get("/api/model/options")
@@ -1728,6 +2087,12 @@ def get_auxiliary_models():
                 "provider": str(slot_cfg.get("provider", "auto") or "auto"),
                 "model": str(slot_cfg.get("model", "") or ""),
                 "base_url": str(slot_cfg.get("base_url", "") or ""),
+                "pricing": _model_pricing_summary(
+                    str(slot_cfg.get("provider", "auto") or "auto"),
+                    str(slot_cfg.get("model", "") or ""),
+                    base_url=str(slot_cfg.get("base_url", "") or ""),
+                ),
+                "fallback_chain": _aux_fallback_entries(slot_cfg),
             })
 
         model_cfg = cfg.get("model", {})
@@ -1738,11 +2103,56 @@ def get_auxiliary_models():
             }
         else:
             main = {"provider": "", "model": str(model_cfg) if model_cfg else ""}
+        main["pricing"] = _model_pricing_summary(main.get("provider", ""), main.get("model", ""))
 
         return {"tasks": tasks, "main": main}
     except Exception:
         _log.exception("GET /api/model/auxiliary failed")
         raise HTTPException(status_code=500, detail="Failed to read auxiliary config")
+
+
+@app.post("/api/model/auxiliary/fallback-chain")
+async def set_auxiliary_fallback_chain(body: AuxiliaryFallbackChainUpdate):
+    task = (body.task or "").strip().lower()
+    if task not in _AUX_TASK_SLOTS:
+        raise HTTPException(status_code=400, detail=f"unknown auxiliary task: {task}")
+    try:
+        cfg = load_config()
+        aux = cfg.get("auxiliary")
+        if not isinstance(aux, dict):
+            aux = {}
+        slot_cfg = aux.get(task)
+        if not isinstance(slot_cfg, dict):
+            slot_cfg = {}
+
+        chain: list[dict] = []
+        for raw in body.fallback_chain[:12]:
+            if not isinstance(raw, dict):
+                continue
+            provider = str(raw.get("provider", "") or "").strip()
+            model = str(raw.get("model", "") or "").strip()
+            base_url = str(raw.get("base_url", "") or "").strip()
+            if not provider:
+                continue
+            item = {"provider": provider, "model": model}
+            if base_url:
+                item["base_url"] = base_url
+            chain.append(item)
+
+        slot_cfg["fallback_chain"] = chain
+        aux[task] = slot_cfg
+        cfg["auxiliary"] = aux
+        save_config(cfg)
+        return {
+            "ok": True,
+            "task": task,
+            "fallback_chain": _aux_fallback_entries(slot_cfg),
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/model/auxiliary/fallback-chain failed")
+        raise HTTPException(status_code=500, detail="Failed to save auxiliary fallback chain")
 
 
 @app.post("/api/model/set")
@@ -2781,6 +3191,16 @@ def _truncate_token(value: Optional[str], visible: int = 6) -> str:
     return f"…{s[-visible:]}"
 
 
+def _unix_ms_to_iso(value: Any) -> Optional[str]:
+    """Return an ISO timestamp for unix-millisecond values."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def _anthropic_oauth_status() -> Dict[str, Any]:
     """Combined status across the three Anthropic credential sources we read.
 
@@ -2911,6 +3331,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "status_fn": None,  # dispatched via auth.get_codex_auth_status
     },
     {
+        "id": "google-gemini-cli",
+        "name": "Google Gemini (OAuth)",
+        "flow": "external",
+        "cli_command": "hermes auth add google-gemini-cli",
+        "docs_url": "https://github.com/google-gemini/gemini-cli",
+        "status_fn": None,  # dispatched via auth.get_gemini_oauth_auth_status
+    },
+    {
         "id": "qwen-oauth",
         "name": "Qwen (via Qwen CLI)",
         "flow": "external",
@@ -2973,6 +3401,36 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "token_preview": _truncate_token(raw.get("access_token")),
                 "expires_at": raw.get("expires_at"),
                 "has_refresh_token": bool(raw.get("has_refresh_token")),
+            }
+        if provider_id == "google-gemini-cli":
+            raw = hauth.get_gemini_oauth_auth_status()
+            logged_in = bool(raw.get("logged_in"))
+            expires_at_ms = raw.get("expires_at_ms")
+            try:
+                expires_soon = (
+                    logged_in
+                    and expires_at_ms is not None
+                    and float(expires_at_ms) <= (time.time() + 60) * 1000
+                )
+            except (TypeError, ValueError):
+                expires_soon = False
+            if expires_soon:
+                try:
+                    refreshed = hauth.resolve_gemini_oauth_runtime_credentials(
+                        force_refresh=True
+                    )
+                    raw = {**raw, **refreshed, "logged_in": True}
+                    logged_in = True
+                except Exception as exc:
+                    raw = {**raw, "error": str(exc)}
+            return {
+                "logged_in": logged_in,
+                "source": raw.get("source") or "google-oauth",
+                "source_label": raw.get("email") or raw.get("auth_file") or "Google OAuth",
+                "token_preview": _truncate_token(raw.get("api_key")) if logged_in else "",
+                "expires_at": _unix_ms_to_iso(raw.get("expires_at_ms")),
+                "has_refresh_token": bool(raw.get("has_refresh_token", logged_in)),
+                "error": None if raw.get("error") == "not logged in" else raw.get("error"),
             }
         if provider_id == "minimax-oauth":
             raw = hauth.get_minimax_oauth_auth_status()
@@ -4613,6 +5071,7 @@ class PairingApprove(BaseModel):
     platform: str
     code: Optional[str] = None
     entry_id: Optional[str] = None
+    approval_scope: str = "topic"
     profile: str = "default"
     create_profile: bool = False
     new_profile_name: str = ""
@@ -4707,6 +5166,15 @@ def _upsert_pairing_profile_route(pairing_result: Dict[str, Any], profile: str) 
     }
     if thread_id:
         next_route["thread_id"] = thread_id
+    else:
+        routes = [
+            route for route in routes
+            if not (
+                str(route.get("platform") or "").lower().strip() == platform
+                and str(route.get("chat_id") or "").strip() == chat_id
+                and str(route.get("thread_id") or "").strip()
+            )
+        ]
 
     replaced = False
     for index, route in enumerate(routes):
@@ -4744,15 +5212,22 @@ async def approve_pairing(body: PairingApprove):
     platform = (body.platform or "").lower().strip()
     code = (body.code or "").upper().strip()
     entry_id = (body.entry_id or "").strip()
+    approval_scope = (body.approval_scope or "topic").lower().strip()
     if not platform or not (code or entry_id):
         raise HTTPException(status_code=400, detail="platform and code or entry_id are required")
+    if approval_scope not in {"chat", "topic"}:
+        raise HTTPException(status_code=400, detail="approval_scope must be 'chat' or 'topic'")
 
     try:
         profile = _ensure_pairing_profile(body)
     except (ValueError, FileExistsError, FileNotFoundError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    result = store.approve_entry(platform, entry_id) if entry_id else store.approve_code(platform, code)
+    result = (
+        store.approve_entry(platform, entry_id, approval_scope=approval_scope)
+        if entry_id
+        else store.approve_code(platform, code)
+    )
     if result:
         route = _upsert_pairing_profile_route(result, profile)
         return {"ok": True, "user": result, "route": route}
@@ -5660,7 +6135,7 @@ async def search_skills_hub(q: str = "", source: str = "all", limit: int = 20):
 
 
 # ---------------------------------------------------------------------------
-# Profile management endpoints (minimal — list/create/rename/delete + SOUL.md)
+# Profile management endpoints (list/create/rename/delete + prompt files)
 # ---------------------------------------------------------------------------
 
 
@@ -5675,6 +6150,10 @@ class ProfileRename(BaseModel):
 
 
 class ProfileSoulUpdate(BaseModel):
+    content: str
+
+
+class ProfileMemoryFileUpdate(BaseModel):
     content: str
 
 
@@ -5695,6 +6174,13 @@ class CommunicationStyleCreate(BaseModel):
 class ProfileSkillToggle(BaseModel):
     name: str
     enabled: bool
+
+
+class ProfileDisplaySettingsUpdate(BaseModel):
+    tool_progress: str = "off"
+    interim_assistant_messages: bool = False
+    cleanup_progress: bool = True
+    tool_preview_length: int = 0
 
 
 class ProfileRouteBody(BaseModel):
@@ -6221,10 +6707,10 @@ async def get_profile_soul(name: str):
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
     if soul_path.exists():
         try:
-            return {"content": soul_path.read_text(encoding="utf-8"), "exists": True}
+            return {"content": soul_path.read_text(encoding="utf-8"), "exists": True, "file": str(soul_path)}
         except OSError as e:
             raise HTTPException(status_code=500, detail=f"Could not read SOUL.md: {e}")
-    return {"content": "", "exists": False}
+    return {"content": "", "exists": False, "file": str(soul_path)}
 
 
 @app.put("/api/profiles/{name}/soul")
@@ -6236,6 +6722,65 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
     return {"ok": True}
+
+
+_PROFILE_MEMORY_FILES = {
+    "user": ("USER.md", "User preferences and communication rules"),
+    "memory": ("MEMORY.md", "Profile facts, chat lore, and operational context"),
+}
+
+
+def _profile_memory_file_path(name: str, file_id: str) -> Tuple[Path, str, str]:
+    key = str(file_id or "").strip().lower()
+    spec = _PROFILE_MEMORY_FILES.get(key)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="Unknown profile memory file")
+    filename, description = spec
+    return _resolve_profile_dir(name) / "memories" / filename, filename, description
+
+
+def _profile_memory_file_response(name: str, file_id: str) -> Dict[str, Any]:
+    path, filename, description = _profile_memory_file_path(name, file_id)
+    if path.exists():
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Could not read {filename}: {e}")
+        exists = True
+    else:
+        content = ""
+        exists = False
+    return {
+        "id": file_id,
+        "label": filename,
+        "description": description,
+        "file": str(path),
+        "exists": exists,
+        "content": content,
+    }
+
+
+@app.get("/api/profiles/{name}/memory-files")
+async def get_profile_memory_files(name: str):
+    return {
+        "profile": name,
+        "files": [
+            _profile_memory_file_response(name, file_id)
+            for file_id in ("user", "memory")
+        ],
+    }
+
+
+@app.put("/api/profiles/{name}/memory-files/{file_id}")
+async def update_profile_memory_file(name: str, file_id: str, body: ProfileMemoryFileUpdate):
+    path, filename, _description = _profile_memory_file_path(name, file_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body.content, encoding="utf-8")
+    except OSError as e:
+        _log.exception("PUT /api/profiles/%s/memory-files/%s failed", name, file_id)
+        raise HTTPException(status_code=500, detail=f"Could not write {filename}: {e}")
+    return {"ok": True, **_profile_memory_file_response(name, file_id)}
 
 
 def _profile_config_path(name: str) -> Path:
@@ -6552,6 +7097,249 @@ def _read_profile_config_for_edit(name: str) -> Tuple[Path, Dict[str, Any]]:
     if not isinstance(data, dict):
         data = {}
     return config_path, data
+
+
+_PROFILE_TOOL_PROGRESS_VALUES = {"off", "new", "all", "verbose"}
+
+
+def _profile_display_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled", "enable"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled", "disable"}:
+        return False
+    return default
+
+
+def _profile_display_tool_progress(value: Any, default: str = "off") -> str:
+    if value is True:
+        return "all"
+    if value is False or value is None or value == "":
+        return "off"
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "yes", "1", "on", "enabled", "enable"}:
+        return "all"
+    if normalized in {"false", "no", "0", "disabled", "disable"}:
+        return "off"
+    if normalized not in _PROFILE_TOOL_PROGRESS_VALUES:
+        return default
+    return normalized
+
+
+def _profile_display_preview_length(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _profile_display_settings_from_config(name: str, config_path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
+    display = data.get("display") if isinstance(data, dict) else {}
+    if not isinstance(display, dict):
+        display = {}
+    settings = {
+        "tool_progress": _profile_display_tool_progress(display.get("tool_progress")),
+        "interim_assistant_messages": _profile_display_bool(
+            display.get("interim_assistant_messages"),
+            default=False,
+        ),
+        "cleanup_progress": _profile_display_bool(
+            display.get("cleanup_progress"),
+            default=True,
+        ),
+        "tool_preview_length": _profile_display_preview_length(
+            display.get("tool_preview_length"),
+        ),
+    }
+    return {
+        "profile": name,
+        "path": str(config_path),
+        "settings": settings,
+    }
+
+
+_PROFILE_DISPLAY_RESOLVED_FIELDS = (
+    "tool_progress",
+    "show_reasoning",
+    "tool_preview_length",
+    "interim_assistant_messages",
+    "long_running_notifications",
+    "busy_ack_detail",
+    "cleanup_progress",
+    "streaming",
+)
+
+
+def _dashboard_bool_from_config(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled", "enable"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled", "disable"}:
+        return False
+    return default
+
+
+def _dashboard_streaming_enabled_fallback() -> bool:
+    cfg = load_config() or {}
+    streaming = cfg.get("streaming")
+    if not isinstance(streaming, dict):
+        gateway = cfg.get("gateway")
+        if isinstance(gateway, dict):
+            streaming = gateway.get("streaming")
+    if not isinstance(streaming, dict):
+        streaming = {}
+    enabled = _dashboard_bool_from_config(streaming.get("enabled"), default=False)
+    transport = str(streaming.get("transport") or "auto").strip().lower()
+    return enabled and transport != "off"
+
+
+def _dashboard_platform_config(platform: str) -> Dict[str, Any]:
+    cfg = load_config() or {}
+    value = cfg.get(platform)
+    return value if isinstance(value, dict) else {}
+
+
+def _dashboard_platform_extra(platform_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    extra = platform_cfg.get("extra")
+    return extra if isinstance(extra, dict) else {}
+
+
+def _dashboard_list_contains(raw: Any, wanted: str) -> bool:
+    wanted = str(wanted or "").strip()
+    if not wanted:
+        return False
+    if isinstance(raw, (list, tuple, set)):
+        return wanted in {str(item).strip() for item in raw}
+    parts = re.split(r"[\s,]+", str(raw or "").strip())
+    return wanted in {part for part in parts if part}
+
+
+def _profile_resolved_chat_base_settings(platform: str, chat_id: str = "") -> Dict[str, Any]:
+    platform_key = str(platform or "telegram").strip().lower() or "telegram"
+    chat_id = str(chat_id or "").strip()
+    platform_cfg = _dashboard_platform_config(platform_key)
+    extra = _dashboard_platform_extra(platform_cfg)
+
+    response_mode = "all"
+    transcribe_audio: str = "standard"
+    audio_trigger = False
+    show_transcription = False
+    reply_to_mode = str(platform_cfg.get("reply_to_mode") or extra.get("reply_to_mode") or "first").strip().lower()
+    if reply_to_mode not in {"off", "first", "all"}:
+        reply_to_mode = "first"
+    gateway_restart_notification = _dashboard_bool_from_config(
+        platform_cfg.get("gateway_restart_notification", extra.get("gateway_restart_notification")),
+        default=False,
+    )
+
+    if platform_key == "telegram":
+        free_response = _dashboard_list_contains(
+            extra.get("free_response_chats", platform_cfg.get("free_response_chats", "")),
+            chat_id,
+        )
+        require_mention = _dashboard_bool_from_config(
+            extra.get("require_mention", platform_cfg.get("require_mention")),
+            default=False,
+        )
+        response_mode = "all" if free_response else ("mentions" if require_mention else "all")
+        # Default Telegram voice handling is its normal configured behavior:
+        # accepted voice messages can still be transcribed for the bot, while
+        # passive transcript-only handling is controlled by chat overrides and
+        # audio_transcription_rules.
+        transcribe_audio = "standard"
+        audio_trigger = _dashboard_bool_from_config(
+            platform_cfg.get("audio_trigger", extra.get("audio_trigger")),
+            default=False,
+        )
+        show_transcription = _dashboard_bool_from_config(
+            platform_cfg.get("show_transcription", extra.get("show_transcription")),
+            default=False,
+        )
+    elif _dashboard_bool_from_config(platform_cfg.get("require_mention"), default=False):
+        response_mode = "mentions"
+
+    return {
+        "response_mode": response_mode,
+        "transcribe_audio": transcribe_audio,
+        "audio_trigger": audio_trigger,
+        "show_transcription": show_transcription,
+        "reply_to_mode": reply_to_mode,
+        "gateway_restart_notification": gateway_restart_notification,
+    }
+
+
+def _profile_resolved_display_settings(name: str, platform: str, chat_id: str = "") -> Dict[str, Any]:
+    from gateway.display_config import resolve_display_setting
+
+    config_path, data = _read_profile_config_for_edit(name)
+    platform_key = str(platform or "telegram").strip().lower() or "telegram"
+    settings: Dict[str, Any] = _profile_resolved_chat_base_settings(platform_key, chat_id)
+    for field_name in _PROFILE_DISPLAY_RESOLVED_FIELDS:
+        value = resolve_display_setting(data, platform_key, field_name)
+        if field_name == "streaming" and value is None:
+            value = _dashboard_streaming_enabled_fallback()
+        settings[field_name] = value
+    return {
+        "profile": name,
+        "platform": platform_key,
+        "path": str(config_path),
+        "settings": settings,
+    }
+
+
+@app.get("/api/profiles/{name}/resolved-display-settings")
+async def get_profile_resolved_display_settings_endpoint(
+    name: str,
+    platform: str = "telegram",
+    chat_id: str = "",
+):
+    return _profile_resolved_display_settings(name, platform, chat_id)
+
+
+@app.get("/api/profiles/{name}/display-settings")
+async def get_profile_display_settings_endpoint(name: str):
+    config_path, data = _read_profile_config_for_edit(name)
+    return _profile_display_settings_from_config(name, config_path, data)
+
+
+@app.put("/api/profiles/{name}/display-settings")
+async def update_profile_display_settings_endpoint(name: str, body: ProfileDisplaySettingsUpdate):
+    config_path, data = _read_profile_config_for_edit(name)
+
+    tool_progress = _profile_display_tool_progress(body.tool_progress, default="")
+    if tool_progress not in _PROFILE_TOOL_PROGRESS_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail="tool_progress must be one of: off, new, all, verbose",
+        )
+    tool_preview_length = _profile_display_preview_length(body.tool_preview_length)
+
+    display = data.setdefault("display", {})
+    if not isinstance(display, dict):
+        display = {}
+        data["display"] = display
+
+    display["tool_progress"] = tool_progress
+    display["interim_assistant_messages"] = bool(body.interim_assistant_messages)
+    display["cleanup_progress"] = bool(body.cleanup_progress)
+    display["tool_preview_length"] = tool_preview_length
+
+    try:
+        config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    except OSError as e:
+        _log.exception("PUT /api/profiles/%s/display-settings failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not write profile config.yaml: {e}")
+
+    return {"ok": True, **_profile_display_settings_from_config(name, config_path, data)}
 
 
 @app.get("/api/profiles/{name}/skills")

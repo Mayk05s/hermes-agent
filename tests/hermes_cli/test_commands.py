@@ -215,6 +215,20 @@ class TestGatewayHelpLines:
         assert len(bg_line) == 1
         assert "/bg" in bg_line[0]
 
+    def test_hides_operator_commands_for_named_profiles(self):
+        joined = "\n".join(gateway_help_lines(profile_name="family-chat"))
+        assert "/debug" not in joined
+        assert "/restart" not in joined
+        assert "/update" not in joined
+        assert "/status" in joined
+        assert "/help" in joined
+
+    def test_default_profile_keeps_operator_commands_visible(self):
+        joined = "\n".join(gateway_help_lines(profile_name="default"))
+        assert "/debug" in joined
+        assert "/restart" in joined
+        assert "/update" in joined
+
 
 class TestTelegramBotCommands:
     def test_returns_list_of_tuples(self):
@@ -257,6 +271,14 @@ class TestTelegramBotCommands:
         names = {name for name, _ in telegram_bot_commands()}
         assert "codex_runtime" in names
         assert "codex-runtime" not in names
+
+    def test_hides_operator_commands_for_named_profiles(self):
+        names = {name for name, _ in telegram_bot_commands(profile_name="family-chat")}
+        assert "debug" not in names
+        assert "restart" not in names
+        assert "update" not in names
+        assert "status" in names
+        assert "help" in names
 
 
 class TestSlackSubcommandMap:
@@ -974,6 +996,15 @@ class TestTelegramMenuCommands:
             "status",
         ):
             assert name in names
+
+    def test_operator_builtins_hidden_in_named_profile_menu(self):
+        menu, _ = telegram_menu_commands(max_commands=100, profile_name="family-chat")
+        names = {name for name, _desc in menu}
+        assert "debug" not in names
+        assert "restart" not in names
+        assert "update" not in names
+        assert "status" in names
+        assert "help" in names
 
     def test_includes_plugin_commands_via_lazy_discovery(self, tmp_path, monkeypatch):
         """Telegram menu generation should discover plugin slash commands on first access."""

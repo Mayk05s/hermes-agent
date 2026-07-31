@@ -16,7 +16,11 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { EnvVarInfo, ModelOptionsResponse } from "@/lib/api";
+import type {
+  EnvVarInfo,
+  ModelOptionProvider,
+  ModelOptionsResponse,
+} from "@/lib/api";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
@@ -52,6 +56,9 @@ const PROVIDER_GROUPS: { prefix: string; name: string; priority: number }[] = [
   { prefix: "ANTHROPIC_", name: "Anthropic", priority: 1 },
   { prefix: "DASHSCOPE_", name: "DashScope (Qwen)", priority: 2 },
   { prefix: "HERMES_QWEN_", name: "DashScope (Qwen)", priority: 2 },
+  { prefix: "COPILOT_", name: "GitHub Copilot", priority: 3 },
+  { prefix: "GH_", name: "GitHub Copilot", priority: 3 },
+  { prefix: "GITHUB_", name: "GitHub Copilot", priority: 3 },
   { prefix: "DEEPSEEK_", name: "DeepSeek", priority: 3 },
   { prefix: "GOOGLE_", name: "Gemini", priority: 4 },
   { prefix: "GEMINI_", name: "Gemini", priority: 4 },
@@ -73,6 +80,8 @@ const PROVIDER_GROUPS: { prefix: string; name: string; priority: number }[] = [
   { prefix: "STEPFUN_", name: "StepFun", priority: 16 },
   { prefix: "ARCEE", name: "Arcee AI", priority: 17 },
   { prefix: "GMI_", name: "GMI Cloud", priority: 18 },
+  { prefix: "NOVITA_", name: "NovitaAI", priority: 19 },
+  { prefix: "TOKENHUB_", name: "Tencent TokenHub", priority: 20 },
 ];
 
 function getProviderGroup(key: string): string {
@@ -92,6 +101,14 @@ interface ProviderGroup {
   priority: number;
   entries: [string, EnvVarInfo][];
   hasAnySet: boolean;
+}
+
+function envVarDomId(key: string): string {
+  return `env-var-${key.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+}
+
+function normalizeProviderName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
 const CATEGORY_META_ICONS: Record<string, typeof KeyRound> = {
@@ -142,7 +159,10 @@ function EnvVarRow({
   // Compact inline row for unset, non-editing keys (used inside provider groups)
   if (compact && !info.is_set && !isEditing) {
     return (
-      <div className="flex items-center justify-between gap-3 py-1.5 min-w-0 overflow-hidden text-text-secondary hover:text-foreground transition-colors">
+      <div
+        id={envVarDomId(varKey)}
+        className="flex items-center justify-between gap-3 py-1.5 min-w-0 overflow-hidden text-text-secondary hover:text-foreground transition-colors"
+      >
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-mono-ui text-xs">
             {varKey}
@@ -178,7 +198,10 @@ function EnvVarRow({
   // Non-compact unset row
   if (!info.is_set && !isEditing) {
     return (
-      <div className="flex items-center justify-between gap-3 border border-border/50 px-4 py-2.5 min-w-0 overflow-hidden text-text-secondary hover:text-foreground transition-colors">
+      <div
+        id={envVarDomId(varKey)}
+        className="flex items-center justify-between gap-3 border border-border/50 px-4 py-2.5 min-w-0 overflow-hidden text-text-secondary hover:text-foreground transition-colors"
+      >
         <div className="flex items-center gap-3 min-w-0">
           <Label className="font-mono-ui text-xs">
             {varKey}
@@ -213,7 +236,10 @@ function EnvVarRow({
 
   // Full expanded row for set keys or keys being edited
   return (
-    <div className="grid gap-2 border border-border p-4 min-w-0 overflow-hidden">
+    <div
+      id={envVarDomId(varKey)}
+      className="grid gap-2 border border-border p-4 min-w-0 overflow-hidden"
+    >
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2">
           <Label className="font-mono-ui text-xs">{varKey}</Label>
@@ -344,6 +370,8 @@ function EnvVarRow({
 
 function ProviderGroupCard({
   group,
+  expanded,
+  onExpandedChange,
   edits,
   setEdits,
   revealed,
@@ -355,6 +383,8 @@ function ProviderGroupCard({
   clearDialogOpen = false,
 }: {
   group: ProviderGroup;
+  expanded: boolean;
+  onExpandedChange: (expanded: boolean) => void;
   edits: Record<string, string>;
   setEdits: React.Dispatch<React.SetStateAction<Record<string, string>>>;
   revealed: Record<string, string>;
@@ -365,7 +395,6 @@ function ProviderGroupCard({
   onCancelEdit: (key: string) => void;
   clearDialogOpen?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
   const { t } = useI18n();
 
   // Separate API keys from base URLs and other settings
@@ -391,7 +420,7 @@ function ProviderGroupCard({
     <div className="border border-border">
       {/* Header — always visible */}
       <ListItem
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => onExpandedChange(!expanded)}
         aria-expanded={expanded}
         className="justify-between gap-3 px-4 py-3 hover:bg-primary/5"
       >
@@ -493,8 +522,10 @@ function ProviderGroupCard({
 
 function AvailableModelProvidersStrip({
   options,
+  onSetupProvider,
 }: {
   options: ModelOptionsResponse | null;
+  onSetupProvider: (provider: ModelOptionProvider) => void;
 }) {
   const providers = options?.providers ?? [];
   if (providers.length === 0) return null;
@@ -511,19 +542,31 @@ function AvailableModelProvidersStrip({
           {readyCount}/{providers.length} ready
         </span>
       </div>
-      <div className="flex min-w-0 gap-2 overflow-x-auto pb-1">
+      <div className="flex min-w-0 flex-wrap gap-2">
         {providers.map((provider) => (
           <div
             key={provider.slug}
-            className="inline-flex shrink-0 items-center gap-2 border border-border/60 bg-background/50 px-2 py-1"
+            className="inline-flex min-w-0 max-w-full items-center gap-2 border border-border/60 bg-background/50 px-2 py-1"
+            title={provider.warning ?? provider.name}
           >
-            <span className="text-xs font-medium">{provider.name}</span>
+            <span className="min-w-0 max-w-[11rem] truncate text-xs font-medium">
+              {provider.name}
+            </span>
             <span className="font-mono text-xs text-text-secondary">
               {provider.total_models ?? provider.models?.length ?? 0}
             </span>
-            <Badge tone={provider.authenticated ? "success" : "secondary"}>
-              {provider.authenticated ? "ready" : "setup"}
-            </Badge>
+            {provider.authenticated ? (
+              <Badge tone="success">ready</Badge>
+            ) : (
+              <Button
+                size="sm"
+                outlined
+                onClick={() => onSetupProvider(provider)}
+                className="h-6 px-2 text-xs"
+              >
+                Setup
+              </Button>
+            )}
           </div>
         ))}
       </div>
@@ -542,6 +585,7 @@ export default function EnvPage() {
   const [revealed, setRevealed] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(true); // Show all providers by default
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const location = useLocation();
   const { toast, showToast } = useToast();
   const { t } = useI18n();
@@ -772,6 +816,65 @@ export default function EnvPage() {
     return { providerGroups: groups, nonProviderGrouped: nonProvider };
   }, [vars, showAdvanced, t]);
 
+  const handleSetupProvider = useCallback(
+    (provider: ModelOptionProvider) => {
+      if (!vars) return;
+
+      let targetKey =
+        provider.key_env && vars[provider.key_env] ? provider.key_env : null;
+      let targetGroupName = targetKey ? getProviderGroup(targetKey) : "";
+
+      if (!targetKey) {
+        const providerNames = [provider.name, provider.slug]
+          .filter(Boolean)
+          .map(normalizeProviderName);
+        const matchedGroup = providerGroups.find((group) => {
+          const groupName = normalizeProviderName(group.name);
+          return providerNames.some(
+            (name) => name === groupName || name.includes(groupName) || groupName.includes(name),
+          );
+        });
+        const fallbackEntry =
+          matchedGroup?.entries.find(
+            ([key, info]) =>
+              !info.is_set &&
+              (key.endsWith("_API_KEY") || key.endsWith("_TOKEN")),
+          ) ??
+          matchedGroup?.entries.find(([, info]) => !info.is_set) ??
+          matchedGroup?.entries[0];
+
+        if (fallbackEntry && matchedGroup) {
+          targetKey = fallbackEntry[0];
+          targetGroupName = matchedGroup.name;
+        }
+      }
+
+      if (!targetKey) {
+        showToast(
+          provider.warning ?? `No editable key found for ${provider.name}.`,
+          "error",
+        );
+        return;
+      }
+
+      setShowAdvanced(true);
+      setExpandedGroups((prev) => ({
+        ...prev,
+        [targetGroupName || getProviderGroup(targetKey)]: true,
+      }));
+      setEdits((prev) => ({ ...prev, [targetKey]: prev[targetKey] ?? "" }));
+
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          document
+            .getElementById(envVarDomId(targetKey))
+            ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
+      });
+    },
+    [providerGroups, showToast, vars],
+  );
+
   if (!vars) {
     return (
       <div className="flex items-center justify-center py-24">
@@ -844,12 +947,22 @@ export default function EnvPage() {
         </CardHeader>
 
         <CardContent className="grid gap-0 p-0">
-          <AvailableModelProvidersStrip options={modelOptions} />
+          <AvailableModelProvidersStrip
+            options={modelOptions}
+            onSetupProvider={handleSetupProvider}
+          />
 
           {providerGroups.map((group) => (
             <ProviderGroupCard
               key={group.name}
               group={group}
+              expanded={!!expandedGroups[group.name]}
+              onExpandedChange={(expanded) =>
+                setExpandedGroups((prev) => ({
+                  ...prev,
+                  [group.name]: expanded,
+                }))
+              }
               edits={edits}
               setEdits={setEdits}
               revealed={revealed}

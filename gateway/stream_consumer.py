@@ -210,6 +210,7 @@ class GatewayStreamConsumer:
         message_id: str,
         content: str,
         finalize: bool = False,
+        is_turn_final: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
         kwargs = {
@@ -221,14 +222,17 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        edit_metadata = dict(self.metadata or {})
+        if finalize and is_turn_final:
+            edit_metadata["hermes_turn_final"] = True
+        if edit_metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = edit_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -584,12 +588,18 @@ class GatewayStreamConsumer:
                             # visible update this tick) OR the adapter needs
                             # explicit finalize=True to close the stream.
                             self._final_response_sent = await self._send_or_edit(
-                                self._accumulated, finalize=True,
+                                self._accumulated,
+                                finalize=True,
+                                is_turn_final=True,
                             )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated,
+                                finalize=True,
+                                is_turn_final=True,
+                            )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                     return
@@ -808,14 +818,17 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks):
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
+                chunk_metadata = dict(self.metadata or {})
+                if chunk_index == len(chunks) - 1:
+                    chunk_metadata["hermes_turn_final"] = True
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self.metadata,
+                    metadata=chunk_metadata or None,
                 )
                 if result.success:
                     break
@@ -1082,10 +1095,13 @@ class GatewayStreamConsumer:
         """
         old_message_id = self._message_id
         try:
+            final_metadata = dict(self.metadata or {})
+            if is_turn_final:
+                final_metadata["hermes_turn_final"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=final_metadata or None,
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -1127,7 +1143,7 @@ class GatewayStreamConsumer:
         return True
 
     async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+        self, text: str, *, finalize: bool = False, is_turn_final: bool = False,
     ) -> bool:
         """Send or edit the streaming message.
 
@@ -1232,6 +1248,7 @@ class GatewayStreamConsumer:
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,
+                        is_turn_final=is_turn_final,
                     )
                     if result.success:
                         self._already_sent = True
@@ -1307,11 +1324,14 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
+                send_metadata = dict(self.metadata or {})
+                if finalize and is_turn_final:
+                    send_metadata["hermes_turn_final"] = True
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
+                    metadata=send_metadata or None,
                 )
                 if result.success:
                     if result.message_id:

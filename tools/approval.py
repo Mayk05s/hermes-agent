@@ -1,4 +1,4 @@
-"""Dangerous command approval -- detection, prompting, and per-session state.
+"""User approval -- dangerous-command detection and per-session action consent.
 
 This module is the single source of truth for the dangerous command system:
 - Pattern detection (DANGEROUS_PATTERNS, detect_dangerous_command)
@@ -6,6 +6,7 @@ This module is the single source of truth for the dangerous command system:
 - Approval prompting (CLI interactive + gateway async)
 - Smart approval via auxiliary LLM (auto-approve low-risk commands)
 - Permanent allowlist persistence (config.yaml)
+- Explicit gateway action approvals (for example cross-chat delivery)
 """
 
 import contextvars
@@ -1177,6 +1178,122 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         choice=_outcome,
     )
     return {"resolved": resolved, "choice": choice}
+
+
+def check_gateway_action_approval(
+    *,
+    action_key: str,
+    action_preview: str,
+    description: str,
+) -> dict:
+    """Require explicit gateway approval for a non-command action.
+
+    ``action_key`` defines the scope remembered by ``session`` or ``always``.
+    A one-time approval is consumed only by this call.  Permanent approvals
+    use the existing durable allowlist, but this function deliberately does
+    not honor YOLO, smart approval, or ``approvals.mode=off``: the caller is
+    using it for an explicit-consent boundary, not command risk scoring.
+    """
+    action_key = str(action_key or "").strip()
+    if not action_key:
+        return {
+            "approved": False,
+            "message": "BLOCKED: approval action key is missing.",
+            "outcome": "invalid",
+            "user_consent": False,
+        }
+
+    session_key = get_current_session_key()
+    if is_approved(session_key, action_key):
+        return {
+            "approved": True,
+            "message": None,
+            "approval_scope": "remembered",
+        }
+
+    # Scheduled/background jobs have no current human turn and therefore
+    # cannot establish fresh consent for a cross-chat action.
+    if env_var_enabled("HERMES_CRON_SESSION"):
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: This action requires a live user approval, but "
+                "scheduled jobs run without a user present."
+            ),
+            "outcome": "no_live_user",
+            "user_consent": False,
+        }
+
+    notify_cb = None
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+
+    approval_data = {
+        "command": str(action_preview or "")[:4000],
+        "pattern_key": action_key,
+        "pattern_keys": [action_key],
+        "description": str(description or "user-controlled action"),
+        "approval_kind": "action",
+    }
+
+    if notify_cb is None:
+        submit_pending(session_key, approval_data)
+        return {
+            "approved": False,
+            "pattern_key": action_key,
+            "status": "pending_approval",
+            "approval_pending": True,
+            "message": (
+                "BLOCKED: This action requires live user approval, but no "
+                "approval surface is attached to the current session."
+            ),
+            "outcome": "approval_unavailable",
+            "user_consent": False,
+        }
+
+    decision = _await_gateway_decision(
+        session_key,
+        notify_cb,
+        approval_data,
+        surface="gateway_action",
+    )
+    if decision.get("notify_failed"):
+        return {
+            "approved": False,
+            "message": "BLOCKED: Failed to send the approval request to the user.",
+            "pattern_key": action_key,
+            "outcome": "notify_failed",
+            "user_consent": False,
+        }
+
+    resolved = decision["resolved"]
+    choice = decision["choice"]
+    if not resolved or choice is None or choice == "deny":
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: The user did not approve this action."
+                if resolved
+                else "BLOCKED: Approval timed out. Silence is not consent."
+            ),
+            "pattern_key": action_key,
+            "outcome": "denied" if resolved else "timeout",
+            "user_consent": False,
+        }
+
+    if choice == "session":
+        approve_session(session_key, action_key)
+    elif choice == "always":
+        approve_session(session_key, action_key)
+        approve_permanent(action_key)
+        save_permanent_allowlist(_permanent_approved)
+
+    return {
+        "approved": True,
+        "message": None,
+        "user_approved": True,
+        "approval_scope": choice,
+    }
 
 
 def check_all_command_guards(command: str, env_type: str,

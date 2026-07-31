@@ -13,6 +13,7 @@ import re
 import ssl
 import time
 from email.utils import formatdate
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from agent.redact import redact_sensitive_text
 
@@ -65,6 +66,49 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_EXPLICIT_SEND_REQUEST_RE = re.compile(
+    r"(?iu)\b(?:"
+    r"отправ\w*|перешл\w*|передай\w*|напиш\w*|пошл\w*|"
+    r"перенес\w*|перенеси|перекин\w*|скин\w*|продублир\w*|"
+    r"ответь|опубликуй\w*|запост\w*|закин\w*|достав\w*|"
+    r"send|forward|post|share|deliver|message|reply"
+    r")\b"
+)
+_MINIAPP_START_LINK_RE = re.compile(
+    r"(?P<url>https://t\.me/(?P<bot>[A-Za-z0-9_]{3,32})\?startapp=(?P<param>[A-Za-z0-9_-]+))",
+    re.IGNORECASE,
+)
+_SUPPORTED_INLINE_MINIAPP_PARAMS: tuple[str, ...] = (
+    "health",
+    "fitness",
+    "fitness_day",
+    "fitness_week",
+    "fitness_history",
+    "fitness_planning",
+    "nutrition",
+    "nutrition_history",
+    "stats",
+    "meds",
+    "planning",
+    "todo",
+    "tasks",
+)
+_MINIAPP_BUTTON_LABELS: dict[str, str] = {
+    "health": "Открыть здоровье",
+    "fitness": "Открыть тренировки",
+    "fitness_day": "Открыть день",
+    "fitness_week": "Открыть неделю",
+    "fitness_history": "Открыть историю",
+    "fitness_planning": "Открыть план",
+    "nutrition": "Открыть питание",
+    "nutrition_history": "Открыть историю питания",
+    "stats": "Открыть статистику",
+    "meds": "Открыть лекарства",
+    "planning": "Открыть планирование",
+    "todo": "Открыть задачи",
+    "tasks": "Открыть задачи",
+}
+_MINIAPP_WEBAPP_BASE_URL = "https://miniapp.mayk05.pro/"
 
 
 def _sanitize_error_text(text) -> str:
@@ -78,6 +122,268 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _same_telegram_chat_delivery_error(
+    *,
+    origin_platform: str,
+    origin_chat_id: str,
+    destination_platform: str,
+    destination_chat_id: str,
+    telegram_extra: dict | None,
+) -> str | None:
+    """Enforce an opt-in same-chat boundary for cross-topic delivery."""
+    if str(origin_platform or "").strip().lower() != "telegram":
+        return None
+    origin_chat = str(origin_chat_id or "").strip()
+    if not origin_chat or not isinstance(telegram_extra, dict):
+        return None
+
+    policy = ""
+    for group in telegram_extra.get("group_topics") or []:
+        if not isinstance(group, dict):
+            continue
+        if str(group.get("chat_id") or "").strip() == origin_chat:
+            policy = str(group.get("send_message_scope") or "").strip().lower()
+            break
+    if policy != "same_chat":
+        return None
+
+    destination_chat = str(destination_chat_id or "").strip()
+    if (
+        str(destination_platform or "").strip().lower() == "telegram"
+        and destination_chat == origin_chat
+    ):
+        return None
+    return (
+        "This Telegram chat only allows cross-topic delivery inside the same "
+        f"chat ({origin_chat}). Choose another topic ID in this chat; do not "
+        "send the result to a DM or a different group."
+    )
+
+
+def _telegram_send_message_scope(
+    *,
+    origin_platform: str,
+    origin_chat_id: str,
+    telegram_extra: dict | None,
+) -> str:
+    """Return the configured send boundary for the originating TG chat."""
+    if str(origin_platform or "").strip().lower() != "telegram":
+        return ""
+    origin_chat = str(origin_chat_id or "").strip()
+    if not origin_chat or not isinstance(telegram_extra, dict):
+        return ""
+    for group in telegram_extra.get("group_topics") or []:
+        if not isinstance(group, dict):
+            continue
+        if str(group.get("chat_id") or "").strip() == origin_chat:
+            return str(group.get("send_message_scope") or "").strip().lower()
+    return ""
+
+
+def _telegram_cross_chat_request_users(
+    *,
+    origin_platform: str,
+    origin_chat_id: str,
+    telegram_extra: dict | None,
+) -> set[str]:
+    """Return requester IDs allowed to initiate cross-chat approval."""
+    if str(origin_platform or "").strip().lower() != "telegram":
+        return set()
+    origin_chat = str(origin_chat_id or "").strip()
+    if not origin_chat or not isinstance(telegram_extra, dict):
+        return set()
+    for group in telegram_extra.get("group_topics") or []:
+        if not isinstance(group, dict):
+            continue
+        if str(group.get("chat_id") or "").strip() != origin_chat:
+            continue
+        values = group.get("cross_chat_request_users") or []
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        return {
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+        }
+    return set()
+
+
+def _is_cross_chat_delivery(
+    *,
+    origin_platform: str,
+    origin_chat_id: str,
+    destination_platform: str,
+    destination_chat_id: str,
+) -> bool:
+    origin_platform = str(origin_platform or "").strip().lower()
+    destination_platform = str(destination_platform or "").strip().lower()
+    origin_chat = str(origin_chat_id or "").strip()
+    destination_chat = str(destination_chat_id or "").strip()
+    return bool(
+        origin_platform
+        and origin_chat
+        and (
+            destination_platform != origin_platform
+            or destination_chat != origin_chat
+        )
+    )
+
+
+def _explicit_cross_chat_request_error(
+    *,
+    current_user_request: str,
+    user_request_quote: str,
+) -> str | None:
+    """Verify that the current user turn explicitly requested a send."""
+    request = " ".join(str(current_user_request or "").casefold().split())
+    quote = " ".join(str(user_request_quote or "").casefold().split())
+    if len(quote) < 4:
+        return (
+            "Cross-chat delivery requires an exact quote from the current "
+            "user message that explicitly asks to send or forward it."
+        )
+    if quote not in request:
+        return (
+            "The supplied cross-chat request quote is not present in the "
+            "current user message. Do not send and do not request approval."
+        )
+    if not _EXPLICIT_SEND_REQUEST_RE.search(quote):
+        return (
+            "The quoted user text does not explicitly request sending, "
+            "forwarding, posting, or replying in another chat."
+        )
+    return None
+
+
+def _miniapp_label_key(start_param: str) -> str | None:
+    param = str(start_param or "").strip().lower()
+    if not param:
+        return None
+    if param.startswith("fitness_day_"):
+        return "fitness_day"
+    if param.startswith("fitness_week_"):
+        return "fitness_week"
+    if param in _MINIAPP_BUTTON_LABELS:
+        return param
+    return None
+
+
+def _miniapp_shortcut_text(start_param: str) -> str:
+    label_key = _miniapp_label_key(start_param) or ""
+    if label_key == "planning" or label_key in {"todo", "tasks"}:
+        return "Открой миниапп планирования."
+    if label_key == "health":
+        return "Открой миниапп здоровья."
+    if label_key.startswith("fitness"):
+        return "Открой тренировки в миниаппе."
+    if label_key.startswith("nutrition"):
+        return "Открой питание в миниаппе."
+    if label_key == "meds":
+        return "Открой лекарства в миниаппе."
+    if label_key == "stats":
+        return "Открой статистику в миниаппе."
+    return "Открой миниапп."
+
+
+def _miniapp_webapp_url(start_param: str) -> str:
+    base_url = (
+        os.environ.get("HERMES_MINIAPP_WEBAPP_URL")
+        or os.environ.get("MINIAPP_WEBAPP_URL")
+        or _MINIAPP_WEBAPP_BASE_URL
+    ).strip() or _MINIAPP_WEBAPP_BASE_URL
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["startapp"] = str(start_param or "").strip()
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path or "/",
+        urlencode(query),
+        parts.fragment,
+    ))
+
+
+def _miniapp_supports_web_app_button_for_chat_id(chat_id) -> bool:
+    chat_id_text = str(chat_id or "").strip()
+    return bool(chat_id_text and not chat_id_text.startswith("-"))
+
+
+def _miniapp_allowed_bot_usernames(bot_username: str | None = None) -> set[str]:
+    allowed = {"tripioobot"}
+    for value in (
+        bot_username,
+        os.environ.get("MINIAPP_BOT_USERNAME"),
+        os.environ.get("TELEGRAM_BOT_USERNAME"),
+    ):
+        if isinstance(value, str) and value.strip():
+            allowed.add(value.strip().lstrip("@").lower())
+    return allowed
+
+
+def _cleanup_miniapp_link_text(text: str) -> str:
+    cleaned = re.sub(r"`\s*`", "", text or "")
+    cleaned = re.sub(
+        r"(?im)^\s*(?:miniapp_url|url|link|ссылка|линк)\s*[:=-]?\s*$",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?im)^\s*(?:открыть|показать)\s+"
+        r"(?:тренировки|тренировку|день|неделю|миниапп|миниприложение|"
+        r"планирование|задачи|здоровье|питание|лекарства|статистику)\s*[:.]*\s*$",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"[ \t]+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    if cleaned.endswith(":"):
+        cleaned = f"{cleaned[:-1].rstrip()}."
+    return cleaned
+
+
+def _extract_telegram_miniapp_button_spec(
+    content: str,
+    *,
+    bot_username: str | None = None,
+    use_web_app: bool = False,
+) -> tuple[str, list[list[dict[str, str]]]]:
+    buttons: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    allowed_bots = _miniapp_allowed_bot_usernames(bot_username)
+
+    def _replace(match: re.Match) -> str:
+        bot = str(match.group("bot") or "").strip().lstrip("@").lower()
+        start_param = str(match.group("param") or "").strip()
+        label_key = _miniapp_label_key(start_param)
+        if (
+            bot not in allowed_bots
+            or label_key is None
+            or label_key not in _SUPPORTED_INLINE_MINIAPP_PARAMS
+        ):
+            return match.group("url")
+        button = {"text": _MINIAPP_BUTTON_LABELS[label_key]}
+        if use_web_app:
+            button["web_app_url"] = _miniapp_webapp_url(start_param)
+        else:
+            button["url"] = match.group("url")
+        dedupe_key = (button["text"], button.get("url") or button.get("web_app_url") or "")
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
+            buttons.append(button)
+        return ""
+
+    cleaned = _MINIAPP_START_LINK_RE.sub(_replace, content or "")
+    if not buttons:
+        return content, []
+    cleaned = _cleanup_miniapp_link_text(cleaned)
+    if not cleaned:
+        first_param = _MINIAPP_START_LINK_RE.search(content or "")
+        cleaned = _miniapp_shortcut_text(first_param.group("param") if first_param else "")
+    return cleaned, [[button] for button in buttons]
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -148,6 +454,16 @@ SEND_MESSAGE_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
+            },
+            "user_request_quote": {
+                "type": "string",
+                "description": (
+                    "For delivery outside the current chat only: copy an exact "
+                    "quote from the CURRENT user message that explicitly asks "
+                    "to send/forward/post to another chat. The tool verifies "
+                    "this provenance before requesting one-time, session, or "
+                    "permanent route approval. Never invent this quote."
+                ),
             }
         },
         "required": []
@@ -160,6 +476,18 @@ def send_message_tool(args, **kw):
     action = args.get("action", "send")
 
     if action == "list":
+        origin_scope = _personal_planning_origin_scope()
+        if origin_scope:
+            targets = []
+            if origin_scope.get("chat_id"):
+                target = f"telegram:{origin_scope['chat_id']}"
+                if origin_scope.get("thread_id"):
+                    target += f":{origin_scope['thread_id']}"
+                targets.append(target)
+            return json.dumps({
+                "targets": targets,
+                "scope": "personal_planning_origin_only",
+            })
         return _handle_list()
 
     return _handle_send(args)
@@ -282,6 +610,113 @@ def _handle_send(args):
                 f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
                 f"or set a home channel via: hermes config set {home_env} <channel_id>"
             })
+
+    from gateway.session_context import get_session_env
+
+    telegram_config = config.platforms.get(Platform.TELEGRAM)
+    origin_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    telegram_extra = getattr(telegram_config, "extra", None)
+    delivery_scope_error = _same_telegram_chat_delivery_error(
+        origin_platform=origin_platform,
+        origin_chat_id=origin_chat_id,
+        destination_platform=platform_name,
+        destination_chat_id=chat_id,
+        telegram_extra=telegram_extra,
+    )
+    if delivery_scope_error:
+        logger.warning("Blocked cross-chat send_message delivery: %s", delivery_scope_error)
+        return tool_error(delivery_scope_error)
+
+    send_scope = _telegram_send_message_scope(
+        origin_platform=origin_platform,
+        origin_chat_id=origin_chat_id,
+        telegram_extra=telegram_extra,
+    )
+    if (
+        send_scope == "cross_chat_approval"
+        and _is_cross_chat_delivery(
+            origin_platform=origin_platform,
+            origin_chat_id=origin_chat_id,
+            destination_platform=platform_name,
+            destination_chat_id=chat_id,
+        )
+    ):
+        allowed_requesters = _telegram_cross_chat_request_users(
+            origin_platform=origin_platform,
+            origin_chat_id=origin_chat_id,
+            telegram_extra=telegram_extra,
+        )
+        origin_user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+        if allowed_requesters and origin_user_id not in allowed_requesters:
+            logger.warning(
+                "Blocked cross-chat send_message request from unauthorized user %s",
+                origin_user_id or "unknown",
+            )
+            return tool_error(
+                "Cross-chat delivery can only be requested by the configured "
+                "owner for this chat. Do not request approval."
+            )
+
+        request_error = _explicit_cross_chat_request_error(
+            current_user_request=get_session_env(
+                "HERMES_SESSION_USER_REQUEST",
+                "",
+            ),
+            user_request_quote=args.get("user_request_quote", ""),
+        )
+        if request_error:
+            logger.warning(
+                "Blocked cross-chat send_message without explicit request: %s",
+                request_error,
+            )
+            return tool_error(request_error)
+
+        from tools.approval import check_gateway_action_approval
+
+        route_key = (
+            "send_message:cross_chat:"
+            f"{str(origin_platform).strip().lower()}:{str(origin_chat_id).strip()}"
+            f"->{platform_name}:{str(chat_id).strip()}"
+        )
+        preview = _sanitize_error_text(cleaned_message.strip())
+        if len(preview) > 800:
+            preview = preview[:800] + "…"
+        approval = check_gateway_action_approval(
+            action_key=route_key,
+            action_preview=(
+                "send_message cross-chat\n"
+                f"from: {origin_platform}:{origin_chat_id}\n"
+                f"to: {platform_name}:{chat_id}"
+                + (f":{thread_id}" if thread_id else "")
+                + f"\nmessage:\n{preview or '[media attachment]'}"
+            ),
+            description=(
+                "Cross-chat message delivery requested by the current user. "
+                "Allow Once permits only this send; Session remembers this "
+                "route until the conversation resets; Always permanently "
+                "trusts only this source-to-destination route. A fresh explicit "
+                "user request is still required for every future send."
+            ),
+        )
+        if not approval.get("approved"):
+            logger.warning(
+                "Cross-chat send_message was not approved: %s",
+                approval.get("outcome") or "blocked",
+            )
+            return tool_error(
+                approval.get("message")
+                or "Cross-chat delivery was not approved."
+            )
+
+    scope_error = _personal_planning_delivery_error(
+        platform_name,
+        chat_id,
+        thread_id,
+    )
+    if scope_error:
+        logger.warning("Blocked profile-scoped send_message delivery: %s", scope_error)
+        return tool_error(scope_error)
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
@@ -637,6 +1072,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.TELEGRAM:
         last_result = None
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        miniapp_bot_username = (
+            getattr(pconfig, "extra", {}) or {}
+        ).get("miniapp_bot_username")
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _send_telegram(
@@ -647,6 +1085,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 disable_link_previews=disable_link_previews,
                 force_document=force_document,
+                miniapp_bot_username=miniapp_bot_username,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -816,6 +1255,57 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     return last_result
 
 
+def _personal_planning_origin_scope():
+    """Return the only delivery lane allowed from personal planning turns.
+
+    The planning agent handles private Calendar data. It may reply only to the
+    Telegram chat/topic that invoked it; channel discovery and cross-chat
+    messaging are deliberately unavailable in that scoped runtime.
+    """
+    from gateway.session_context import get_session_env
+
+    profile = get_session_env("HERMES_SESSION_PROFILE_NAME", "").strip()
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    allowed_skills = get_session_env("HERMES_SESSION_ALLOWED_SKILLS", "")
+    if (
+        profile != "personal"
+        or platform != "telegram"
+        or "telegram_planning" not in allowed_skills
+    ):
+        return None
+
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    if not chat_id:
+        # A scoped planning turn without a trusted origin must not gain a home
+        # channel or arbitrary explicit-target fallback.
+        return {"chat_id": "", "thread_id": thread_id}
+    return {"chat_id": chat_id, "thread_id": thread_id}
+
+
+def _personal_planning_delivery_error(
+    platform_name: str,
+    chat_id: str | None,
+    thread_id: str | None,
+) -> str | None:
+    """Fail closed when personal planning tries to leave its origin lane."""
+    scope = _personal_planning_origin_scope()
+    if not scope:
+        return None
+
+    origin_chat = str(scope.get("chat_id") or "").strip()
+    origin_thread = str(scope.get("thread_id") or "").strip()
+    target_chat = str(chat_id or "").strip()
+    target_thread = str(thread_id or "").strip()
+    if not origin_chat:
+        return "Personal planning delivery is blocked because its origin chat is unavailable."
+    if platform_name != "telegram" or target_chat != origin_chat:
+        return "Personal planning can send messages only to its originating Telegram chat."
+    if origin_thread and target_thread != origin_thread:
+        return "Personal planning can send messages only to its originating Telegram topic."
+    return None
+
+
 def _is_telegram_thread_not_found(error: Exception) -> bool:
     """Check if a Telegram error is a thread-not-found failure.
 
@@ -825,7 +1315,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    miniapp_bot_username=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -834,8 +1333,34 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     instead, bypassing MarkdownV2 conversion.
     """
     try:
-        from telegram import Bot
+        from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+        from telegram import InputMediaPhoto, InputMediaVideo
         from telegram.constants import ParseMode
+
+        message, miniapp_button_rows = _extract_telegram_miniapp_button_spec(
+            message,
+            bot_username=miniapp_bot_username,
+            use_web_app=_miniapp_supports_web_app_button_for_chat_id(chat_id),
+        )
+        miniapp_reply_markup = None
+        if miniapp_button_rows:
+            def _miniapp_inline_button(button):
+                if button.get("web_app_url"):
+                    return InlineKeyboardButton(
+                        button["text"],
+                        web_app=WebAppInfo(url=button["web_app_url"]),
+                    )
+                return InlineKeyboardButton(button["text"], url=button["url"])
+
+            miniapp_reply_markup = InlineKeyboardMarkup(
+                [
+                    [
+                        _miniapp_inline_button(button)
+                        for button in row
+                    ]
+                    for row in miniapp_button_rows
+                ]
+            )
 
         # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
         # Inspired by github.com/ashaney — PR #1568.
@@ -910,11 +1435,24 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         text_kwargs = dict(thread_kwargs)
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
+        if miniapp_reply_markup is not None:
+            text_kwargs["reply_markup"] = miniapp_reply_markup
 
         last_msg = None
         warnings = []
 
-        if formatted.strip():
+        caption_media_path = None
+        caption_text = None
+        if message.strip() and len(message) <= 1024 and not force_document:
+            for media_path, is_voice in media_files:
+                ext = os.path.splitext(media_path)[1].lower()
+                if ext in _IMAGE_EXTS and not is_voice and os.path.exists(media_path):
+                    caption_media_path = media_path
+                    caption_text = message
+                    break
+
+        miniapp_markup_sent = False
+        if formatted.strip() and caption_text is None:
             try:
                 last_msg = await _send_telegram_message_with_retry(
                     bot,
@@ -922,10 +1460,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     parse_mode=send_parse_mode, **text_kwargs
                 )
             except Exception as md_error:
-                # Thread not found — retry without message_thread_id so the
-                # message still delivers (matching the gateway adapter's
-                # fallback behaviour, issue #27012).
+                # Never escape a group topic into General. For private chats a
+                # stale DM-topic ID may still use the legacy root-DM fallback.
                 if _is_telegram_thread_not_found(md_error) and thread_kwargs:
+                    if int_chat_id < 0:
+                        raise
                     logger.warning(
                         "Thread %s not found in _send_telegram, retrying without message_thread_id",
                         thread_kwargs.get("message_thread_id"),
@@ -957,8 +1496,86 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     )
                 else:
                     raise
+            miniapp_markup_sent = miniapp_reply_markup is not None
+
+        sent_media_group_paths = set()
+        if media_files and not force_document and miniapp_reply_markup is None:
+            album_candidates = []
+            for media_path, is_voice in media_files:
+                if is_voice or not os.path.exists(media_path):
+                    continue
+                ext = os.path.splitext(media_path)[1].lower()
+                if ext in (_IMAGE_EXTS - {".gif"}) or ext in _VIDEO_EXTS:
+                    album_candidates.append((media_path, ext))
+
+            if len(album_candidates) >= 2:
+                for start in range(0, len(album_candidates), 10):
+                    chunk = album_candidates[start:start + 10]
+                    opened_files = []
+                    media_group = []
+                    try:
+                        for offset, (media_path, ext) in enumerate(chunk):
+                            fh = open(media_path, "rb")
+                            opened_files.append(fh)
+                            caption = (
+                                caption_text
+                                if start == 0 and offset == 0 and caption_text
+                                else None
+                            )
+                            if ext in (_IMAGE_EXTS - {".gif"}):
+                                media_group.append(InputMediaPhoto(media=fh, caption=caption))
+                            else:
+                                media_group.append(InputMediaVideo(media=fh, caption=caption))
+
+                        media_kwargs = dict(thread_kwargs)
+                        try:
+                            group_result = await bot.send_media_group(
+                                chat_id=int_chat_id,
+                                media=media_group,
+                                **media_kwargs,
+                            )
+                        except Exception as media_group_err:
+                            if (
+                                _is_telegram_thread_not_found(media_group_err)
+                                and media_kwargs.get("message_thread_id")
+                            ):
+                                if int_chat_id < 0:
+                                    raise
+                                logger.warning(
+                                    "Thread %s not found for media group send, retrying without message_thread_id",
+                                    media_kwargs["message_thread_id"],
+                                )
+                                for fh in opened_files:
+                                    fh.seek(0)
+                                media_kwargs.pop("message_thread_id", None)
+                                group_result = await bot.send_media_group(
+                                    chat_id=int_chat_id,
+                                    media=media_group,
+                                    **media_kwargs,
+                                )
+                            else:
+                                raise
+
+                        if group_result:
+                            last_msg = group_result[-1]
+                            sent_media_group_paths.update(path for path, _ in chunk)
+                    except Exception as e:
+                        warning = _sanitize_error_text(
+                            f"Failed to send Telegram media group; falling back to individual media: {e}"
+                        )
+                        logger.warning(warning)
+                        warnings.append(warning)
+                        break
+                    finally:
+                        for fh in opened_files:
+                            try:
+                                fh.close()
+                            except Exception:
+                                pass
 
         for media_path, is_voice in media_files:
+            if media_path in sent_media_group_paths:
+                continue
             if not os.path.exists(media_path):
                 warning = f"Media file not found, skipping: {media_path}"
                 logger.warning(warning)
@@ -969,11 +1586,22 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 with open(media_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)
+                    media_caption = caption_text if media_path == caption_media_path else None
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
-                            last_msg = await bot.send_photo(
-                                chat_id=int_chat_id, photo=f, **media_kwargs
+                            photo_kwargs = dict(media_kwargs)
+                            if media_caption:
+                                photo_kwargs["caption"] = media_caption
+                            attach_miniapp_markup = (
+                                miniapp_reply_markup is not None and not miniapp_markup_sent
                             )
+                            if attach_miniapp_markup:
+                                photo_kwargs["reply_markup"] = miniapp_reply_markup
+                            last_msg = await bot.send_photo(
+                                chat_id=int_chat_id, photo=f, **photo_kwargs
+                            )
+                            if attach_miniapp_markup:
+                                miniapp_markup_sent = True
                         elif ext in _VIDEO_EXTS:
                             last_msg = await bot.send_video(
                                 chat_id=int_chat_id, video=f, **media_kwargs
@@ -992,8 +1620,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             )
                     except Exception as media_err:
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
-                            # Thread not found for media — retry without
-                            # message_thread_id (issue #27012).
+                            if int_chat_id < 0:
+                                raise
+                            # Private-chat DM topic fallback only.
                             logger.warning(
                                 "Thread %s not found for media send, retrying without message_thread_id",
                                 media_kwargs["message_thread_id"],
@@ -1002,9 +1631,19 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             f.seek(0)
                             media_kwargs.pop("message_thread_id", None)
                             if ext in _IMAGE_EXTS and not force_document:
-                                last_msg = await bot.send_photo(
-                                    chat_id=int_chat_id, photo=f, **media_kwargs
+                                photo_kwargs = dict(media_kwargs)
+                                if media_caption:
+                                    photo_kwargs["caption"] = media_caption
+                                attach_miniapp_markup = (
+                                    miniapp_reply_markup is not None and not miniapp_markup_sent
                                 )
+                                if attach_miniapp_markup:
+                                    photo_kwargs["reply_markup"] = miniapp_reply_markup
+                                last_msg = await bot.send_photo(
+                                    chat_id=int_chat_id, photo=f, **photo_kwargs
+                                )
+                                if attach_miniapp_markup:
+                                    miniapp_markup_sent = True
                             elif ext in _VIDEO_EXTS:
                                 last_msg = await bot.send_video(
                                     chat_id=int_chat_id, video=f, **media_kwargs
