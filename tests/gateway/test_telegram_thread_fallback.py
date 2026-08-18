@@ -1638,8 +1638,8 @@ def test_reads_and_non_miniapp_tools_do_not_map_to_buttons(tool_name):
         ("planning", "Открыть планирование"),
         ("menu", "Открыть меню"),
         ("shopping", "Открыть списки"),
-        ("shopping_buy_0JLQsNC-0YHRgtC-0Lk", "Открыть: купить"),
-        ("shopping_take_0JLQsNC-0YHRgtC-0Lk", "Открыть: взять"),
+        ("shopping_buy_0JLQsNC-0YHRgtC-0Lk", "Открыть списки"),
+        ("shopping_take_0JLQsNC-0YHRgtC-0Lk", "Открыть списки"),
         ("boxmap", "Открыть сценарии"),
         ("social", "Открыть публикации"),
     ],
@@ -1663,7 +1663,7 @@ def test_shopping_mutation_contract_preserves_case_sensitive_list_target():
     )
 
     assert recorded == start_param
-    assert adapter._miniapp_button_label(recorded) == "Открыть: взять"
+    assert adapter._miniapp_button_label(recorded) == "Открыть списки"
 
 
 @pytest.mark.asyncio
