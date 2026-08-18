@@ -329,7 +329,7 @@ async def test_on_processing_complete_success_can_clear(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction=None,
+        reaction=[],
     )
 
 
@@ -374,7 +374,7 @@ async def test_on_processing_complete_clears_when_configured_reaction_fails(monk
     assert adapter._bot.set_message_reaction.await_args_list[1].kwargs == {
         "chat_id": 123,
         "message_id": 456,
-        "reaction": None,
+        "reaction": [],
     }
 
 
@@ -407,13 +407,12 @@ async def test_on_processing_complete_cancelled_clears_reaction(monkeypatch):
 
     await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
 
-    # set_message_reaction with reaction=None clears all reactions on the
-    # message (Bot API documented semantics; equivalent to Bot API 10.0's
-    # deleteMessageReaction but works on PTB 22.6 already).
+    # An explicit empty reaction list clears all bot-set reactions without
+    # triggering PTB's invalid Reaction_empty serialization path.
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction=None,
+        reaction=[],
     )
 
 
@@ -493,7 +492,7 @@ async def test_control_silent_clears_lifecycle_reaction(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction=None,
+        reaction=[],
     )
 
 

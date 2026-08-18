@@ -2063,8 +2063,10 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_versions = []
+                self._last_drained_steer_versions = []
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, input_version: Optional[int] = None) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -2092,12 +2094,24 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if input_version is not None:
+                versions = getattr(self, "_pending_steer_versions", None)
+                if versions is None:
+                    versions = []
+                    self._pending_steer_versions = versions
+                versions.append(int(input_version))
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            if input_version is not None:
+                versions = getattr(self, "_pending_steer_versions", None)
+                if versions is None:
+                    versions = []
+                    self._pending_steer_versions = versions
+                versions.append(int(input_version))
         return True
 
     def _drain_pending_steer(self) -> Optional[str]:
@@ -2110,11 +2124,29 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            self._last_drained_steer_versions = list(
+                getattr(self, "_pending_steer_versions", []) or []
+            )
+            self._pending_steer_versions = []
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            self._last_drained_steer_versions = list(
+                getattr(self, "_pending_steer_versions", []) or []
+            )
+            self._pending_steer_versions = []
         return text
+
+    def _notify_drained_steer_consumed(self) -> None:
+        """Acknowledge only steer versions actually injected into model input."""
+        versions = list(
+            getattr(self, "_last_drained_steer_versions", []) or []
+        )
+        self._last_drained_steer_versions = []
+        callback = getattr(self, "_durable_steer_consumed_callback", None)
+        if versions and callable(callback):
+            callback(max(versions))
 
     def _record_file_mutation_result(
         self,

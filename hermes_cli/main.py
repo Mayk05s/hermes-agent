@@ -13067,6 +13067,19 @@ Examples:
     )
     config_set.add_argument("value", nargs="?", help="Value to set")
 
+    # config topic-response
+    config_topic_response = config_subparsers.add_parser(
+        "topic-response",
+        help="Set one Telegram topic to answer all messages or mentions only",
+    )
+    config_topic_response.add_argument("chat_id", type=int, help="Telegram chat ID")
+    config_topic_response.add_argument("thread_id", type=int, help="Telegram topic/thread ID")
+    config_topic_response.add_argument(
+        "mode",
+        choices=("all", "mentions", "default"),
+        help="all=no mention required; mentions=require mention; default=remove override",
+    )
+
     # config path
     config_subparsers.add_parser("path", help="Print config file path")
 

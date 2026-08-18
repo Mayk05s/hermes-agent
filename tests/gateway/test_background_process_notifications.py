@@ -24,8 +24,9 @@ from gateway.run import GatewayRunner, _parse_session_key
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
 
-    def __init__(self, sessions):
+    def __init__(self, sessions, *, completion_consumed=False):
         self._sessions = list(sessions)
+        self._completion_consumed = completion_consumed
 
     def get(self, session_id):
         if self._sessions:
@@ -33,7 +34,7 @@ class _FakeRegistry:
         return None
 
     def is_completion_consumed(self, session_id):
-        return False
+        return self._completion_consumed
 
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
@@ -355,6 +356,43 @@ async def test_agent_notification_no_message_id_is_tolerated(monkeypatch, tmp_pa
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.message_id is None
+
+
+@pytest.mark.asyncio
+async def test_consumed_agent_notification_does_not_leak_raw_output(monkeypatch, tmp_path):
+    """A result consumed by process(wait/poll/log) stays inside the active turn."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="private traceback\n", exited=True, exit_code=1,
+        command="node listener.js",
+    )]
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry(sessions, completion_consumed=True),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = {
+        "session_id": "proc_consumed",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:group:-100:2",
+        "platform": "telegram",
+        "chat_id": "-100",
+        "thread_id": "2",
+        "notify_on_complete": True,
+    }
+
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

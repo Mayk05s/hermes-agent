@@ -74,6 +74,22 @@ class _AuthRunner:
         return self.authorized
 
 
+class _PairingRunner:
+    def __init__(self, resolution=None):
+        self.config = None
+        self.resolve = MagicMock(return_value=resolution)
+
+    async def _handle_message(self, event):
+        return None
+
+    def _resolve_chat_pairing_request(self, entry_id, *, action, approval_scope):
+        return self.resolve(
+            entry_id,
+            action=action,
+            approval_scope=approval_scope,
+        )
+
+
 # ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
@@ -254,6 +270,109 @@ class TestTelegramExecApproval:
         kwargs = adapter._bot.send_message.call_args[1]
         assert "..." in kwargs["text"]
         assert len(kwargs["text"]) < 5000
+
+
+class TestTelegramChatPairingPrompt:
+    @pytest.mark.asyncio
+    async def test_sends_owner_dm_with_persistent_callback_buttons(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[SimpleNamespace(message_id=1), SimpleNamespace(message_id=2)]
+        )
+
+        class RecordingButton:
+            def __init__(self, text, **kwargs):
+                self.text = text
+                self.callback_data = kwargs.get("callback_data")
+
+        class RecordingMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.InlineKeyboardButton",
+            RecordingButton,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.InlineKeyboardMarkup",
+            RecordingMarkup,
+        )
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111,*,222")
+        monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+
+        delivered = await adapter.send_chat_pairing_request(
+            entry_id="abc123",
+            chat_id="-100555",
+            chat_name="Research <Group>",
+            chat_type="forum",
+            thread_id="35",
+            requester_user_name="Alice & Bob",
+        )
+
+        assert delivered == 2
+        assert [
+            call.kwargs["chat_id"] for call in adapter._bot.send_message.await_args_list
+        ] == [111, 222]
+        first = adapter._bot.send_message.await_args_list[0].kwargs
+        assert "Research &lt;Group&gt;" in first["text"]
+        callbacks = [
+            button.callback_data
+            for row in first["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert callbacks == ["pa:t:abc123", "pa:c:abc123", "pa:x:abc123"]
+
+
+class TestTelegramChatPairingCallback:
+    @staticmethod
+    def _query(data: str, user_id: int = 111):
+        query = AsyncMock()
+        query.data = data
+        query.message = MagicMock()
+        query.message.chat_id = user_id
+        query.message.chat.type = "private"
+        query.message.text = "Запрос доступа"
+        query.from_user = MagicMock()
+        query.from_user.id = user_id
+        query.from_user.first_name = "Owner"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock()
+        return query
+
+    @pytest.mark.asyncio
+    async def test_owner_approves_whole_chat(self, monkeypatch):
+        adapter = _make_adapter()
+        runner = _PairingRunner(resolution={"status": "approved"})
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:c:abc123")
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        runner.resolve.assert_called_once_with(
+            "abc123",
+            action="approve",
+            approval_scope="chat",
+        )
+        assert "одобрен" in query.answer.await_args.kwargs["text"].lower()
+        query.edit_message_text.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_owner_cannot_reject_request(self, monkeypatch):
+        adapter = _make_adapter()
+        runner = _PairingRunner(resolution={"status": "rejected"})
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:x:abc123", user_id=222)
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        runner.resolve.assert_not_called()
+        assert "только владелец" in query.answer.await_args.kwargs["text"].lower()
+        query.edit_message_text.assert_not_awaited()
 # _handle_callback_query — approval button clicks
 # ===========================================================================
 

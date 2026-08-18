@@ -2292,9 +2292,18 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
                     agent._pending_steer = agent._pending_steer + "\n" + steer_text
                 else:
                     agent._pending_steer = steer_text
+                agent._pending_steer_versions = (
+                    list(getattr(agent, "_last_drained_steer_versions", []) or [])
+                    + list(getattr(agent, "_pending_steer_versions", []) or [])
+                )
         else:
             existing = getattr(agent, "_pending_steer", None)
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+            agent._pending_steer_versions = (
+                list(getattr(agent, "_last_drained_steer_versions", []) or [])
+                + list(getattr(agent, "_pending_steer_versions", []) or [])
+            )
+        agent._last_drained_steer_versions = []
         return
     marker = f"\n\nUser guidance: {steer_text}"
     existing_content = messages[target_idx].get("content", "")
@@ -2315,6 +2324,10 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
+    try:
+        agent._notify_drained_steer_consumed()
+    except Exception:
+        _ra().logger.exception("Durable steer-consumption callback failed")
 
 
 

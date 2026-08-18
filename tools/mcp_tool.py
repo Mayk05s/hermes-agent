@@ -2932,9 +2932,40 @@ def _guard_chainremind_origin_target(
         return None
     if not isinstance(args, dict):
         return None
+    # A bare mention of Calendar is not a positive Calendar write request.  In
+    # particular, corrections such as "при чём тут календарь" and "не в
+    # календарь, просто напомни" explicitly reject that routing.
+    calendar_write_intent = re.search(
+        r"(?is)(?:"
+        r"(?:добав(?:ь|ить)|созда(?:й|ть)|запиш(?:и|ите|ать)|постав(?:ь|ить)|"
+        r"внес(?:и|ите|ти)|удал(?:и|ите|ить)|отмен(?:и|ите|ить)|"
+        r"перенес(?:и|ите|ти)|измен(?:и|ите|ить))[^\n.!?]{0,80}календ|"
+        r"календ[^\n.!?]{0,80}(?:добав(?:ь|ить)|созда(?:й|ть)|запиш(?:и|ите|ать)|"
+        r"постав(?:ь|ить)|внес(?:и|ите|ти)|удал(?:и|ите|ить)|"
+        r"отмен(?:и|ите|ить)|перенес(?:и|ите|ти)|измен(?:и|ите|ить))|"
+        r"(?:add|create|put|record|delete|remove|cancel|move|reschedule|update|change)"
+        r"[^\n.!?]{0,80}\bcalendar\b|"
+        r"\bcalendar\b[^\n.!?]{0,80}(?:add|create|put|record|delete|remove|cancel|"
+        r"move|reschedule|update|change)"
+        r")",
+        user_task or "",
+    )
+    calendar_rejection = re.search(
+        r"(?is)(?:"
+        r"(?:\bне\b|\bникак\b|\bпри\s+ч[её]м\s+тут\b|\bприч[её]м\s+тут\b)"
+        r"[^\n.!?]{0,35}календ|"
+        r"календ[^\n.!?]{0,35}(?:\bне\s+(?:нуж|надо|использ|добав|созда|запис)|"
+        r"\bни\s+при\s+ч[её]м\b)|"
+        r"(?:\bnot\b|\bdon't\b|\bdo\s+not\b|\bwhy\b)"
+        r"[^\n.!?]{0,35}\bcalendar\b|"
+        r"\bcalendar\b[^\n.!?]{0,35}(?:\bisn't\b|\bis\s+not\b|\bnot\s+needed\b)"
+        r")",
+        user_task or "",
+    )
     if (
         tool_name in {"create_reminder", "update_reminder", "delete_reminder"}
-        and re.search(r"(?i)(?:\bcalendar\b|календ)", user_task or "")
+        and calendar_write_intent
+        and not calendar_rejection
     ):
         return json.dumps(
             {

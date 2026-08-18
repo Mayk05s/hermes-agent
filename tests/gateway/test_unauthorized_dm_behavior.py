@@ -61,12 +61,18 @@ def _make_runner(platform: Platform, config: GatewayConfig):
 
     runner = object.__new__(GatewayRunner)
     runner.config = config
-    adapter = SimpleNamespace(send=AsyncMock())
+    adapter = SimpleNamespace(
+        send=AsyncMock(),
+        send_chat_pairing_request=AsyncMock(return_value=1),
+    )
     runner.adapters = {platform: adapter}
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     runner.pairing_store.is_chat_approved.return_value = False
     runner.pairing_store._is_rate_limited.return_value = False
+    runner.pairing_store.get_pending_entry.return_value = {
+        "subject_type": "chat",
+    }
     runner._profile_route_config = lambda: normalize_profile_routes_config(None)
     # Attributes required by _handle_message for the authorized-user path
     runner._running_agents = {}
@@ -487,7 +493,20 @@ async def test_unauthorized_telegram_group_mention_creates_chat_pairing_request(
         requester_user_name="Наталия",
     )
     adapter.send.assert_awaited_once()
-    assert "Pairing request sent" in adapter.send.await_args.args[1]
+    assert "личный чат" in adapter.send.await_args.args[1]
+    adapter.send_chat_pairing_request.assert_awaited_once_with(
+        entry_id="pairing-telegram--5274164515-chat",
+        chat_id="-5274164515",
+        chat_name="Only me b2+",
+        chat_type="group",
+        thread_id="",
+        requester_user_id="367599252",
+        requester_user_name="Наталия",
+    )
+    runner.pairing_store.mark_owner_notified.assert_called_once_with(
+        "telegram",
+        "pairing-telegram--5274164515-chat",
+    )
 
 
 @pytest.mark.asyncio

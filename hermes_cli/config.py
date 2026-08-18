@@ -22,9 +22,20 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -5822,6 +5833,127 @@ def set_config_value(key: str, value: str):
     print(f"✓ Set {key} = {value} in {config_path}")
 
 
+@contextmanager
+def _telegram_topic_rules_file_lock(config_path: Path):
+    """Serialize topic-rule read/modify/write cycles across processes."""
+    lock_path = config_path.with_suffix(config_path.suffix + ".topic-rules.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fcntl is None and msvcrt is None:
+        with _CONFIG_LOCK:
+            yield
+        return
+
+    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+        lock_path.write_text(" ", encoding="utf-8")
+
+    with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
+        if fcntl:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        else:
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            with _CONFIG_LOCK:
+                yield
+        finally:
+            if fcntl:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
+            else:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
+
+
+def set_telegram_topic_response_mode(chat_id: int, thread_id: int, mode: str) -> Path:
+    """Upsert one Telegram topic response rule in the gateway's main config.
+
+    ``mode`` is ``all`` (no mention required), ``mentions`` (mention required),
+    or ``default`` (remove the exact topic override).  The main Hermes root is
+    intentional: Telegram trigger gating happens before profile routing, so a
+    profile-local config cannot be authoritative for this policy.
+    """
+    if is_managed():
+        managed_error("set Telegram topic response mode")
+        raise RuntimeError("Telegram topic response mode is managed externally")
+
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode not in {"all", "mentions", "default"}:
+        raise ValueError("mode must be one of: all, mentions, default")
+
+    from hermes_constants import get_default_hermes_root
+    from utils import atomic_yaml_write
+
+    config_path = get_default_hermes_root() / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    target_chat = str(chat_id)
+    target_thread = str(thread_id)
+
+    with _telegram_topic_rules_file_lock(config_path):
+        if config_path.exists():
+            try:
+                with config_path.open(encoding="utf-8") as config_file:
+                    user_config = yaml.safe_load(config_file) or {}
+            except Exception as exc:
+                raise ValueError(f"Cannot update invalid YAML in {config_path}: {exc}") from exc
+        else:
+            user_config = {}
+
+        if not isinstance(user_config, dict):
+            raise ValueError(f"Cannot update non-mapping config in {config_path}")
+
+        telegram_cfg = user_config.setdefault("telegram", {})
+        if not isinstance(telegram_cfg, dict):
+            raise ValueError("telegram config must be a mapping")
+        telegram_extra = telegram_cfg.setdefault("extra", {})
+        if not isinstance(telegram_extra, dict):
+            raise ValueError("telegram.extra config must be a mapping")
+        existing_rules = telegram_extra.get("topic_response_rules", [])
+        if existing_rules is None:
+            existing_rules = []
+        if not isinstance(existing_rules, list):
+            raise ValueError("telegram.extra.topic_response_rules must be a list")
+
+        replacement = None
+        if normalized_mode != "default":
+            replacement = {
+                "chat_id": int(chat_id),
+                "thread_id": int(thread_id),
+                "require_mention": normalized_mode == "mentions",
+            }
+
+        updated_rules = []
+        target_written = False
+        for rule in existing_rules:
+            is_target = (
+                isinstance(rule, dict)
+                and str(rule.get("chat_id", "")) == target_chat
+                and str(rule.get("thread_id", "")) == target_thread
+            )
+            if not is_target:
+                updated_rules.append(rule)
+                continue
+            if replacement is not None and not target_written:
+                merged_rule = dict(rule)
+                merged_rule.update(replacement)
+                updated_rules.append(merged_rule)
+                target_written = True
+
+        if replacement is not None and not target_written:
+            updated_rules.append(replacement)
+
+        telegram_extra["topic_response_rules"] = updated_rules
+        atomic_yaml_write(config_path, user_config, sort_keys=False)
+        _secure_file(config_path)
+
+    return config_path
+
+
 # =============================================================================
 # Command handler
 # =============================================================================
@@ -5848,6 +5980,19 @@ def config_command(args):
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             sys.exit(1)
         set_config_value(key, value)
+
+    elif subcmd == "topic-response":
+        chat_id = getattr(args, 'chat_id', None)
+        thread_id = getattr(args, 'thread_id', None)
+        mode = getattr(args, 'mode', None)
+        if chat_id is None or thread_id is None or mode is None:
+            print("Usage: hermes config topic-response <chat_id> <thread_id> <all|mentions|default>")
+            sys.exit(1)
+        config_path = set_telegram_topic_response_mode(chat_id, thread_id, mode)
+        print(
+            f"✓ Telegram topic {chat_id}:{thread_id} response mode = {mode} "
+            f"in {config_path} (effective on the next message)"
+        )
     
     elif subcmd == "path":
         print(get_config_path())

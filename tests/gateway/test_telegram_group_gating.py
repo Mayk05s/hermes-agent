@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    topic_response_rules=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -32,6 +33,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if topic_response_rules is not None:
+        extra["topic_response_rules"] = topic_response_rules
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -436,6 +439,38 @@ def test_observed_group_context_preserves_slash_command_text_for_dispatch():
     assert "observed Telegram group context" in attributed.channel_prompt
 
 
+def test_group_attribution_preserves_voice_dispatch_eligibility():
+    from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
+
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            user_id="111",
+            user_name="Alice",
+            chat_type="group",
+            thread_id="2",
+        ),
+        raw_message=_group_message(""),
+        telegram_agent_dispatch_eligible=True,
+        telegram_passive_audio_transcription=True,
+    )
+
+    attributed = adapter._apply_telegram_group_observe_attribution(event)
+
+    assert attributed.telegram_agent_dispatch_eligible is True
+    assert attributed.telegram_passive_audio_transcription is True
+    assert attributed.source.user_id is None
+
+
 def test_unmentioned_group_observe_does_not_require_chat_allowlist_for_shared_context():
     async def _run():
         adapter = _make_adapter(
@@ -640,7 +675,7 @@ def test_group_messages_can_require_direct_trigger_via_config():
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
 
 
-def test_explicit_multi_bot_mentions_route_only_to_named_bots():
+def test_reply_to_this_bot_wins_over_other_bot_mentions():
     text = "@research_bot @ops_bot hi"
     entities = _mention_entities(text, ["@research_bot", "@ops_bot"])
 
@@ -648,21 +683,35 @@ def test_explicit_multi_bot_mentions_route_only_to_named_bots():
     research_bot = _make_adapter(require_mention=True, bot_username="research_bot")
     ops_bot = _make_adapter(require_mention=True, bot_username="ops_bot")
 
-    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True, entities=entities)) is False
+    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True, entities=entities)) is True
     assert research_bot._should_process_message(_group_message(text, entities=entities)) is True
     assert ops_bot._should_process_message(_group_message(text, entities=entities)) is True
 
 
-def test_entityless_multi_bot_mentions_still_route_exclusively():
+def test_entityless_other_bot_mentions_do_not_override_reply_to_this_bot():
     text = "@research_bot @ops_bot hi"
 
     default_bot = _make_adapter(require_mention=True, bot_username="default_bot")
     research_bot = _make_adapter(require_mention=True, bot_username="research_bot")
     ops_bot = _make_adapter(require_mention=True, bot_username="ops_bot")
 
-    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True)) is False
+    assert default_bot._should_process_message(_group_message(text, reply_to_bot=True)) is True
     assert research_bot._should_process_message(_group_message(text)) is True
     assert ops_bot._should_process_message(_group_message(text)) is True
+
+
+def test_reply_to_other_bot_does_not_bypass_require_mention():
+    adapter = _make_adapter(require_mention=True, bot_username="default_bot")
+    message = _group_message("reply to another bot")
+    message.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=12345),
+        message_id=10,
+        text="other bot reply",
+        caption=None,
+    )
+
+    assert adapter._is_reply_to_bot(message) is False
+    assert adapter._should_process_message(message) is False
 
 
 def test_intern_bots_ignore_messages_addressed_to_other_intern_bot():
@@ -671,7 +720,7 @@ def test_intern_bots_ignore_messages_addressed_to_other_intern_bot():
     test2_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber2bot")
     test1_bot = _make_adapter(require_mention=False, bot_username="Interntestnumber1bot")
 
-    assert test2_bot._should_process_message(_group_message(text, reply_to_bot=True)) is False
+    assert test2_bot._should_process_message(_group_message(text, reply_to_bot=True)) is True
     assert test1_bot._should_process_message(_group_message(text)) is True
 
 
@@ -711,6 +760,102 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_topic_response_rule_overrides_global_require_mention():
+    adapter = _make_adapter(
+        require_mention=True,
+        topic_response_rules=[
+            {"chat_id": "-200", "thread_id": 7, "require_mention": False},
+            {"chat_id": "-200", "thread_id": 8, "require_mention": True},
+        ],
+    )
+
+    assert adapter._should_process_message(_group_message("no mention", chat_id=-200, thread_id=7)) is True
+    assert adapter._should_process_message(_group_message("no mention", chat_id=-200, thread_id=8)) is False
+    assert adapter._should_process_message(_group_message("no mention", chat_id=-201, thread_id=7)) is False
+
+
+def test_topic_response_rules_hot_reload_without_rebuilding_adapter(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "telegram:\n"
+        "  extra:\n"
+        "    require_mention: true\n"
+        "    topic_response_rules:\n"
+        "      - chat_id: -200\n"
+        "        thread_id: 7\n"
+        "        require_mention: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    adapter = _make_adapter(
+        require_mention=True,
+        topic_response_rules=[
+            {"chat_id": -200, "thread_id": 7, "require_mention": True},
+        ],
+    )
+    adapter._topic_response_rules_hot_reload = True
+    message = _group_message("no mention", chat_id=-200, thread_id=7)
+
+    assert adapter._should_process_message(message) is False
+
+    config_path.write_text(
+        "telegram:\n"
+        "  extra:\n"
+        "    require_mention: true\n"
+        "    topic_response_rules:\n"
+        "      - chat_id: -200\n"
+        "        thread_id: 7\n"
+        "        require_mention: false\n",
+        encoding="utf-8",
+    )
+
+    assert adapter._should_process_message(message) is True
+
+    config_path.write_text(
+        "telegram:\n"
+        "  extra:\n"
+        "    require_mention: true\n"
+        "    topic_response_rules: []\n",
+        encoding="utf-8",
+    )
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_topic_response_rule_can_require_mention_when_global_is_open():
+    adapter = _make_adapter(
+        require_mention=False,
+        topic_response_rules=[
+            {"chat_id": "-200", "thread_id": 7, "require_mention": True},
+        ],
+    )
+
+    assert adapter._should_process_message(_group_message("no mention", chat_id=-200, thread_id=7)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            thread_id=7,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+
+
+def test_free_response_chat_is_stronger_than_topic_response_rule():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        topic_response_rules=[
+            {"chat_id": "-200", "thread_id": 7, "require_mention": True},
+        ],
+    )
+
+    assert adapter._should_process_message(_group_message("no mention", chat_id=-200, thread_id=7)) is True
 
 
 def test_chat_settings_response_mode_all_bypasses_mention_requirement(monkeypatch):
@@ -1021,6 +1166,30 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
     assert tg_cfg.extra.get("voice_trigger_keywords") == ["трипио", "tripioo"]
     assert tg_cfg.extra.get("voice_trigger_aliases") == ["3p"]
+
+
+def test_config_bridges_telegram_extra_topic_response_rules(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  extra:\n"
+        "    topic_response_rules:\n"
+        "      - chat_id: \"-100\"\n"
+        "        thread_id: 7\n"
+        "        require_mention: false\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = load_gateway_config()
+
+    assert config is not None
+    tg_cfg = config.platforms.get(Platform.TELEGRAM)
+    assert tg_cfg is not None
+    assert tg_cfg.extra.get("topic_response_rules") == [
+        {"chat_id": "-100", "thread_id": 7, "require_mention": False}
+    ]
 
 
 def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):

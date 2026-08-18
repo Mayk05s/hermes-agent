@@ -12,11 +12,14 @@ These tests confirm that:
   3. Mixed media lists (voice + audio) split correctly.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.durable_jobs import DurableJobStore
+from gateway.job_router import JobRouteDecision
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -150,6 +153,7 @@ async def test_telegram_voice_rule_transcript_only_posts_plain_text_and_preserve
         result = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
 
     assert result is None
+    assert "Сегодня обсуждали билеты" in event.telegram_transcript_only_history_text
     adapter.send.assert_awaited_once_with(
         "-1003966683704",
         "Сегодня обсуждали билеты",
@@ -318,6 +322,232 @@ async def test_passive_voice_with_transcription_and_audio_trigger_stays_transcri
         reply_to="321",
         metadata=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_addressed_voice_continues_after_transcript_without_keyword():
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={"voice_trigger_keywords": ["tripioo"]},
+    )
+    runner._gateway_chat_settings_raw = lambda: {
+        "settings": [
+            {
+                "platform": "telegram",
+                "chat_id": "-200",
+                "audio_trigger": "on",
+                "show_transcription": "on",
+            }
+        ]
+    }
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-200", chat_type="group")
+    # TelegramAdapter sets this from the pre-STT ordinary router.  It covers
+    # response_mode=all/free-response, a direct mention, or a reply to this bot.
+    event.telegram_agent_dispatch_eligible = True
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "обсуждаем семейные планы", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=event.source, history=[])
+
+    assert result is not None
+    assert "обсуждаем семейные планы" in result
+    assert "voice transcription rule matched" not in result
+    adapter.send.assert_awaited_once_with(
+        "-200",
+        "обсуждаем семейные планы",
+        reply_to="321",
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_voice_routes_job_only_after_stt_enrichment(tmp_path):
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_trigger": True,
+            "show_transcription": True,
+            "voice_trigger_keywords": ["tripioo"],
+        },
+    )
+    runner._durable_job_store = DurableJobStore(tmp_path / "jobs.sqlite3")
+    runner._job_route_locks = {}
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    event = _voice_event(chat_id="-200", chat_type="group", thread_id="2")
+    event.telegram_agent_dispatch_eligible = True
+    thread_key = "agent:main:telegram:group:-200:2"
+
+    with (
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={
+                "success": True,
+                "transcript": "Включи охрану сразу, без задержки",
+                "provider": "whisper",
+            },
+        ) as transcribe,
+        patch(
+            "gateway.job_router.decide_job_route",
+            new=AsyncMock(
+                return_value=JobRouteDecision(
+                    action="new_job",
+                    confidence=0.99,
+                    reason="voice command",
+                )
+            ),
+        ),
+    ):
+        job, handled = await runner._ensure_durable_job_route(
+            event, event.source, thread_key
+        )
+
+    assert handled is False
+    assert job is not None
+    assert "Включи охрану сразу" in job["request_text"]
+    assert event.telegram_voice_preprocessed is True
+    assert event.telegram_voice_transcript_only is False
+    assert "Включи охрану сразу" in event.durable_request_text
+    transcribe.assert_called_once_with("/tmp/voice.ogg")
+    adapter.send.assert_awaited_once()
+
+    # Job execution consumes the already prepared text and must not repeat STT
+    # or post a second transcript bubble.
+    with patch("tools.transcription_tools.transcribe_audio") as second_stt:
+        prepared_again = await runner._prepare_inbound_message_text(
+            event=event,
+            source=event.source,
+            history=[],
+        )
+    second_stt.assert_not_called()
+    assert "Включи охрану сразу" in prepared_again
+    adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_durable_transcript_only_is_public_context_not_job(tmp_path):
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={
+            "audio_trigger": True,
+            "show_transcription": True,
+            "voice_trigger_keywords": ["tripioo"],
+        },
+    )
+    runner._durable_job_store = DurableJobStore(tmp_path / "jobs.sqlite3")
+    runner._job_route_locks = {}
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SimpleNamespace(
+        session_id="public-topic-session"
+    )
+    runner.session_store.load_transcript.return_value = []
+    event = _voice_event(chat_id="-200", chat_type="group", thread_id="2")
+    thread_key = "agent:main:telegram:group:-200:2"
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "Это фоновый контекст без обращения к боту",
+            "provider": "whisper",
+        },
+    ) as transcribe:
+        job, handled = await runner._ensure_durable_job_route(
+            event, event.source, thread_key
+        )
+
+    assert handled is True
+    assert job is None
+    inbox = runner._durable_job_store.get_inbox_event(event.durable_inbox_id)
+    assert inbox["status"] == "context_only"
+    assert "фоновый контекст" in inbox["request_text"]
+    assert runner._durable_job_store.active_jobs() == []
+    runner.session_store.append_to_transcript.assert_called_once()
+    public_entry = runner.session_store.append_to_transcript.call_args.args[1]
+    assert "фоновый контекст" in public_entry["content"]
+
+    # Telegram redelivery reuses the context-only inbox row without another STT
+    # call, transcript bubble, or public-history duplicate.
+    duplicate = _voice_event(chat_id="-200", chat_type="group", thread_id="2")
+    with patch("tools.transcription_tools.transcribe_audio") as duplicate_stt:
+        duplicate_job, duplicate_handled = await runner._ensure_durable_job_route(
+            duplicate, duplicate.source, thread_key
+        )
+    duplicate_stt.assert_not_called()
+    assert duplicate_job is None
+    assert duplicate_handled is True
+    assert transcribe.call_count == 1
+    runner.session_store.append_to_transcript.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_raw_voice_by_transcribing_before_job_route(tmp_path):
+    runner = _make_runner(stt_enabled=True)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test",
+        extra={"audio_trigger": True, "show_transcription": False},
+    )
+    runner._durable_job_store = DurableJobStore(tmp_path / "jobs.sqlite3")
+    runner._job_route_locks = {}
+    runner.adapters[Platform.TELEGRAM] = MagicMock(send=AsyncMock())
+    source = _voice_event(
+        chat_id="-200", chat_type="group", thread_id="2"
+    ).source
+    thread_key = "agent:main:telegram:group:-200:2"
+    runner._durable_job_store.ingest_event(
+        thread_key=thread_key,
+        platform="telegram",
+        source=source,
+        request_text="",
+        message_id="restart-voice-1",
+        platform_update_id=9001,
+        message_type="voice",
+        media=[{"path": "/tmp/restart-voice.ogg", "type": "audio/ogg"}],
+        event_metadata={"telegram_agent_dispatch_eligible": True},
+    )
+
+    with (
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={
+                "success": True,
+                "transcript": "Проверь состояние охраны",
+                "provider": "whisper",
+            },
+        ),
+        patch(
+            "gateway.job_router.decide_job_route",
+            new=AsyncMock(
+                return_value=JobRouteDecision(
+                    action="new_job",
+                    confidence=0.95,
+                    reason="recovered voice command",
+                )
+            ),
+        ),
+    ):
+        recovered = await runner._recover_unrouted_inbox_events()
+
+    jobs = runner._durable_job_store.active_jobs()
+    assert recovered == 1
+    assert len(jobs) == 1
+    assert "Проверь состояние охраны" in jobs[0]["request_text"]
 
 
 @pytest.mark.asyncio

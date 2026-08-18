@@ -10,7 +10,9 @@ actionable-looking text the user did not quote (#22619).
 
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from gateway.config import PlatformConfig
 
@@ -34,6 +36,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
+from gateway.platforms.base import MessageType  # noqa: E402
 
 
 def _make_adapter():
@@ -142,3 +145,67 @@ def test_empty_quote_text_falls_back_to_full_reply():
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
     assert event.reply_to_text == "Prior message body"
+
+
+@pytest.mark.asyncio
+async def test_text_reply_to_photo_attaches_replied_pixels(monkeypatch):
+    adapter = _make_adapter()
+    file_obj = SimpleNamespace(
+        file_path="telegram/photo.jpg",
+        download_as_bytearray=AsyncMock(return_value=bytearray(b"reply-image")),
+    )
+    photo = SimpleNamespace(get_file=AsyncMock(return_value=file_obj))
+    replied = SimpleNamespace(
+        message_id=42,
+        text=None,
+        caption=None,
+        photo=[photo],
+        document=None,
+    )
+    msg = _make_message(text="@TripiooBot сохрани")
+    msg.reply_to_message = replied
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+    monkeypatch.setattr(
+        "gateway.platforms.telegram.cache_image_from_bytes",
+        lambda data, ext: "/tmp/replied-photo.jpg",
+    )
+
+    attached = await adapter._attach_replied_image(msg, event)
+
+    assert attached is True
+    assert event.media_urls == ["/tmp/replied-photo.jpg"]
+    assert event.media_types == ["image/jpeg"]
+    file_obj.download_as_bytearray.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_text_reply_to_image_document_attaches_replied_pixels(monkeypatch):
+    adapter = _make_adapter()
+    file_obj = SimpleNamespace(
+        file_path="telegram/scan.png",
+        download_as_bytearray=AsyncMock(return_value=bytearray(b"reply-document")),
+    )
+    document = SimpleNamespace(
+        mime_type="image/png",
+        get_file=AsyncMock(return_value=file_obj),
+    )
+    replied = SimpleNamespace(
+        message_id=43,
+        text=None,
+        caption=None,
+        photo=[],
+        document=document,
+    )
+    msg = _make_message(text="@TripiooBot прочитай")
+    msg.reply_to_message = replied
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+    monkeypatch.setattr(
+        "gateway.platforms.telegram.cache_image_from_bytes",
+        lambda data, ext: "/tmp/replied-scan.png",
+    )
+
+    attached = await adapter._attach_replied_image(msg, event)
+
+    assert attached is True
+    assert event.media_urls == ["/tmp/replied-scan.png"]
+    assert event.media_types == ["image/png"]

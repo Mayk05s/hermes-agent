@@ -134,16 +134,32 @@ _CRON_CALENDAR_MUTATION_RE = re.compile(
     r"перенес(?:и|ти)|измен(?:и|ить)|удал(?:и|ить)|отмен(?:и|ить))"
     r")"
 )
+_CRON_CALENDAR_REJECTION_RE = re.compile(
+    r"(?is)(?:"
+    r"(?:\bне\b|\bникак\b|\bпри\s+ч[её]м\s+тут\b|\bприч[её]м\s+тут\b)"
+    r"[^\n.!?]{0,35}календар|"
+    r"календар[^\n.!?]{0,35}(?:\bне\s+(?:нуж|надо|использ|добав|созда|запис)|"
+    r"\bни\s+при\s+ч[её]м\b)|"
+    r"(?:\bnot\b|\bdon't\b|\bdo\s+not\b|\bwhy\b)"
+    r"[^\n.!?]{0,35}\bcalendar\b|"
+    r"\bcalendar\b[^\n.!?]{0,35}(?:\bisn't\b|\bis\s+not\b|\bnot\s+needed\b)"
+    r")"
+)
 
 
 def _cron_calendar_mutation_error(*texts: str) -> str:
     """Reject cron as a substitute for an immediate Calendar mutation."""
-    if any(_CRON_CALENDAR_MUTATION_RE.search(str(text or "")) for text in texts):
-        return (
-            "Calendar event writes must use the live google_calendar tool directly. "
-            "Do not create or run a cron job to create, update, move, or delete a "
-            "Calendar event."
-        )
+    for text in texts:
+        candidate = str(text or "")
+        if (
+            _CRON_CALENDAR_MUTATION_RE.search(candidate)
+            and not _CRON_CALENDAR_REJECTION_RE.search(candidate)
+        ):
+            return (
+                "Calendar event writes must use the live google_calendar tool directly. "
+                "Do not create or run a cron job to create, update, move, or delete a "
+                "Calendar event."
+            )
     return ""
 
 # U+200D Zero-Width Joiner is also a legitimate, required part of many

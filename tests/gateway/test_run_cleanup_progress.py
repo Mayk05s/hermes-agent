@@ -131,6 +131,24 @@ class FailingAgent:
         }
 
 
+class FailingAgentWithResponse(FailingAgent):
+    """Provider exhaustion includes an error envelope as final_response."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        envelope = "API call failed after 3 retries: Connection error."
+        callback = getattr(self, "status_callback", None)
+        if callback is not None:
+            callback("provider.error", envelope)
+        return {
+            "final_response": envelope,
+            "messages": [],
+            "api_calls": 3,
+            "completed": False,
+            "failed": True,
+            "error": "Connection error.",
+        }
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -145,6 +163,7 @@ def _make_runner(adapter):
     runner._session_db = None
     runner._running_agents = {}
     runner._session_run_generation = {}
+    runner._cleanup_progress_ids_by_run = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
@@ -291,6 +310,38 @@ async def test_cleanup_skipped_on_failed_run(monkeypatch, tmp_path):
         for _ in range(10):
             await asyncio.sleep(0.01)
     assert adapter.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_failed_flag_survives_nonempty_provider_error_response(
+    monkeypatch, tmp_path
+):
+    """A provider error envelope must not erase failed=True in the gateway."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(
+        monkeypatch,
+        FailingAgentWithResponse,
+        cleanup_on=False,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="-1001"),
+        session_id="sess-provider-error",
+        session_key="agent:main:telegram:group:-1001",
+        durable_job_id="gw_provider_error",
+    )
+
+    assert result["final_response"].startswith("API call failed after 3 retries")
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["error"] == "Connection error."
+    await asyncio.sleep(0)
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio

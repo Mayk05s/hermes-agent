@@ -43,7 +43,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, Iterable, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -145,36 +145,6 @@ _GROUP_OPERATOR_SLASH_COMMANDS: frozenset[str] = frozenset({
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
-
-
-def _prepend_durable_job_registration_note(
-    message: str,
-    job_id: Optional[str],
-    *,
-    durable_recovery: bool = False,
-) -> str:
-    """Tell the agent that the gateway already owns current-turn durability.
-
-    The note belongs to the current user turn rather than the cached system
-    prompt because the gateway job ID changes for every inbound message.
-    Recovery turns already carry a stronger, reason-aware instruction.
-    """
-    normalized_job_id = str(job_id or "").strip()
-    if durable_recovery or not normalized_job_id:
-        return message
-
-    return (
-        f"[System note: This request is already registered as durable gateway "
-        f"job {normalized_job_id}. The gateway persists its status, recovers "
-        f"unfinished work after a restart, and delivers the final result to "
-        f"the originating chat. Do not call cronjob merely to obtain a Job "
-        f"ID, create a registry/checkpoint/trace record, or keep this current "
-        f"turn alive. Use cronjob only when the user explicitly requests "
-        f"execution at a future time or on a recurring schedule. Complete "
-        f"ordinary work in this current turn; if a Job ID is relevant, use "
-        f"{normalized_job_id}.]\n\n"
-        f"{message}"
-    )
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -320,6 +290,53 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if len(body) > 400 or body.count("\n") > 4:
         return False
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+
+
+_GATEWAY_NONRETRYABLE_PROVIDER_FAILURE_RE = re.compile(
+    r"(authentication|incorrect\s+api\s+key|invalid\s+api\s+key|unauthorized"
+    r"|billing|credits?\s+exhausted|insufficient[_\s-]*quota"
+    r"|content\s+policy|safety\s+filter|policy\s+blocked"
+    r"|context\s+(?:length|size|window)|maximum\s+context|too\s+many\s+tokens"
+    r"|prompt\s+is\s+too\s+long|model\s+not\s+found|invalid[_\s-]*request)",
+    re.IGNORECASE,
+)
+
+_GATEWAY_RETRYABLE_PROVIDER_FAILURE_RE = re.compile(
+    r"(api\s+(?:call\s+)?failed\s+after\s+\d+\s+retries"
+    r"|connection\s+(?:error|lost|reset|closed)|network\s+(?:error|connection)"
+    r"|timed?\s*out|timeout|temporary|temporarily|ssl|unexpected\s+eof"
+    r"|rate\s*limit|too\s+many\s+requests|\b429\b"
+    r"|service\s+unavailable|overloaded|bad\s+gateway|gateway\s+timeout"
+    r"|\b(?:500|502|503|504)\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_retryable_provider_failure_result(agent_result: Any) -> bool:
+    """Classify a failed agent turn that should keep its durable job alive.
+
+    Provider exhaustion is returned by ``run_conversation()`` as a normal dict,
+    not raised as an exception.  Durable jobs must therefore inspect the result
+    explicitly.  Permanent configuration/request failures stay terminal; network,
+    timeout, rate-limit, and provider 5xx failures are safe to resume later.
+    """
+    if not isinstance(agent_result, dict) or not agent_result.get("failed"):
+        return False
+    if agent_result.get("compression_exhausted"):
+        return False
+    details = "\n".join(
+        str(value or "")
+        for value in (
+            agent_result.get("final_response"),
+            agent_result.get("error"),
+        )
+    ).strip()
+    if not details or _GATEWAY_NONRETRYABLE_PROVIDER_FAILURE_RE.search(details):
+        return False
+    return bool(
+        _looks_like_gateway_provider_error(str(agent_result.get("final_response") or ""))
+        or _GATEWAY_RETRYABLE_PROVIDER_FAILURE_RE.search(details)
+    )
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
@@ -638,6 +655,12 @@ def _build_replay_entry(role: str, content: Any, msg: Dict[str, Any]) -> Dict[st
 _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
 _OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
 _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
+_CURRENT_ATTACHMENT_GUARD = (
+    "[Current message attachment - primary evidence. Inspect the attached "
+    "image(s) before interpreting the request and do not substitute images or "
+    "facts from earlier messages. If the user asks to save/add/update anything, "
+    "claim success only after the corresponding write operation succeeds.]"
+)
 
 
 def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
@@ -736,6 +759,40 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
         return [{"type": "text", "text": prefix.rstrip()}] + wrapped
 
     return message
+
+
+def _wrap_current_message_with_attachment_guard(message: Any) -> Any:
+    """Make the newly attached image authoritative for this API turn only."""
+
+    prefix = f"{_CURRENT_ATTACHMENT_GUARD}\n"
+    if isinstance(message, str):
+        return f"{prefix}{message}"
+    if isinstance(message, list):
+        wrapped = [dict(part) if isinstance(part, dict) else part for part in message]
+        for part in wrapped:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = f"{prefix}{part.get('text', '')}"
+                return wrapped
+        return [{"type": "text", "text": _CURRENT_ATTACHMENT_GUARD}] + wrapped
+    return message
+
+
+def _persisted_user_message_with_image_refs(
+    message: str,
+    image_paths: Iterable[str],
+) -> str:
+    """Persist small local handles for current images, never their base64 data."""
+
+    text = str(message or "").strip()
+    refs: List[str] = []
+    for raw_path in image_paths:
+        path = str(raw_path or "").strip()
+        marker = f"[Image attached at: {path}]"
+        if path and marker not in text and marker not in refs:
+            refs.append(marker)
+    if not refs:
+        return text
+    return "\n\n".join(part for part in (text, "\n".join(refs)) if part)
 
 
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
@@ -1279,6 +1336,7 @@ from gateway.config import (
     load_gateway_config,
 )
 from gateway.session import (
+    SessionEntry,
     SessionStore,
     SessionSource,
     SessionContext,
@@ -2364,6 +2422,7 @@ class GatewayRunner:
         )
         self._active_job_ids: Dict[str, str] = {}
         self._scheduled_durable_job_ids: set[str] = set()
+        self._provider_retry_job_ids: set[str] = set()
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2406,6 +2465,10 @@ class GatewayRunner:
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+        # Temporary status-message IDs share the same lifecycle as tool-progress
+        # bubbles. Key by run generation so a stale completion can never delete
+        # a newer run's busy acknowledgement.
+        self._cleanup_progress_ids_by_run: Dict[tuple[str, int], List[str]] = {}
         # LRU cache of live SessionSources keyed by session_key. Used by
         # fallback routing paths (shutdown notifications, synthetic
         # background-process events) when the persisted origin is missing
@@ -4032,6 +4095,21 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _track_cleanup_progress_result(self, session_key: str, result: Any) -> None:
+        """Attach a temporary gateway status message to the active run cleanup."""
+        if not result or not getattr(result, "success", False):
+            return
+        message_id = getattr(result, "message_id", None)
+        if message_id is None:
+            return
+        generation = int(self._session_run_generation.get(session_key, 0) or 0)
+        registry = getattr(self, "_cleanup_progress_ids_by_run", None)
+        if not isinstance(registry, dict):
+            return
+        tracked = registry.get((session_key, generation))
+        if tracked is not None:
+            tracked.append(str(message_id))
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -4051,17 +4129,22 @@ class GatewayRunner:
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
+            routed_source = self._source_with_profile_scope(event.source)
+            event.source = routed_source
+            thread_key = self._session_key_for_source(routed_source)
+            # Commit the raw inbox event, not a guessed job. Startup recovery
+            # performs semantic routing once the gateway is accepting work.
+            self._ingest_durable_inbox_event(event, routed_source, thread_key)
             adapter = self.adapters.get(event.source.platform)
             if not adapter:
                 return True
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-            else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+            message = (
+                f"⏳ Gateway {self._status_action_gerund()} — message saved and "
+                "will be routed when it comes back."
+            )
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -4081,6 +4164,22 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
+
+        routed_source = self._source_with_profile_scope(event.source)
+        event.source = routed_source
+        thread_key = self._session_key_for_source(routed_source)
+        _job, handled = await self._ensure_durable_job_route(
+            event, routed_source, thread_key
+        )
+        if handled:
+            # Semantic scope updates are already in the job mailbox and, when
+            # possible, steered into the live agent. They intentionally produce
+            # no second assistant turn or busy acknowledgement.
+            return True
+        execution_key = str(getattr(event, "job_execution_key", None) or "")
+        if execution_key:
+            adapter._start_session_processing(event, execution_key)
+            return True
 
         running_agent = self._running_agents.get(session_key)
 
@@ -4269,7 +4368,7 @@ class GatewayRunner:
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
         try:
-            await adapter._send_with_retry(
+            send_result = await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
                 reply_to=(
@@ -4281,6 +4380,7 @@ class GatewayRunner:
                 ),
                 metadata=thread_meta,
             )
+            self._track_cleanup_progress_result(session_key, send_result)
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
@@ -4865,6 +4965,557 @@ class GatewayRunner:
         """Return the durable gateway-job store when this runner owns one."""
         return getattr(self, "_durable_job_store", None)
 
+    @staticmethod
+    def _durable_event_metadata(event: MessageEvent) -> Dict[str, Any]:
+        """Return restart-safe metadata for one durable inbox event."""
+        return {
+            "reply_to_text": getattr(event, "reply_to_text", None),
+            "auto_skill": getattr(event, "auto_skill", None),
+            "channel_prompt": getattr(event, "channel_prompt", None),
+            "channel_context": getattr(event, "channel_context", None),
+            "telegram_agent_dispatch_eligible": bool(
+                getattr(event, "telegram_agent_dispatch_eligible", False)
+            ),
+            "telegram_passive_audio_transcription": bool(
+                getattr(event, "telegram_passive_audio_transcription", False)
+            ),
+            "telegram_voice_preprocessed": bool(
+                getattr(event, "telegram_voice_preprocessed", False)
+            ),
+            "telegram_voice_transcript_only": bool(
+                getattr(event, "telegram_voice_transcript_only", False)
+            ),
+            "telegram_transcript_only_history_text": getattr(
+                event, "telegram_transcript_only_history_text", None
+            ),
+        }
+
+    def _ingest_durable_inbox_event(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        thread_key: str,
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Persist a user event without assuming that it is a new job."""
+        store = self._durable_store()
+        if store is None or getattr(event, "internal", False):
+            return None, False
+        existing_id = str(getattr(event, "durable_inbox_id", None) or "")
+        if existing_id:
+            existing = store.get_inbox_event(existing_id)
+            if existing is None:
+                raise RuntimeError(
+                    f"Missing durable inbox event referenced by message: {existing_id}"
+                )
+            return existing, False
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        media_types = list(getattr(event, "media_types", None) or [])
+        media = [
+            {
+                "path": str(path),
+                "type": str(media_types[index] if index < len(media_types) else ""),
+            }
+            for index, path in enumerate(media_urls)
+        ]
+        inbox, created = store.ingest_event(
+            thread_key=thread_key,
+            platform=_gateway_platform_value(source.platform),
+            source=source,
+            request_text=(
+                getattr(event, "durable_request_text", None)
+                if getattr(event, "durable_request_text", None) is not None
+                else event.text or ""
+            ),
+            message_id=event.message_id,
+            platform_update_id=event.platform_update_id,
+            reply_to_message_id=event.reply_to_message_id,
+            message_type=str(
+                getattr(getattr(event, "message_type", None), "value", None)
+                or "text"
+            ),
+            media=media,
+            event_metadata=self._durable_event_metadata(event),
+        )
+        event.durable_inbox_id = str(inbox["event_id"])
+        event.job_thread_key = thread_key
+        return inbox, created
+
+    def _persist_telegram_transcript_only_context(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        thread_key: str,
+    ) -> None:
+        """Append a passive voice transcript to the public topic history.
+
+        Job execution sessions are intentionally private branches.  A voice
+        note that does not start the AI has no job branch, so its transcript
+        belongs in the canonical public topic session where the next addressed
+        turn can see it.
+        """
+        transcript_text = str(
+            getattr(event, "telegram_transcript_only_history_text", None) or ""
+        ).strip()
+        if not transcript_text or getattr(
+            event, "telegram_transcript_only_history_persisted", False
+        ):
+            return
+        session_entry = self.session_store.get_or_create_session(
+            source,
+            session_key_override=thread_key,
+        )
+        message_id = str(event.message_id or "")
+        existing_history = self.session_store.load_transcript(
+            session_entry.session_id
+        )
+        if not isinstance(existing_history, list):
+            existing_history = []
+        already_present = bool(
+            message_id
+            and any(
+                str(item.get("message_id") or "") == message_id
+                for item in existing_history
+                if isinstance(item, dict)
+            )
+        )
+        if not already_present:
+            entry = {
+                "role": "user",
+                "content": transcript_text,
+                "timestamp": datetime.now().isoformat(),
+                "observed": True,
+            }
+            if message_id:
+                entry["message_id"] = message_id
+            self.session_store.append_to_transcript(
+                session_entry.session_id,
+                entry,
+            )
+        event.telegram_transcript_only_history_persisted = True
+
+    async def _prepare_durable_telegram_voice_intake(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        thread_key: str,
+    ) -> bool:
+        """Durably stage, transcribe, and enrich Telegram voice before routing.
+
+        Returns true when the voice note is intentionally context-only and no
+        AI job should be created.  A raw inbox row is committed before STT;
+        semantic routing only sees the persisted transcript afterwards.
+        """
+        store = self._durable_store()
+        if (
+            store is None
+            or getattr(event, "internal", False)
+            or _gateway_platform_value(source.platform) != "telegram"
+            or event.message_type != MessageType.VOICE
+        ):
+            return False
+
+        inbox, _created = self._ingest_durable_inbox_event(
+            event, source, thread_key
+        )
+        if inbox is None:
+            return False
+        status = str(inbox.get("status") or "")
+        if status == "context_only":
+            return True
+        if status != "received" or inbox.get("job_id"):
+            return False
+
+        # A restart after STT but before semantic routing reloads these fields
+        # from event_json and must not transcribe or post the bubble twice.
+        if getattr(event, "telegram_voice_preprocessed", False):
+            if getattr(event, "telegram_voice_transcript_only", False):
+                self._persist_telegram_transcript_only_context(
+                    event, source, thread_key
+                )
+                store.mark_inbox_context_only(
+                    str(inbox["event_id"]),
+                    request_text=str(event.durable_request_text or event.text or ""),
+                    event_metadata=self._durable_event_metadata(event),
+                )
+                return True
+            return False
+
+        audio_paths = [
+            str(path)
+            for index, path in enumerate(event.media_urls or [])
+            if (
+                str(
+                    event.media_types[index]
+                    if index < len(event.media_types or [])
+                    else ""
+                ).startswith("audio/")
+                or event.message_type == MessageType.VOICE
+            )
+        ]
+        if not audio_paths:
+            return False
+
+        voice_rule = dict(
+            self._matching_telegram_voice_transcription_rule(event, source) or {}
+        )
+        audio_trigger_enabled = self._telegram_audio_trigger_enabled(source)
+        show_transcription_enabled = self._telegram_show_transcription_enabled(
+            voice_rule,
+            source=source,
+        )
+        dispatch_eligible = bool(event.telegram_agent_dispatch_eligible)
+        if (
+            not show_transcription_enabled
+            and not audio_trigger_enabled
+            and not dispatch_eligible
+        ):
+            event.telegram_voice_preprocessed = True
+            event.telegram_voice_transcript_only = True
+            store.mark_inbox_context_only(
+                str(inbox["event_id"]),
+                request_text=str(event.durable_request_text or event.text or ""),
+                event_metadata=self._durable_event_metadata(event),
+                reason="voice_processing_disabled",
+            )
+            return True
+
+        voice_rule.update(
+            {
+                "audio_trigger": audio_trigger_enabled,
+                "send_transcript": show_transcription_enabled,
+                "on_keyword_match": "run_ai",
+                "on_no_match": "transcript_only",
+                "run_ai_if_addressed": dispatch_eligible,
+            }
+        )
+        prepared_text = await self._apply_telegram_voice_transcription_rule(
+            event.text or "",
+            audio_paths,
+            event,
+            source,
+            voice_rule,
+        )
+        event.telegram_voice_preprocessed = True
+        event.telegram_voice_transcript_only = prepared_text is None
+
+        if prepared_text is None:
+            transcript_context = str(
+                event.telegram_transcript_only_history_text or event.text or ""
+            )
+            event.durable_request_text = transcript_context
+            self._persist_telegram_transcript_only_context(
+                event, source, thread_key
+            )
+            store.mark_inbox_context_only(
+                str(inbox["event_id"]),
+                request_text=transcript_context,
+                event_metadata=self._durable_event_metadata(event),
+            )
+            return True
+
+        event.text = prepared_text
+        event.durable_request_text = prepared_text
+        store.enrich_inbox_event(
+            str(inbox["event_id"]),
+            request_text=prepared_text,
+            event_metadata=self._durable_event_metadata(event),
+        )
+        return False
+
+    @staticmethod
+    def _populate_event_job_route(event: MessageEvent, job: Dict[str, Any]) -> None:
+        event.durable_job_id = str(job.get("job_id") or "") or None
+        event.job_thread_key = str(job.get("thread_key") or "") or None
+        event.job_execution_key = str(job.get("session_key") or "") or None
+        event.job_input_version = int(job.get("input_version") or 1)
+
+    async def _ensure_durable_job_route(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        thread_key: str,
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Serialize semantic routing inside one public chat/thread."""
+        locks = getattr(self, "_job_route_locks", None)
+        if locks is None:
+            locks = {}
+            self._job_route_locks = locks
+        lock = locks.get(thread_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[thread_key] = lock
+        async with lock:
+            if await self._prepare_durable_telegram_voice_intake(
+                event, source, thread_key
+            ):
+                return None, True
+            return await self._ensure_durable_job_route_locked(
+                event, source, thread_key
+            )
+
+    async def _ensure_durable_job_route_locked(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        thread_key: str,
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Route an inbox event to a new job or attach it to active work.
+
+        Returns ``(job, handled)``. ``handled`` is true for a semantic update
+        that was durably attached to an existing job and therefore must not
+        produce a second agent turn/response.
+        """
+        store = self._durable_store()
+        if store is None or getattr(event, "internal", False):
+            return None, False
+        inbox, created = self._ingest_durable_inbox_event(
+            event, source, thread_key
+        )
+        if inbox is None:
+            return None, False
+        routed_job_id = str(inbox.get("job_id") or "")
+        if routed_job_id:
+            # The busy-session path routes the raw event first, then hands the
+            # *same* MessageEvent to a job-specific adapter lane for execution.
+            # Preserve that ownership marker before repopulating the route. A
+            # fresh platform redelivery has no such marker and must stay
+            # suppressed, while the already-routed original must be allowed to
+            # reach _prepare_durable_job() and claim its pending job.
+            pre_routed_job_id = str(
+                getattr(event, "durable_job_id", None) or ""
+            )
+            pre_routed_action = str(
+                getattr(event, "job_route_action", None) or ""
+            )
+            job = store.get(routed_job_id)
+            if job is None:
+                raise RuntimeError(
+                    f"Durable inbox event {inbox['event_id']} references missing job {routed_job_id}"
+                )
+            self._populate_event_job_route(event, job)
+            action = str(inbox.get("route_action") or "")
+            event.job_route_action = action or None
+            # A re-delivered platform update must never launch or steer the job
+            # twice. The already-routed original event is the exception: the
+            # busy-session handler has just moved it onto its job-specific lane
+            # and that lane now owns the first execution.
+            if not created:
+                if (
+                    pre_routed_job_id == routed_job_id
+                    and pre_routed_action == "new_job"
+                ):
+                    return job, False
+                return job, True
+            return job, action == "attach"
+
+        active_jobs = store.active_for_thread(thread_key)
+        recent_jobs = store.recent_terminal_for_thread(thread_key)
+        replied_job = store.job_for_delivery_message(
+            thread_key, event.reply_to_message_id
+        )
+        replied_job_id = (
+            str(replied_job.get("job_id") or "") if replied_job else None
+        )
+        from gateway.job_router import decide_job_route
+
+        decision = await decide_job_route(
+            message=str(
+                getattr(event, "durable_request_text", None)
+                if getattr(event, "durable_request_text", None) is not None
+                else event.text or ""
+            ),
+            active_jobs=active_jobs,
+            recent_jobs=recent_jobs,
+            replied_job_id=replied_job_id,
+            sender_user_id=str(source.user_id or ""),
+            sender_user_name=str(source.user_name or ""),
+            message_type=str(
+                getattr(getattr(event, "message_type", None), "value", None)
+                or "text"
+            ),
+            media_count=len(list(getattr(event, "media_urls", None) or [])),
+        )
+        if decision.action == "attach" and decision.job_id:
+            target_before_attach = store.get(decision.job_id)
+            job = store.attach_event_to_job(
+                str(inbox["event_id"]),
+                decision.job_id,
+                confidence=decision.confidence,
+                reason=decision.reason,
+            )
+            self._populate_event_job_route(event, job)
+            event.job_route_action = "attach"
+            execution_key = str(job.get("session_key") or "")
+            running_agent = self._running_agents.get(execution_key)
+            accepted = False
+            if (
+                running_agent is not None
+                and running_agent is not _AGENT_PENDING_SENTINEL
+                and hasattr(running_agent, "steer")
+            ):
+                steer_text = str(event.text or "").strip()
+                try:
+                    if steer_text:
+                        try:
+                            accepted = bool(
+                                running_agent.steer(
+                                    steer_text,
+                                    input_version=int(job.get("input_version") or 1),
+                                )
+                            )
+                        except TypeError:
+                            # Compatibility with custom/older agent objects.
+                            # Their acceptance is useful, but without an explicit
+                            # consumption token the result fence will conservatively
+                            # rerun the combined request before final delivery.
+                            accepted = bool(running_agent.steer(steer_text))
+                except Exception:
+                    logger.warning(
+                        "Durable scope update steer failed for job %s",
+                        decision.job_id,
+                        exc_info=True,
+                    )
+            if accepted:
+                store.append_job_event(
+                    str(job["job_id"]),
+                    "input_steer_accepted",
+                    {"input_version": int(job.get("input_version") or 1)},
+                )
+            elif str(job.get("status") or "") == "running":
+                # The update is safe in the durable mailbox. Prevent the old
+                # attempt from becoming terminal; startup/current completion
+                # will schedule a recovery using the combined request.
+                store.mark_resume_pending(
+                    str(job["job_id"]), "scope_update_pending"
+                )
+            if (
+                not accepted
+                and execution_key not in self._running_agents
+                and str((target_before_attach or {}).get("status") or "")
+                == "completed"
+            ):
+                self._schedule_durable_job_continuation(str(job["job_id"]))
+            logger.info(
+                "Durable inbox event %s attached to job %s version=%s steer=%s reason=%s",
+                inbox["event_id"],
+                job["job_id"],
+                job.get("input_version"),
+                accepted,
+                decision.reason,
+            )
+            return job, True
+
+        parent_job_id = (
+            decision.parent_job_id
+            or (
+                replied_job_id
+                if replied_job
+                and str(replied_job.get("status") or "")
+                not in {"pending", "running", "resume_pending"}
+                else None
+            )
+        )
+        parent_job = store.get(parent_job_id) if parent_job_id else None
+        job, _ = store.create_job_for_event(
+            str(inbox["event_id"]),
+            parent_job_id=parent_job_id,
+            branch_id=(
+                str(parent_job.get("branch_id") or "") or None
+                if parent_job
+                else None
+            ),
+            routing_summary=str(event.text or "")[:1000],
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+        self._populate_event_job_route(event, job)
+        event.job_route_action = "new_job"
+        logger.info(
+            "Durable inbox event %s created independent job %s thread=%s reason=%s",
+            inbox["event_id"],
+            job["job_id"],
+            thread_key,
+            decision.reason,
+        )
+        return job, False
+
+    async def _recover_unrouted_inbox_events(self) -> int:
+        """Route committed inbox events left undecided by a process exit."""
+        store = self._durable_store()
+        if store is None:
+            return 0
+        recovered = 0
+        for inbox in store.unrouted_inbox_events():
+            try:
+                source = SessionSource.from_dict(store.source_dict(inbox))
+                media_payload = json.loads(str(inbox.get("media_json") or "[]"))
+                event_metadata = json.loads(
+                    str(inbox.get("event_json") or "{}")
+                )
+                try:
+                    recovered_message_type = MessageType(
+                        str(inbox.get("message_type") or "text")
+                    )
+                except ValueError:
+                    recovered_message_type = MessageType.TEXT
+                event = MessageEvent(
+                    text=str(inbox.get("request_text") or ""),
+                    message_type=recovered_message_type,
+                    source=source,
+                    message_id=inbox.get("request_message_id"),
+                    platform_update_id=inbox.get("platform_update_id"),
+                    reply_to_message_id=inbox.get("reply_to_message_id"),
+                    reply_to_text=event_metadata.get("reply_to_text"),
+                    media_urls=[
+                        str(item.get("path") or "")
+                        for item in media_payload
+                        if isinstance(item, dict) and item.get("path")
+                    ],
+                    media_types=[
+                        str(item.get("type") or "")
+                        for item in media_payload
+                        if isinstance(item, dict) and item.get("path")
+                    ],
+                    durable_inbox_id=str(inbox["event_id"]),
+                    durable_request_text=str(inbox.get("request_text") or ""),
+                    auto_skill=event_metadata.get("auto_skill"),
+                    channel_prompt=event_metadata.get("channel_prompt"),
+                    channel_context=event_metadata.get("channel_context"),
+                    telegram_agent_dispatch_eligible=bool(
+                        event_metadata.get("telegram_agent_dispatch_eligible", False)
+                    ),
+                    telegram_passive_audio_transcription=bool(
+                        event_metadata.get(
+                            "telegram_passive_audio_transcription", False
+                        )
+                    ),
+                    telegram_voice_preprocessed=bool(
+                        event_metadata.get("telegram_voice_preprocessed", False)
+                    ),
+                    telegram_voice_transcript_only=bool(
+                        event_metadata.get("telegram_voice_transcript_only", False)
+                    ),
+                    telegram_transcript_only_history_text=event_metadata.get(
+                        "telegram_transcript_only_history_text"
+                    ),
+                )
+                _job, _handled = await self._ensure_durable_job_route(
+                    event, source, str(inbox["thread_key"])
+                )
+                # Do not dispatch here. The startup scheduler immediately below
+                # claims every active job exactly once. Dispatching a freshly
+                # created pending job here would race that scan and could launch
+                # the same work twice after a restart.
+                recovered += 1
+            except Exception:
+                logger.exception(
+                    "Failed to recover durable inbox event %s",
+                    inbox.get("event_id"),
+                )
+        if recovered:
+            logger.info("Recovered %d unrouted durable inbox event(s)", recovered)
+        return recovered
+
     def _prepare_durable_job(
         self,
         event: MessageEvent,
@@ -4964,21 +5615,175 @@ class GatewayRunner:
         result_text: str,
         *,
         delivered: bool = False,
-    ) -> None:
+    ) -> bool:
         store = self._durable_store()
         job_id = str(getattr(event, "durable_job_id", None) or "")
         if store is None or not job_id:
-            return
+            return True
+        consumed_versions = getattr(self, "_job_consumed_input_versions", {})
+        input_version = max(
+            int(getattr(event, "job_input_version", None) or 1),
+            int(consumed_versions.get(job_id) or 1),
+        )
         final_text = str(result_text or "").strip()
         if not final_text:
             # A missing final response is diagnostic information, not a
             # user-facing result.  Mark it delivered so startup recovery
             # never broadcasts a placeholder to the original chat.
             logger.warning("Durable gateway job %s completed without final text", job_id)
-            store.complete(job_id, "", delivered=True)
+            completed = store.complete(
+                job_id,
+                "",
+                delivered=True,
+                input_version=input_version,
+            )
         else:
-            store.complete(job_id, final_text, delivered=delivered)
-        getattr(self, "_scheduled_durable_job_ids", set()).discard(job_id)
+            completed = store.complete(
+                job_id,
+                final_text,
+                delivered=delivered,
+                input_version=input_version,
+            )
+        if completed:
+            getattr(self, "_scheduled_durable_job_ids", set()).discard(job_id)
+            getattr(self, "_provider_retry_job_ids", set()).discard(job_id)
+            consumed_versions.pop(job_id, None)
+        else:
+            logger.info(
+                "Durable gateway job %s result version %d is stale; current input is newer",
+                job_id,
+                input_version,
+            )
+        return completed
+
+    def _schedule_durable_job_provider_retry(self, job_id: str) -> bool:
+        """Schedule one bounded-backoff continuation for a provider outage.
+
+        The database remains the source of truth.  If this process exits while
+        the timer is pending, startup recovery sees ``resume_pending`` and resumes
+        the same job ID.  The in-memory set only prevents duplicate timers inside
+        the current process.
+        """
+        store = self._durable_store()
+        job = store.get(job_id) if store is not None else None
+        if not job or str(job.get("status") or "") not in {
+            "pending",
+            "running",
+            "resume_pending",
+        }:
+            return False
+
+        scheduled = getattr(self, "_provider_retry_job_ids", None)
+        if scheduled is None:
+            scheduled = set()
+            self._provider_retry_job_ids = scheduled
+        if job_id in scheduled:
+            return False
+
+        owner_instance = str(
+            getattr(self, "_durable_job_instance", "")
+            or f"{os.getpid()}:{time.time_ns()}"
+        )
+        if not store.mark_recovery_scheduled(
+            job_id,
+            owner_instance=owner_instance,
+        ):
+            return False
+        job = store.get(job_id) or job
+        attempt = max(1, int(job.get("resume_attempts") or 1))
+        delay_seconds = min(300.0, 15.0 * (2 ** min(attempt - 1, 5)))
+        execution_key = str(job.get("session_key") or "")
+        source = SessionSource.from_dict(store.source_dict(job))
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return False
+
+        scheduled.add(job_id)
+
+        async def _resume_after_backoff() -> None:
+            try:
+                await asyncio.sleep(delay_seconds)
+                for _ in range(300):
+                    if (
+                        execution_key not in self._running_agents
+                        and execution_key not in getattr(adapter, "_active_sessions", {})
+                    ):
+                        break
+                    await asyncio.sleep(0.1)
+                current = store.get(job_id)
+                if not current or str(current.get("status") or "") not in {
+                    "pending",
+                    "running",
+                    "resume_pending",
+                }:
+                    return
+                event = MessageEvent(
+                    text="",
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                    durable_job_id=job_id,
+                    durable_recovery=True,
+                    durable_request_text=str(current.get("request_text") or ""),
+                    job_thread_key=str(current.get("thread_key") or "") or None,
+                    job_execution_key=execution_key or None,
+                    job_input_version=int(current.get("input_version") or 1),
+                )
+                # Allow a later failed attempt to register the next backoff while
+                # this event is running; the job itself still serializes execution.
+                scheduled.discard(job_id)
+                await adapter.handle_message(event)
+            finally:
+                scheduled.discard(job_id)
+
+        task = asyncio.create_task(_resume_after_backoff())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        logger.warning(
+            "Durable gateway job %s will retry after provider outage in %.0fs "
+            "(resume attempt %d)",
+            job_id,
+            delay_seconds,
+            attempt,
+        )
+        return True
+
+    def _schedule_durable_job_continuation(self, job_id: str) -> None:
+        store = self._durable_store()
+        job = store.get(job_id) if store is not None else None
+        if not job:
+            return
+        execution_key = str(job.get("session_key") or "")
+        source = SessionSource.from_dict(store.source_dict(job))
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return
+
+        async def _resume_when_free() -> None:
+            for _ in range(300):
+                if (
+                    execution_key not in self._running_agents
+                    and execution_key not in getattr(adapter, "_active_sessions", {})
+                ):
+                    break
+                await asyncio.sleep(0.1)
+            event = MessageEvent(
+                text="",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+                durable_job_id=job_id,
+                durable_recovery=True,
+                durable_request_text=str(job.get("request_text") or ""),
+                job_thread_key=str(job.get("thread_key") or "") or None,
+                job_execution_key=execution_key or None,
+                job_input_version=int(job.get("input_version") or 1),
+            )
+            await adapter.handle_message(event)
+
+        task = asyncio.create_task(_resume_when_free())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def _fail_durable_job(
         self,
@@ -5007,20 +5812,41 @@ class GatewayRunner:
         attempted: bool,
         succeeded: bool,
         error: Optional[str] = None,
+        message_id: Optional[str] = None,
+        message_ids: Optional[list[str]] = None,
     ) -> None:
         store = self._durable_store()
         job_id = str(getattr(event, "durable_job_id", None) or "")
         if store is None or not job_id or not attempted:
             return
-        store.record_delivery(job_id, success=succeeded, error=error)
-        if succeeded:
+        recorded = store.record_delivery(
+            job_id,
+            success=succeeded,
+            error=error,
+            message_id=message_id,
+            message_ids=message_ids,
+        )
+        if succeeded and recorded:
             logger.info("Durable gateway job %s final result delivered", job_id)
-        else:
+        elif not succeeded and recorded:
             logger.warning(
                 "Durable gateway job %s completed but delivery failed: %s",
                 job_id,
                 error or "unknown platform error",
             )
+
+    async def _validate_durable_job_delivery(self, event: MessageEvent) -> bool:
+        """Return True only for the latest committed result of this job."""
+        store = self._durable_store()
+        job_id = str(getattr(event, "durable_job_id", None) or "")
+        if store is None or not job_id:
+            return True
+        job = store.get(job_id)
+        if not job or str(job.get("status") or "") != "completed":
+            return False
+        return int(job.get("result_input_version") or 0) == int(
+            job.get("input_version") or 1
+        )
 
     def _mark_durable_session_resume_pending(
         self,
@@ -5060,6 +5886,20 @@ class GatewayRunner:
             result_text = str(job.get("result_text") or "").strip()
             if not result_text:
                 return False
+            current = store.get(job_id)
+            if (
+                not current
+                or str(current.get("status") or "")
+                not in {"completed", "failed"}
+                or int(current.get("result_input_version") or 0)
+                not in {0, int(current.get("input_version") or 1)}
+                or str(current.get("result_text") or "").strip() != result_text
+            ):
+                logger.info(
+                    "Skipping stale stored delivery for durable job %s",
+                    job_id,
+                )
+                return False
             # Recovery is an implementation detail. Deliver the actual
             # stored result, without a lifecycle banner or internal job ID.
             content = result_text
@@ -5073,6 +5913,9 @@ class GatewayRunner:
                 job_id,
                 success=success,
                 error=str(getattr(result, "error", "") or "delivery failed"),
+                message_id=(
+                    str(getattr(result, "message_id", "") or "") or None
+                ),
             )
             if success:
                 logger.info(
@@ -5176,6 +6019,9 @@ class GatewayRunner:
                 durable_job_id=job_id,
                 durable_recovery=True,
                 durable_request_text=str(job.get("request_text") or ""),
+                job_thread_key=str(job.get("thread_key") or "") or None,
+                job_execution_key=session_key or None,
+                job_input_version=int(job.get("input_version") or 1),
             )
             task = asyncio.create_task(adapter.handle_message(event))
             self._background_tasks.add(task)
@@ -5555,6 +6401,10 @@ class GatewayRunner:
                 adapter.set_durable_job_delivery_handler(
                     self._handle_durable_job_delivery_receipt
                 )
+            if hasattr(adapter, "set_durable_job_delivery_validator"):
+                adapter.set_durable_job_delivery_validator(
+                    self._validate_durable_job_delivery
+                )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -5769,6 +6619,7 @@ class GatewayRunner:
         # Recover explicit durable jobs first. The older session-level
         # resume_pending path remains as a compatibility fallback for work that
         # started before the registry existed, but must exclude claimed jobs.
+        await self._recover_unrouted_inbox_events()
         _, durable_session_keys = self._schedule_durable_jobs()
         self._schedule_resume_pending_sessions(
             exclude_session_keys=durable_session_keys,
@@ -7308,6 +8159,10 @@ class GatewayRunner:
                         adapter.set_durable_job_delivery_handler(
                             self._handle_durable_job_delivery_receipt
                         )
+                    if hasattr(adapter, "set_durable_job_delivery_validator"):
+                        adapter.set_durable_job_delivery_validator(
+                            self._validate_durable_job_delivery
+                        )
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -7337,6 +8192,7 @@ class GatewayRunner:
 
                         # A platform unavailable during startup may own jobs
                         # waiting for recovery or final-result delivery.
+                        await self._recover_unrouted_inbox_events()
                         self._schedule_durable_jobs()
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
@@ -8532,6 +9388,47 @@ class GatewayRunner:
             )
         return requester_user_id, requester_user_name
 
+    def _resolve_chat_pairing_request(
+        self,
+        entry_id: str,
+        *,
+        action: str,
+        approval_scope: str = "chat",
+    ) -> Optional[dict]:
+        """Resolve a Telegram owner-DM access prompt against persistent state."""
+        platform_name = "telegram"
+        pending = self.pairing_store.get_pending_entry(platform_name, entry_id)
+        if not isinstance(pending, dict) or pending.get("subject_type") != "chat":
+            return None
+
+        if action == "reject":
+            if not self.pairing_store.reject_entry(platform_name, entry_id):
+                return None
+            return {"status": "rejected", "request": pending}
+
+        result = self.pairing_store.approve_entry(
+            platform_name,
+            entry_id,
+            approval_scope=approval_scope,
+        )
+        if not result:
+            return None
+
+        route = None
+        try:
+            from gateway.pairing_routes import upsert_pairing_profile_route
+
+            route = upsert_pairing_profile_route(result, "default")
+        except Exception:
+            # The pairing grant itself is authoritative for access and has
+            # already been committed. Keep it effective even if the optional
+            # explicit default-profile route cannot be written.
+            logger.exception(
+                "Failed to create default profile route for Telegram pairing %s",
+                entry_id,
+            )
+        return {"status": "approved", "request": pending, "pairing": result, "route": route}
+
     async def _handle_group_pairing_request(self, event: MessageEvent) -> Optional[str]:
         """Create a pending pairing request for an unauthorized group/channel."""
         source = event.source
@@ -8558,10 +9455,58 @@ class GatewayRunner:
             return None
 
         if entry_id:
+            pending_entry = None
+            get_pending_entry = getattr(self.pairing_store, "get_pending_entry", None)
+            if callable(get_pending_entry):
+                pending_entry = get_pending_entry(platform_name, entry_id)
+            already_notified = bool(
+                isinstance(pending_entry, dict)
+                and pending_entry.get("owner_notified_at")
+            )
+            delivered_to_owner = 0
+            notify_owner = getattr(adapter, "send_chat_pairing_request", None)
+            if callable(notify_owner) and not already_notified:
+                try:
+                    delivered_to_owner = await notify_owner(
+                        entry_id=entry_id,
+                        chat_id=source.chat_id,
+                        chat_name=source.chat_name or "",
+                        chat_type=source.chat_type or "group",
+                        thread_id=source.thread_id or "",
+                        requester_user_id=requester_user_id,
+                        requester_user_name=requester_user_name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to notify Telegram owner about chat pairing request %s",
+                        entry_id,
+                    )
+                if delivered_to_owner:
+                    mark_owner_notified = getattr(
+                        self.pairing_store,
+                        "mark_owner_notified",
+                        None,
+                    )
+                    if callable(mark_owner_notified):
+                        mark_owner_notified(platform_name, entry_id)
+
+            if delivered_to_owner:
+                acknowledgement = (
+                    "Запрос доступа отправлен владельцу бота в личный чат. "
+                    "До одобрения я останусь здесь без ответа."
+                )
+            elif already_notified:
+                acknowledgement = (
+                    "Запрос доступа уже отправлен владельцу и ожидает решения."
+                )
+            else:
+                acknowledgement = (
+                    "Запрос доступа сохранён в админке, но личное уведомление "
+                    "владельцу отправить не удалось."
+                )
             await adapter.send(
                 source.chat_id,
-                "Pairing request sent to the Hermes admin. "
-                "I will stay quiet here until this group is approved.",
+                acknowledgement,
                 metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
             )
         else:
@@ -8969,6 +9914,35 @@ class GatewayRunner:
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
 
+        if self._is_telegram_topic_root_lobby(source):
+            # The lobby reminder is a gateway UI response, not AI work. Keep it
+            # outside the durable job registry so startup recovery never tries
+            # to execute a task that was intentionally rejected at intake.
+            if self._should_send_telegram_lobby_reminder(source):
+                return self._telegram_topic_root_lobby_message()
+            return None
+
+        # Durable semantic intake: a raw platform event is not automatically a
+        # new job. Route it against every active job in this public thread.
+        # Scope updates are consumed here (and steered into the live agent);
+        # independent work receives a job-specific execution/session key, so
+        # the running-agent guard below no longer serializes an entire topic.
+        if not is_internal and not event.is_command():
+            if self._draining:
+                self._ingest_durable_inbox_event(event, source, _quick_key)
+                return (
+                    f"⏳ Gateway {self._status_action_gerund()} — message saved "
+                    "and will be routed when it comes back."
+                )
+            _job, _job_handled = await self._ensure_durable_job_route(
+                event, source, _quick_key
+            )
+            if _job_handled:
+                return None
+            _quick_key = str(
+                getattr(event, "job_execution_key", None) or _quick_key
+            )
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -9316,12 +10290,11 @@ class GatewayRunner:
                     )
                 return None
             if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                if not event.is_command():
+                    self._ingest_durable_inbox_event(event, source, _quick_key)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    f"⏳ Gateway {self._status_action_gerund()} — message saved "
+                    "and will be routed when it comes back."
                 )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -9630,11 +10603,23 @@ class GatewayRunner:
                 return "Usage: /steer <prompt>  (no agent is running; sending as a normal message)"
             try:
                 event.text = steer_payload
+                event.durable_request_text = steer_payload
             except Exception:
                 pass
-            # Do NOT return — fall through to _handle_message_with_agent
-            # at the end of this function so the rewritten text is sent
-            # to the agent as a regular user turn.
+            if self._draining:
+                self._ingest_durable_inbox_event(event, source, _quick_key)
+                return (
+                    f"⏳ Gateway {self._status_action_gerund()} — message saved "
+                    "and will be routed when it comes back."
+                )
+            _job, _job_handled = await self._ensure_durable_job_route(
+                event, source, _quick_key
+            )
+            if _job_handled:
+                return None
+            _quick_key = str(
+                getattr(event, "job_execution_key", None) or _quick_key
+            )
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
@@ -9649,7 +10634,13 @@ class GatewayRunner:
             return await self._handle_transcribe_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            if not event.is_command():
+                self._ingest_durable_inbox_event(event, source, _quick_key)
+                return (
+                    f"⏳ Gateway {self._status_action_gerund()} — message saved "
+                    "and will be routed when it comes back."
+                )
+            return f"⏳ Gateway {self._status_action_gerund()} — command was not started."
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -9816,13 +10807,6 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        if self._is_telegram_topic_root_lobby(source):
-            # Debounce the lobby reminder so a user who forgets about
-            # topic mode and fires ten prompts doesn't get ten copies.
-            if self._should_send_telegram_lobby_reminder(source):
-                return self._telegram_topic_root_lobby_message()
-            return None
-
         durable_job_id = None
         if not is_internal or getattr(event, "durable_job_id", None):
             durable_job_id, suppress_work = self._prepare_durable_job(
@@ -9846,35 +10830,6 @@ class GatewayRunner:
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
-            # Goal continuation: after the agent returns a final response
-            # for this turn, check any standing /goal — the judge will
-            # either mark it done, pause it (budget), or enqueue a
-            # continuation prompt back through the adapter FIFO so the
-            # next turn makes more progress. Wrapped in try/except so a
-            # broken judge never breaks normal message handling.
-            try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
-                    try:
-                        session_entry = self.session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
-            except Exception as _goal_exc:
-                logger.debug("goal continuation hook failed: %s", _goal_exc)
-
             if isinstance(_agent_result, dict):
                 durable_result_text = str(
                     _agent_result.get("final_response") or ""
@@ -9890,23 +10845,84 @@ class GatewayRunner:
                 if store is not None and durable_job_id
                 else None
             )
+            result_is_current = True
             if durable_record and durable_record.get("status") in {
                 "pending",
                 "running",
                 "resume_pending",
             }:
-                if self._draining and not durable_result_text.strip():
+                defer_completion = bool(
+                    getattr(event, "durable_defer_completion", False)
+                )
+                if defer_completion:
+                    resume_reason = str(
+                        getattr(event, "durable_resume_reason", None)
+                        or "provider_unavailable"
+                    )
+                    store.mark_resume_pending(durable_job_id, resume_reason)
+                    try:
+                        self.session_store.mark_resume_pending(
+                            str(durable_record.get("session_key") or _quick_key),
+                            reason=resume_reason,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not mark session resumable for provider retry job %s",
+                            durable_job_id,
+                            exc_info=True,
+                        )
+                    self._schedule_durable_job_provider_retry(durable_job_id)
+                    result_is_current = False
+                elif self._draining and not durable_result_text.strip():
                     store.mark_resume_pending(
                         durable_job_id,
                         "restart_timeout"
                         if self._restart_requested
                         else "shutdown_timeout",
                     )
+                    result_is_current = False
                 else:
-                    self._complete_durable_job(
+                    result_is_current = self._complete_durable_job(
                         event,
                         durable_result_text,
                     )
+                    if not result_is_current:
+                        store.mark_resume_pending(
+                            durable_job_id,
+                            "newer_input_pending",
+                        )
+                        self._schedule_durable_job_continuation(durable_job_id)
+
+            if not result_is_current:
+                # A semantic scope update arrived after this attempt began and
+                # could not be consumed safely. The combined request is already
+                # durable; suppress this obsolete answer and let the continuation
+                # produce the one final response for the latest input version.
+                if isinstance(_agent_result, dict):
+                    _agent_result = dict(_agent_result)
+                    _agent_result["final_response"] = ""
+                    _agent_result["already_sent"] = False
+                else:
+                    _agent_result = None
+
+            # Goal continuation is only allowed after the same version that will
+            # be delivered has committed. A stale attempt must not enqueue more
+            # work based on an answer the user never sees.
+            if result_is_current and durable_result_text.strip():
+                try:
+                    session_entry = self.session_store.get_or_create_session(
+                        source,
+                        session_key_override=(
+                            getattr(event, "job_execution_key", None) or _quick_key
+                        ),
+                    )
+                    await self._post_turn_goal_continuation(
+                        session_entry=session_entry,
+                        source=source,
+                        final_response=durable_result_text,
+                    )
+                except Exception as _goal_exc:
+                    logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         except Exception as exc:
             self._fail_durable_job(event, exc)
@@ -10029,31 +11045,45 @@ class GatewayRunner:
                         image_paths,
                     )
 
+            # Durable Telegram intake already performed STT before semantic
+            # job routing and replaced event.text with the prepared transcript.
+            # Do not transcribe or post the transcript bubble a second time in
+            # the job-specific execution session.
+            if (
+                getattr(source, "platform", None) == Platform.TELEGRAM
+                and event.message_type == MessageType.VOICE
+                and event.telegram_voice_preprocessed
+            ):
+                audio_paths = []
+
             if audio_paths:
                 voice_rule = self._matching_telegram_voice_transcription_rule(event, source)
                 if (
                     getattr(source, "platform", None) == Platform.TELEGRAM
                     and event.message_type == MessageType.VOICE
                 ):
-                    # Telegram voice notes are owned by the gateway, including
-                    # replies, mentions, DMs, and free-response chats. First
-                    # apply STT/display settings; only a configured audio
-                    # trigger matched against the completed transcript may
-                    # continue into the AI agent. Addressing metadata must not
-                    # bypass this contract.
+                    # Telegram voice notes are always handled by the gateway for
+                    # STT and optional transcript display.  Whether they continue
+                    # to the agent remains the normal routing decision (all-mode,
+                    # direct mention, reply-to-bot) OR a transcript wake-word.
                     voice_rule = dict(voice_rule or {})
                     audio_trigger_enabled = self._telegram_audio_trigger_enabled(source)
                     show_transcription_enabled = self._telegram_show_transcription_enabled(
                         voice_rule,
                         source=source,
                     )
-                    if not show_transcription_enabled and not audio_trigger_enabled:
+                    if (
+                        not show_transcription_enabled
+                        and not audio_trigger_enabled
+                        and not event.telegram_agent_dispatch_eligible
+                    ):
                         return None
                     voice_rule.update({
                         "audio_trigger": audio_trigger_enabled,
                         "send_transcript": show_transcription_enabled,
                         "on_keyword_match": "run_ai",
                         "on_no_match": "transcript_only",
+                        "run_ai_if_addressed": bool(event.telegram_agent_dispatch_eligible),
                     })
                 if voice_rule is not None:
                     voice_rule_result = await self._apply_telegram_voice_transcription_rule(
@@ -10253,9 +11283,80 @@ class GatewayRunner:
                 pass
         return source
 
+    def _seed_new_job_history(
+        self,
+        event: MessageEvent,
+        session_entry: SessionEntry,
+    ) -> List[Dict[str, Any]]:
+        """Seed a new job branch from public history, never live private work."""
+        job_id = str(getattr(event, "durable_job_id", None) or "")
+        store = self._durable_store()
+        job = store.get(job_id) if store is not None and job_id else None
+        if not job:
+            return []
+        source_session_id = ""
+        parent_job_id = str(job.get("parent_job_id") or "")
+        if parent_job_id:
+            parent = store.get(parent_job_id)
+            source_session_id = str((parent or {}).get("session_id") or "")
+        if not source_session_id:
+            thread_key = str(job.get("thread_key") or "")
+            try:
+                self.session_store._ensure_loaded()
+                legacy_entry = self.session_store._entries.get(thread_key)
+            except Exception:
+                legacy_entry = None
+            if legacy_entry is not None:
+                source_session_id = str(legacy_entry.session_id or "")
+        if not source_session_id or source_session_id == session_entry.session_id:
+            return []
+        source_history = self.session_store.load_transcript(source_session_id)
+        public_history: List[Dict[str, Any]] = []
+        for item in source_history[-80:]:
+            role = item.get("role")
+            content = item.get("content")
+            if role not in {"user", "assistant"} or not content:
+                continue
+            if item.get("tool_calls") or item.get("tool_call_id"):
+                continue
+            public_history.append({"role": role, "content": str(content)})
+        if public_history:
+            self.session_store.rewrite_transcript(
+                session_entry.session_id, public_history
+            )
+            store.append_job_event(
+                job_id,
+                "context_seeded",
+                {
+                    "source_session_id": source_session_id,
+                    "message_count": len(public_history),
+                },
+            )
+        return public_history
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _job_id = str(getattr(event, "durable_job_id", None) or "")
+        if _job_id and not getattr(event, "durable_recovery", False):
+            _job_store = self._durable_store()
+            _job_record = _job_store.get(_job_id) if _job_store is not None else None
+            if _job_record is not None:
+                _current_version = int(_job_record.get("input_version") or 1)
+                _event_version = int(getattr(event, "job_input_version", None) or 1)
+                if _current_version > _event_version:
+                    _inputs = _job_store.inputs_for_job(_job_id)
+                    _parts = [
+                        str(item.get("request_text") or "").strip()
+                        for item in _inputs
+                        if str(item.get("request_text") or "").strip()
+                    ]
+                    if _parts:
+                        event.text = "\n\n[Additional user instruction]\n".join(_parts)
+                    event.durable_request_text = str(
+                        _job_record.get("request_text") or event.text or ""
+                    )
+                    event.job_input_version = _current_version
         # Preserve the actual inbound user text before topic auto-skill bodies,
         # reply context, media notes, or sender attribution are prepended.
         # Intent guards must never classify instructions inside those injected
@@ -10290,7 +11391,12 @@ class GatewayRunner:
             event.source = source
         except Exception:
             pass
-        session_entry = self.session_store.get_or_create_session(source)
+        session_entry = self.session_store.get_or_create_session(
+            source,
+            session_key_override=(
+                getattr(event, "job_execution_key", None) or _quick_key
+            ),
+        )
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         self._bind_durable_job_session(
@@ -10394,6 +11500,7 @@ class GatewayRunner:
                 or getattr(event, "durable_request_text", None)
                 or ""
             ),
+            job_id=str(getattr(event, "durable_job_id", None) or ""),
         )
         
         # Read privacy.redact_pii from config (re-read per message)
@@ -10522,6 +11629,8 @@ class GatewayRunner:
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
+        if not history and getattr(event, "job_execution_key", None):
+            history = self._seed_new_job_history(event, session_entry)
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -10903,6 +12012,15 @@ class GatewayRunner:
             history=history,
         )
         if message_text is None:
+            # Legacy/no-durable-store fallback. Normal durable Telegram voice
+            # intake handles transcript-only events before a private job
+            # session is created; either way the transcript belongs to the
+            # canonical public topic history.
+            self._persist_telegram_transcript_only_context(
+                event,
+                source,
+                str(getattr(event, "job_thread_key", None) or self._session_key_for_source(source)),
+            )
             return
 
         # Bind this gateway run generation to the adapter's active-session
@@ -10978,6 +12096,12 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            if (
+                getattr(event, "durable_job_id", None)
+                and _is_retryable_provider_failure_result(agent_result)
+            ):
+                event.durable_defer_completion = True
+                event.durable_resume_reason = "provider_unavailable"
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -11173,6 +12297,15 @@ class GatewayRunner:
                     "failure in session %s to prevent session growth loop.",
                     session_entry.session_id,
                 )
+            elif agent_failed_early and getattr(event, "durable_recovery", False):
+                # The original request is already durable in gateway_jobs and was
+                # persisted by the first failed attempt when possible. Re-appending
+                # it on every provider retry would grow the transcript forever.
+                logger.info(
+                    "Durable recovery attempt failed for session %s — keeping the "
+                    "existing transcript without duplicating the user turn.",
+                    session_entry.session_id,
+                )
             elif agent_failed_early:
                 logger.info(
                     "Transient agent failure in session %s — persisting user "
@@ -11227,6 +12360,8 @@ class GatewayRunner:
             # entries that were stripped before the agent saw them.
             if is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
+            elif agent_failed_early and getattr(event, "durable_recovery", False):
+                pass  # Original request is already stored by the durable job.
             elif agent_failed_early:
                 # Transient failure (429/timeout/5xx): persist only the user
                 # message so the next message can load a transcript that
@@ -11294,6 +12429,32 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+
+            if getattr(event, "durable_defer_completion", False):
+                # Do not turn an infrastructure failure into the job's terminal
+                # assistant response.  The outer lifecycle marks this exact job
+                # resume_pending and schedules a continuation after backoff.
+                if not getattr(event, "durable_recovery", False):
+                    _retry_adapter = self.adapters.get(source.platform)
+                    if _retry_adapter:
+                        try:
+                            await _retry_adapter.send(
+                                source.chat_id,
+                                "⏳ The model provider is temporarily unavailable. "
+                                "This job is saved and will continue automatically; "
+                                "I’ll send the final result when it succeeds.",
+                                metadata=self._thread_metadata_for_source(
+                                    source,
+                                    self._reply_anchor_for_event(event),
+                                ),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not send provider-retry notice for durable job %s",
+                                getattr(event, "durable_job_id", "?"),
+                                exc_info=True,
+                            )
+                return None
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -11960,7 +13121,18 @@ class GatewayRunner:
 
         # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        thread_key = self._session_key_for_source(source)
+        thread_jobs: list[Dict[str, Any]] = []
+        store = self._durable_store()
+        if store is not None:
+            try:
+                thread_jobs = store.active_for_thread(thread_key)
+            except Exception:
+                logger.debug("Failed to read durable jobs for /status", exc_info=True)
+        is_running = session_key in self._running_agents or any(
+            str(job.get("session_key") or "") in self._running_agents
+            for job in thread_jobs
+        )
 
         # Count pending /queue follow-ups (slot + overflow).
         adapter = self.adapters.get(source.platform) if source else None
@@ -12005,23 +13177,20 @@ class GatewayRunner:
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
-        active_job_id = str(
-            getattr(self, "_active_job_ids", {}).get(session_key) or ""
-        )
-        if not active_job_id:
-            store = self._durable_store()
-            if store is not None:
-                try:
-                    jobs = store.active_for_session(session_key)
-                    if jobs:
-                        active_job_id = str(jobs[-1].get("job_id") or "")
-                except Exception:
-                    logger.debug(
-                        "Failed to read durable job for /status",
-                        exc_info=True,
-                    )
-        if active_job_id:
-            lines.append(f"Job ID: `{active_job_id}`")
+        if len(thread_jobs) == 1:
+            lines.append(f"Job ID: `{thread_jobs[0]['job_id']}`")
+        elif thread_jobs:
+            lines.append(f"Active jobs: {len(thread_jobs)}")
+            for job in thread_jobs:
+                summary = str(
+                    job.get("routing_summary") or job.get("request_text") or ""
+                ).replace("\n", " ").strip()
+                if len(summary) > 80:
+                    summary = summary[:77] + "…"
+                lines.append(
+                    f"- `{job['job_id']}` [{job.get('status')}]"
+                    + (f" — {summary}" if summary else "")
+                )
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         lines.extend([
@@ -12177,6 +13346,40 @@ class GatewayRunner:
         The session is preserved so the user can continue the conversation.
         """
         source = event.source
+        thread_key = self._session_key_for_source(source)
+        store = self._durable_store()
+        if store is not None:
+            active_jobs = store.active_for_thread(thread_key)
+            replied_job = store.job_for_delivery_message(
+                thread_key,
+                getattr(event, "reply_to_message_id", None),
+            )
+            if replied_job and str(replied_job.get("status") or "") in {
+                "pending",
+                "running",
+                "resume_pending",
+            }:
+                target_jobs = [replied_job]
+            else:
+                target_jobs = active_jobs
+            if target_jobs:
+                for job in target_jobs:
+                    execution_key = str(job.get("session_key") or "")
+                    if execution_key:
+                        await self._interrupt_and_clear_session(
+                            execution_key,
+                            source,
+                            interrupt_reason=_INTERRUPT_REASON_STOP,
+                            invalidation_reason="stop_command_job",
+                        )
+                logger.info(
+                    "STOP by %s — interrupted %d durable job(s): %s",
+                    thread_key,
+                    len(target_jobs),
+                    ", ".join(str(job.get("job_id") or "") for job in target_jobs),
+                )
+                return EphemeralReply(t("gateway.stop.stopped"))
+
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
@@ -17563,6 +18766,7 @@ class GatewayRunner:
         context: SessionContext,
         *,
         user_request_text: str = "",
+        job_id: str = "",
     ) -> list:
         """Set session context variables for the current async task.
 
@@ -17599,6 +18803,7 @@ class GatewayRunner:
             memory_scope=str(getattr(context.source, "memory_scope", "") or "default"),
             topic_isolation="true" if getattr(context.source, "topic_isolation", False) else "false",
             user_request=str(user_request_text or ""),
+            job_id=str(job_id or ""),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -17820,11 +19025,15 @@ class GatewayRunner:
         rule: Dict[str, Any],
     ) -> Optional[str]:
         """Apply opt-in Telegram voice rules: send transcript and optionally run AI."""
+        run_ai_if_addressed = bool(rule.get("run_ai_if_addressed", False))
         if not getattr(self.config, "stt_enabled", True):
             # Preserve the established disabled-STT behavior (duration/path note
             # and existing setup/error handling) instead of bypassing config.
             enriched = await self._enrich_message_with_transcription(user_text, audio_paths)
-            if str(rule.get("on_no_match", "transcript_only")).lower() == "transcript_only":
+            if (
+                str(rule.get("on_no_match", "transcript_only")).lower() == "transcript_only"
+                and not run_ai_if_addressed
+            ):
                 return None
             return enriched
 
@@ -17865,7 +19074,17 @@ class GatewayRunner:
             )
             return f"{instruction}\n\n{message_text}" if message_text else instruction
 
-        if not matched and str(rule.get("on_no_match", "transcript_only")).lower() == "transcript_only":
+        if (
+            not matched
+            and str(rule.get("on_no_match", "transcript_only")).lower() == "transcript_only"
+            and not run_ai_if_addressed
+        ):
+            # This turn is intentionally transcript-only, but it remains a
+            # user message in the same Telegram topic. Preserve it so a later
+            # addressed request can rely on the transcript without requiring
+            # the user to paste it again.
+            if transcript_text:
+                event.telegram_transcript_only_history_text = message_text
             return None
         return message_text
 
@@ -18087,7 +19306,14 @@ class GatewayRunner:
                 # --- Agent-triggered completion: inject synthetic message ---
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                if agent_notify:
+                    # ``process(wait|poll|log)`` marks completion as consumed.
+                    # In that case the active agent turn already has the result,
+                    # so neither inject another turn nor fall through to the raw
+                    # text-only notification below.
+                    if _pr_check.is_completion_consumed(session_id):
+                        break
+
                     from tools.ansi_strip import strip_ansi
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
                     # Truncate at line boundaries so notifications never start
@@ -18840,6 +20066,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        durable_job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -18934,6 +20161,12 @@ class GatewayRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # A running job may receive a semantic scope update at any time. Keep
+        # its answer buffered until the input-version fence commits; otherwise
+        # a partial obsolete answer could already be visible before recovery
+        # reruns the combined request.
+        if durable_job_id:
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -19007,12 +20240,21 @@ class GatewayRunner:
                             "Proxy error (%d) from %s: %s",
                             resp.status, proxy_url, error_text[:500],
                         )
-                        return {
+                        proxy_error_result = {
                             "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
                         }
+                        if resp.status == 429 or resp.status >= 500:
+                            proxy_error_result.update(
+                                {
+                                    "completed": False,
+                                    "failed": True,
+                                    "error": f"HTTP {resp.status}: {error_text[:300]}",
+                                }
+                            )
+                        return proxy_error_result
 
                     # Parse SSE stream
                     buffer = ""
@@ -19068,8 +20310,14 @@ class GatewayRunner:
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "completed": False,
+                    "failed": True,
+                    "error": f"{type(e).__name__}: {e}",
                 }
             # Partial response — return what we got
+            proxy_stream_error = f"{type(e).__name__}: {e}"
+        else:
+            proxy_stream_error = None
         finally:
             # Finalize stream consumer
             if _stream_consumer:
@@ -19101,7 +20349,7 @@ class GatewayRunner:
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
-        return {
+        proxy_result = {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
                 {"role": "user", "content": message},
@@ -19113,6 +20361,16 @@ class GatewayRunner:
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
+        if proxy_stream_error:
+            proxy_result.update(
+                {
+                    "completed": False,
+                    "failed": True,
+                    "partial": True,
+                    "error": proxy_stream_error,
+                }
+            )
+        return proxy_result
 
     # ------------------------------------------------------------------
 
@@ -19166,11 +20424,6 @@ class GatewayRunner:
                     f"return a clear final result.]\n\n"
                     f"[Original user task]\n{_original_request}\n"
                 )
-            else:
-                message = _prepend_durable_job_registration_note(
-                    message,
-                    durable_job_id,
-                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -19180,6 +20433,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                durable_job_id=durable_job_id,
             )
 
         from run_agent import AIAgent
@@ -19288,6 +20542,18 @@ class GatewayRunner:
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        _cleanup_generation = int(
+            run_generation
+            if run_generation is not None
+            else self._session_run_generation.get(session_key, 0)
+        )
+        _cleanup_registry_key = (session_key, _cleanup_generation) if session_key else None
+        if _cleanup_progress and _cleanup_registry_key is not None:
+            registry = getattr(self, "_cleanup_progress_ids_by_run", None)
+            if registry is None:
+                registry = {}
+                self._cleanup_progress_ids_by_run = registry
+            registry[_cleanup_registry_key] = _cleanup_msg_ids
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -19861,6 +21127,20 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            # The conversation loop emits its terminal provider envelope through
+            # the status callback before returning the structured failed result.
+            # A durable job decides retryability from that result a moment later;
+            # sending the envelope now would publish a false terminal warning (and
+            # repeat it on every recovery attempt). Permanent failures still reach
+            # the user through the normal sanitized final-response path.
+            if durable_job_id and _looks_like_gateway_provider_error(
+                str(message or "")
+            ):
+                logger.debug(
+                    "Suppressing premature provider status for durable job %s",
+                    durable_job_id,
+                )
+                return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
                 event_type,
@@ -19977,6 +21257,8 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if durable_job_id:
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -20422,12 +21704,6 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 
-            message = _prepend_durable_job_registration_note(
-                message,
-                durable_job_id,
-                durable_recovery=durable_recovery,
-            )
-
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
@@ -20552,6 +21828,7 @@ class GatewayRunner:
                 # content list. Consume-and-clear so subsequent turns on the same
                 # runner instance don't re-attach stale images.
                 _native_imgs = self._consume_pending_native_image_paths(session_key)
+                _attached_native_imgs: List[str] = []
                 if _native_imgs:
                     try:
                         from agent.image_routing import build_native_content_parts
@@ -20566,6 +21843,15 @@ class GatewayRunner:
                             )
                         if any(p.get("type") == "image_url" for p in _parts):
                             _run_message: Any = _parts
+                            _skipped_set = {str(path) for path in _skipped}
+                            _attached_native_imgs = [
+                                str(path)
+                                for path in _native_imgs
+                                if str(path) not in _skipped_set
+                            ]
+                            _run_message = _wrap_current_message_with_attachment_guard(
+                                _run_message
+                            )
                         else:
                             # All images failed to read — fall back to plain text.
                             _run_message = message
@@ -20586,8 +21872,13 @@ class GatewayRunner:
                     "conversation_history": agent_history,
                     "task_id": session_id,
                 }
-                if observed_group_context:
-                    _conversation_kwargs["persist_user_message"] = message
+                if observed_group_context or _attached_native_imgs:
+                    _conversation_kwargs["persist_user_message"] = (
+                        _persisted_user_message_with_image_refs(
+                            message,
+                            _attached_native_imgs,
+                        )
+                    )
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
@@ -20787,9 +22078,11 @@ class GatewayRunner:
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
+                "failed": result_holder[0].get("failed", False) if result_holder[0] else False,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
+                "compression_exhausted": result_holder[0].get("compression_exhausted", False) if result_holder[0] else False,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
@@ -20849,6 +22142,26 @@ class GatewayRunner:
                 )
                 return
             self._running_agents[session_key] = agent_holder[0]
+            if durable_job_id:
+                job_id_for_callback = str(durable_job_id)
+
+                def _mark_steer_consumed(input_version: int) -> None:
+                    consumed = getattr(
+                        self, "_job_consumed_input_versions", None
+                    )
+                    if consumed is None:
+                        consumed = {}
+                        self._job_consumed_input_versions = consumed
+                    consumed[job_id_for_callback] = max(
+                        int(consumed.get(job_id_for_callback) or 1),
+                        int(input_version or 1),
+                    )
+
+                setattr(
+                    agent_holder[0],
+                    "_durable_steer_consumed_callback",
+                    _mark_steer_consumed,
+                )
             if self._draining:
                 self._update_runtime_status("draining")
         
@@ -21559,31 +22872,45 @@ class GatewayRunner:
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
         # breadcrumbs for the user to see what work happened. Only fires on
-        # adapters that support ``delete_message`` (see init above); failures
-        # are swallowed — deletion is best-effort.
+        # adapters that support ``delete_message`` (see init above). Deletion
+        # remains best-effort, but failures are visible and don't block later IDs.
         if (
             _cleanup_progress
             and _cleanup_adapter is not None
-            and _cleanup_msg_ids
             and session_key
             and isinstance(response, dict)
             and not response.get("failed")
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
-            _ids_snapshot = list(_cleanup_msg_ids)
             _chat_id_snapshot = source.chat_id
             _adapter_snapshot = _cleanup_adapter
             _loop_snapshot = asyncio.get_running_loop()
 
             def _cleanup_temp_bubbles() -> None:
                 async def _delete_all() -> None:
+                    _ids_snapshot = list(dict.fromkeys(_cleanup_msg_ids))
                     for _mid in _ids_snapshot:
                         try:
-                            await _adapter_snapshot.delete_message(
+                            deleted = await _adapter_snapshot.delete_message(
                                 _chat_id_snapshot, _mid
                             )
+                            if not deleted:
+                                logger.warning(
+                                    "Temporary progress cleanup failed: chat=%s message=%s",
+                                    _chat_id_snapshot,
+                                    _mid,
+                                )
                         except Exception:
-                            pass
+                            logger.warning(
+                                "Temporary progress cleanup raised: chat=%s message=%s",
+                                _chat_id_snapshot,
+                                _mid,
+                                exc_info=True,
+                            )
+                    if _cleanup_registry_key is not None:
+                        self._cleanup_progress_ids_by_run.pop(
+                            _cleanup_registry_key, None
+                        )
                 try:
                     safe_schedule_threadsafe(
                         _delete_all(), _loop_snapshot,
@@ -21591,7 +22918,14 @@ class GatewayRunner:
                         log_message="Temp bubble cleanup scheduling error",
                     )
                 except Exception:
-                    pass
+                    if _cleanup_registry_key is not None:
+                        self._cleanup_progress_ids_by_run.pop(
+                            _cleanup_registry_key, None
+                        )
+                    logger.warning(
+                        "Temp bubble cleanup scheduling error",
+                        exc_info=True,
+                    )
 
             try:
                 _cleanup_adapter.register_post_delivery_callback(
@@ -21600,7 +22934,13 @@ class GatewayRunner:
                     generation=run_generation,
                 )
             except Exception as _rpe:
-                logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
+                if _cleanup_registry_key is not None:
+                    self._cleanup_progress_ids_by_run.pop(_cleanup_registry_key, None)
+                logger.warning("Post-delivery cleanup registration failed: %s", _rpe)
+        elif _cleanup_registry_key is not None:
+            # Failed runs intentionally retain breadcrumbs, but their in-memory
+            # tracking bucket must not leak into a future run.
+            self._cleanup_progress_ids_by_run.pop(_cleanup_registry_key, None)
 
         return response
 

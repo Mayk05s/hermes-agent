@@ -1460,10 +1460,38 @@ def _wrap_pcm_as_wav(
     return riff_header + fmt_chunk + data_chunk_header + pcm_bytes
 
 
-def _gemini_tts_prompt_text(text: str, style: str) -> str:
-    """Mirror NanoClaw's Gemini TTS style prompt convention."""
+def _gemini_tts_prompt_text(
+    text: str,
+    style: str,
+    *,
+    minimal: bool = False,
+) -> str:
+    """Build an unambiguous audio-only Gemini TTS prompt.
+
+    Gemini's preview TTS classifiers can treat a bare transcript (or a
+    transcript followed by free-form style prose) as a text-generation
+    request.  A clear TTS preamble and an explicitly labelled transcript keep
+    the request on the speech-synthesis path.  ``minimal`` intentionally drops
+    director notes for the one-shot classifier recovery retry.
+    """
+    transcript = str(text or "").strip()
+    if minimal:
+        return (
+            "TTS: Synthesize speech only. Read the transcript below verbatim "
+            "and return audio only. Do not answer, rewrite, explain, or add "
+            "words.\n\n"
+            f"TRANSCRIPT — READ VERBATIM:\n{transcript}"
+        )
+
+    sections = [
+        "TTS: Synthesize speech only from the transcript below and return "
+        "audio only. Do not answer, rewrite, explain, or add words."
+    ]
     style = str(style or "").strip()
-    return f"{text}\n\nStyle: {style}" if style else text
+    if style:
+        sections.append(f"VOICE DIRECTION (DO NOT READ ALOUD):\n{style}")
+    sections.append(f"TRANSCRIPT — READ VERBATIM:\n{transcript}")
+    return "\n\n".join(sections)
 
 
 def _gemini_tts_feedback_detail(data: Dict[str, Any]) -> str:
@@ -1474,6 +1502,29 @@ def _gemini_tts_feedback_detail(data: Dict[str, Any]) -> str:
     if reason:
         return f" (promptFeedback blockReason={reason})"
     return " (promptFeedback present)"
+
+
+class GeminiTTSGenerationError(RuntimeError):
+    """Gemini TTS failure with safe per-model diagnostics for the agent."""
+
+    def __init__(self, message: str, attempts: list[Dict[str, Any]]):
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def _gemini_tts_should_retry_with_minimal_prompt(
+    failure: Dict[str, Any],
+) -> bool:
+    """Return whether a failed request merits one classifier-safe retry."""
+    if failure.get("error_code") == "content_policy_block":
+        return True
+    try:
+        if int(failure.get("http_status") or 0) >= 500:
+            return True
+    except (TypeError, ValueError):
+        pass
+    detail = str(failure.get("detail") or "").lower()
+    return "model tried to generate text" in detail
 
 
 def _extract_gemini_tts_audio_b64(data: Dict[str, Any]) -> str:
@@ -1529,8 +1580,12 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         or DEFAULT_GEMINI_TTS_BASE_URL
     ).strip().rstrip("/")
 
+    prompt_variants = (
+        ("directed", _gemini_tts_prompt_text(text, style)),
+        ("minimal_retry", _gemini_tts_prompt_text(text, "", minimal=True)),
+    )
     payload: Dict[str, Any] = {
-        "contents": [{"parts": [{"text": _gemini_tts_prompt_text(text, style)}]}],
+        "contents": [{"parts": [{"text": prompt_variants[0][1]}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
@@ -1548,43 +1603,96 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     last_error = ""
     audio_b64 = ""
     used_model = model
-    for attempt_model in attempt_models:
+    failed_attempts: list[Dict[str, Any]] = []
+    for model_index, attempt_model in enumerate(attempt_models):
         endpoint = f"{base_url}/models/{attempt_model}:generateContent"
-        response = requests.post(
-            endpoint,
-            params={"key": api_key},
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=60,
-        )
-        if response.status_code != 200:
-            # Surface the API error message when present.
-            try:
-                err = response.json().get("error", {})
-                detail = err.get("message") or response.text[:300]
-            except Exception:
-                detail = response.text[:300]
-            last_error = (
-                f"Gemini TTS API error (HTTP {response.status_code}): {detail}"
+        for prompt_index, (prompt_variant, prompt_text) in enumerate(prompt_variants):
+            payload["contents"][0]["parts"][0]["text"] = prompt_text
+            response = requests.post(
+                endpoint,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=60,
             )
-        else:
-            try:
-                audio_b64 = _extract_gemini_tts_audio_b64(response.json())
-                used_model = attempt_model
-                break
-            except RuntimeError as e:
-                last_error = str(e)
+            if response.status_code != 200:
+                # Surface the API error message when present.
+                try:
+                    err = response.json().get("error", {})
+                    detail = err.get("message") or response.text[:300]
+                    provider_status = err.get("status")
+                except Exception:
+                    detail = response.text[:300]
+                    provider_status = None
+                last_error = (
+                    f"Gemini TTS API error (HTTP {response.status_code}): {detail}"
+                )
+                failure = {
+                    "model": attempt_model,
+                    "prompt_variant": prompt_variant,
+                    "error_code": "api_error",
+                    "http_status": response.status_code,
+                    "provider_status": provider_status,
+                    "detail": last_error,
+                }
+            else:
+                try:
+                    response_data = response.json()
+                    audio_b64 = _extract_gemini_tts_audio_b64(response_data)
+                    used_model = attempt_model
+                    break
+                except RuntimeError as e:
+                    last_error = str(e)
+                    feedback = (
+                        response_data.get("promptFeedback")
+                        if isinstance(response_data, dict)
+                        else None
+                    )
+                    block_reason = (
+                        feedback.get("blockReason")
+                        if isinstance(feedback, dict)
+                        else None
+                    )
+                    failure = {
+                        "model": attempt_model,
+                        "prompt_variant": prompt_variant,
+                        "error_code": (
+                            "content_policy_block"
+                            if block_reason
+                            else "malformed_response"
+                        ),
+                        "provider_reason": block_reason,
+                        "detail": last_error,
+                    }
 
-        if attempt_model != attempt_models[-1]:
+            failed_attempts.append(failure)
+            if (
+                prompt_index == 0
+                and _gemini_tts_should_retry_with_minimal_prompt(failure)
+            ):
+                logger.warning(
+                    "Gemini TTS attempt with model %s was rejected by the "
+                    "speech classifier; retrying the same model with a minimal "
+                    "audio-only transcript prompt: %s",
+                    attempt_model,
+                    last_error,
+                )
+                continue
+            break
+
+        if audio_b64:
+            break
+
+        if model_index < len(attempt_models) - 1:
             logger.warning(
                 "Gemini TTS attempt with model %s failed; retrying %s: %s",
                 attempt_model,
-                attempt_models[attempt_models.index(attempt_model) + 1],
+                attempt_models[model_index + 1],
                 last_error,
             )
             continue
 
-        raise RuntimeError(last_error)
+        raise GeminiTTSGenerationError(last_error, failed_attempts)
 
     if used_model != model:
         logger.info("Gemini TTS used fallback model %s after %s failed", used_model, model)
@@ -2263,6 +2371,85 @@ def text_to_speech_tool(
         error_msg = f"TTS dependency missing ({provider}): {e}"
         logger.error("%s", error_msg, exc_info=True)
         return tool_error(error_msg, success=False)
+    except GeminiTTSGenerationError as e:
+        gemini_config = tts_config.get("gemini", {})
+        configured_model = str(
+            gemini_config.get("model", DEFAULT_GEMINI_TTS_MODEL)
+        ).strip() or DEFAULT_GEMINI_TTS_MODEL
+        fallback_model = str(gemini_config.get("fallback_model", "")).strip()
+        attempts = e.attempts
+        attempt_codes = {
+            str(attempt.get("error_code") or "")
+            for attempt in attempts
+            if isinstance(attempt, dict)
+        }
+        content_policy_block = (
+            bool(attempts)
+            and attempt_codes == {"content_policy_block"}
+        )
+        error_code = (
+            "content_policy_block"
+            if content_policy_block
+            else "generation_failed"
+        )
+        fallback_attempted = bool(
+            fallback_model
+            and any(
+                attempt.get("model") == fallback_model
+                for attempt in attempts
+                if isinstance(attempt, dict)
+            )
+        )
+        if content_policy_block:
+            explanation = (
+                "Gemini accepted the API request but its content-safety filter "
+                "blocked the synthesis prompt and returned no audio. This can "
+                "be a false positive and is not evidence that Telegram, the "
+                "API key, or the whole TTS service is unavailable."
+            )
+            recovery = (
+                "Retry with a shorter neutral style prompt or configure a "
+                "fallback Gemini TTS model."
+                if not fallback_model
+                else "Retry with a shorter neutral style prompt or use another TTS provider."
+            )
+        else:
+            explanation = (
+                "Gemini TTS did not produce audio. Inspect each attempted "
+                "model below; the failure may be an API, model, or response error."
+            )
+            recovery = (
+                "Use the per-model attempt details to choose a retry, fallback model, "
+                "or provider change."
+            )
+
+        error_msg = f"TTS generation failed ({provider}): {e}"
+        logger.error("%s", error_msg, exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": error_msg,
+            "error_code": error_code,
+            "provider": provider,
+            "configured_model": configured_model,
+            "attempted_models": list(dict.fromkeys(
+                attempt.get("model")
+                for attempt in attempts
+                if isinstance(attempt, dict) and attempt.get("model")
+            )),
+            "attempts": attempts,
+            "fallback_model": fallback_model or None,
+            "fallback_configured": bool(fallback_model),
+            "fallback_attempted": fallback_attempted,
+            "explanation": explanation,
+            "recovery": recovery,
+            "assistant_instruction": (
+                "Explain the actual failure to the user. Name the provider/model, "
+                "distinguish a content-policy block from a service outage, say "
+                "whether a fallback was configured and attempted, and give the "
+                "relevant next step. Do not reduce this to a generic 'service "
+                "unavailable' message."
+            ),
+        }, ensure_ascii=False)
     except Exception as e:
         # Unexpected errors
         error_msg = f"TTS generation failed ({provider}): {e}"
@@ -2645,7 +2832,7 @@ from tools.registry import registry, tool_error
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Uses the configured default voice unless the user explicitly requests a different voice or delivery style; then pass voice and/or style as one-request overrides without changing defaults.",
+    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Uses the configured default voice unless the user explicitly requests a different voice or delivery style; then pass voice and/or style as one-request overrides without changing defaults. If success is false, inspect error_code, attempts, and fallback fields and explain the concrete failure to the user. Distinguish a provider content-policy block from an outage, state whether fallback was configured and attempted, and do not replace the diagnostics with a generic service-unavailable message.",
     "parameters": {
         "type": "object",
         "properties": {

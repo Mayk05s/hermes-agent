@@ -73,12 +73,12 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("specialist", props)
         self.assertEqual(
             props["specialist"]["enum"],
-            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder"],
+            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder", "sidense_video_prompt"],
         )
         self.assertIn("specialist", props["tasks"]["items"]["properties"])
         self.assertEqual(
             props["tasks"]["items"]["properties"]["specialist"]["enum"],
-            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder"],
+            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder", "sidense_video_prompt"],
         )
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
@@ -265,6 +265,21 @@ class TestHealthSpecialistContracts(unittest.TestCase):
 
         self.assertEqual(task["_specialist"], "miniapp_builder")
         self.assertIn('skill_view(name="telegram_family/miniapp-builder")', task["goal"])
+
+    @patch("tools.delegate_tool._load_config", return_value={"specialist_models": {"sidense_video_prompt": "gpt-5.6-sol"}})
+    def test_sidense_specialist_is_callable_and_uses_sol_override(self, _mock_config):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Продолжи Studio-сценарий BoxMap после зафиксированного начала.",
+                "specialist": "sidense_video_prompt",
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "sidense_video_prompt")
+        self.assertEqual(task["_specialist_label"], "🎬 *Sidense Video Prompt*")
+        self.assertEqual(task["_specialist_model"], "gpt-5.6-sol")
+        self.assertIn('skill_view(name="sidense-video-prompt-specialist")', task["goal"])
+        self.assertEqual(task["toolsets"], ["skills", "vision"])
 
     def test_unknown_specialist_leaves_task_unchanged(self):
         task = {"goal": "Do ordinary research.", "specialist": "sleep"}

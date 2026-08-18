@@ -1,6 +1,7 @@
 """Tests for the Google Gemini TTS provider in tools/tts_tool.py."""
 
 import base64
+import json
 import struct
 from unittest.mock import MagicMock, patch
 
@@ -200,7 +201,7 @@ class TestGenerateGeminiTts:
         endpoint = mock_post.call_args[0][0]
         assert "gemini-2.5-pro-preview-tts" in endpoint
 
-    def test_custom_style_appended_like_nanoclaw(
+    def test_custom_style_is_separated_from_verbatim_transcript(
         self, tmp_path, monkeypatch, mock_gemini_response
     ):
         from tools.tts_tool import _generate_gemini_tts
@@ -212,11 +213,12 @@ class TestGenerateGeminiTts:
             _generate_gemini_tts("Привет", str(tmp_path / "test.wav"), config)
 
         payload = mock_post.call_args[1]["json"]
-        assert payload["contents"][0]["parts"][0]["text"] == (
-            "Привет\n\nStyle: warm, calm Russian voice"
-        )
+        prompt = payload["contents"][0]["parts"][0]["text"]
+        assert prompt.startswith("TTS: Synthesize speech only")
+        assert "VOICE DIRECTION (DO NOT READ ALOUD):\nwarm, calm Russian voice" in prompt
+        assert prompt.endswith("TRANSCRIPT — READ VERBATIM:\nПривет")
 
-    def test_blank_style_keeps_plain_text(
+    def test_blank_style_still_uses_explicit_audio_only_preamble(
         self, tmp_path, monkeypatch, mock_gemini_response
     ):
         from tools.tts_tool import _generate_gemini_tts
@@ -228,7 +230,10 @@ class TestGenerateGeminiTts:
             _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), config)
 
         payload = mock_post.call_args[1]["json"]
-        assert payload["contents"][0]["parts"][0]["text"] == "Hi"
+        prompt = payload["contents"][0]["parts"][0]["text"]
+        assert prompt.startswith("TTS: Synthesize speech only")
+        assert "VOICE DIRECTION" not in prompt
+        assert prompt.endswith("TRANSCRIPT — READ VERBATIM:\nHi")
 
     def test_response_modality_is_audio(self, tmp_path, monkeypatch, mock_gemini_response):
         from tools.tts_tool import _generate_gemini_tts
@@ -281,7 +286,41 @@ class TestGenerateGeminiTts:
             with pytest.raises(RuntimeError, match="malformed"):
                 _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), {})
 
-    def test_fallback_model_after_prompt_feedback_block(
+    def test_block_without_fallback_preserves_attempt_diagnostics(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.tts_tool import GeminiTTSGenerationError, _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        blocked = MagicMock()
+        blocked.status_code = 200
+        blocked.json.return_value = {
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+        }
+        config = {
+            "gemini": {
+                "model": "primary-tts-model",
+                "fallback_model": "",
+            }
+        }
+
+        with patch("requests.post", return_value=blocked):
+            with pytest.raises(GeminiTTSGenerationError) as exc_info:
+                _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), config)
+
+        assert len(exc_info.value.attempts) == 2
+        assert {attempt["prompt_variant"] for attempt in exc_info.value.attempts} == {
+            "directed",
+            "minimal_retry",
+        }
+        assert all(
+            attempt["model"] == "primary-tts-model"
+            and attempt["error_code"] == "content_policy_block"
+            and attempt["provider_reason"] == "PROHIBITED_CONTENT"
+            for attempt in exc_info.value.attempts
+        )
+
+    def test_prompt_feedback_block_retries_same_model_with_minimal_prompt(
         self, tmp_path, monkeypatch, mock_gemini_response
     ):
         from tools.tts_tool import _generate_gemini_tts
@@ -307,8 +346,77 @@ class TestGenerateGeminiTts:
             _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), config)
 
         assert "gemini-3.1-flash-tts-preview" in mock_post.call_args_list[0][0][0]
-        assert "gemini-2.5-flash-preview-tts" in mock_post.call_args_list[1][0][0]
+        assert "gemini-3.1-flash-tts-preview" in mock_post.call_args_list[1][0][0]
+        retry_prompt = mock_post.call_args_list[1][1]["json"]["contents"][0]["parts"][0]["text"]
+        assert "VOICE DIRECTION" not in retry_prompt
+        assert retry_prompt.endswith("TRANSCRIPT — READ VERBATIM:\nHi")
         assert (tmp_path / "test.wav").read_bytes()[:4] == b"RIFF"
+
+    def test_fallback_model_after_both_primary_prompt_variants_fail(
+        self, tmp_path, monkeypatch, mock_gemini_response
+    ):
+        from tools.tts_tool import _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        blocked = MagicMock()
+        blocked.status_code = 200
+        blocked.json.return_value = {
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+        }
+        config = {
+            "gemini": {
+                "model": "primary-tts-model",
+                "fallback_model": "fallback-tts-model",
+            }
+        }
+
+        with patch(
+            "requests.post",
+            side_effect=[blocked, blocked, mock_gemini_response],
+        ) as mock_post:
+            _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), config)
+
+        assert len(mock_post.call_args_list) == 3
+        assert "primary-tts-model" in mock_post.call_args_list[0][0][0]
+        assert "primary-tts-model" in mock_post.call_args_list[1][0][0]
+        assert "fallback-tts-model" in mock_post.call_args_list[2][0][0]
+        assert (tmp_path / "test.wav").read_bytes()[:4] == b"RIFF"
+
+    def test_tool_returns_actionable_content_block_diagnostics(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.tts_tool import text_to_speech_tool
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        blocked = MagicMock()
+        blocked.status_code = 200
+        blocked.json.return_value = {
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+        }
+        config = {
+            "provider": "gemini",
+            "gemini": {
+                "model": "primary-tts-model",
+                "fallback_model": "",
+                "voice": "Enceladus",
+            },
+        }
+
+        with patch("tools.tts_tool._load_tts_config", return_value=config), \
+             patch("requests.post", return_value=blocked):
+            result = json.loads(text_to_speech_tool(
+                "спасибо", output_path=str(tmp_path / "test.wav")
+            ))
+
+        assert result["success"] is False
+        assert result["error_code"] == "content_policy_block"
+        assert result["configured_model"] == "primary-tts-model"
+        assert result["attempted_models"] == ["primary-tts-model"]
+        assert result["attempts"][0]["provider_reason"] == "PROHIBITED_CONTENT"
+        assert result["fallback_configured"] is False
+        assert result["fallback_attempted"] is False
+        assert "not evidence" in result["explanation"]
+        assert "Do not reduce this" in result["assistant_instruction"]
 
     def test_snake_case_inline_data_accepted(self, tmp_path, monkeypatch, fake_pcm_bytes):
         """Some Gemini SDK versions return inline_data instead of inlineData."""

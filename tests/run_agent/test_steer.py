@@ -72,6 +72,20 @@ class TestSteerDrain:
 
 
 class TestSteerInjection:
+    def test_durable_input_version_acknowledged_only_after_injection(self):
+        agent = _bare_agent()
+        consumed = []
+        agent._durable_steer_consumed_callback = consumed.append
+        agent.steer("add recipe", input_version=2)
+        assert consumed == []
+        messages = [
+            {"role": "tool", "content": "menu draft", "tool_call_id": "1"}
+        ]
+
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert consumed == [2]
+
     def test_appends_to_last_tool_result(self):
         agent = _bare_agent()
         agent.steer("please also check auth.log")

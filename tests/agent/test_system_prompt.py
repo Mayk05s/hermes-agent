@@ -80,6 +80,8 @@ class TestConnectedToolGuidance:
         assert GOOGLE_CALENDAR_TOOL_GUIDANCE in prompt
         assert "prior assistant messages" in prompt
         assert "only after calling `google_calendar`" in prompt
+        assert "standalone request" in prompt
+        assert "is not a Calendar request" in prompt
 
     def test_calendar_guidance_absent_without_function(self):
         prompt = self._stable_prompt(_make_agent(valid_tool_names={"terminal"}))

@@ -82,6 +82,10 @@ _SESSION_TOPIC_ISOLATION: ContextVar = ContextVar("HERMES_SESSION_TOPIC_ISOLATIO
 # use this as provenance for actions that must only happen on an explicit
 # request (for example, sending a message outside the originating chat).
 _SESSION_USER_REQUEST: ContextVar = ContextVar("HERMES_SESSION_USER_REQUEST", default=_UNSET)
+# Stable execution identity for the current durable gateway job. This is
+# runtime metadata, not prompt text, so tools can checkpoint against it without
+# teaching the model to manufacture or reinterpret IDs.
+_JOB_ID: ContextVar = ContextVar("HERMES_JOB_ID", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -107,6 +111,7 @@ _VAR_MAP = {
     "HERMES_SESSION_MEMORY_SCOPE": _SESSION_MEMORY_SCOPE,
     "HERMES_SESSION_TOPIC_ISOLATION": _SESSION_TOPIC_ISOLATION,
     "HERMES_SESSION_USER_REQUEST": _SESSION_USER_REQUEST,
+    "HERMES_JOB_ID": _JOB_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -145,6 +150,7 @@ def set_session_vars(
     memory_scope: str = "",
     topic_isolation: str = "",
     user_request: str = "",
+    job_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -171,6 +177,7 @@ def set_session_vars(
         _SESSION_MEMORY_SCOPE.set(memory_scope),
         _SESSION_TOPIC_ISOLATION.set(topic_isolation),
         _SESSION_USER_REQUEST.set(user_request),
+        _JOB_ID.set(job_id),
     ]
     return tokens
 
@@ -203,6 +210,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MEMORY_SCOPE,
         _SESSION_TOPIC_ISOLATION,
         _SESSION_USER_REQUEST,
+        _JOB_ID,
     ):
         var.set("")
 

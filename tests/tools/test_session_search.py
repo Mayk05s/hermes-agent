@@ -531,6 +531,105 @@ class TestDiscoveryShape:
         }
         assert after["access_scope"]["grants"][0]["mode"] == "chat"
 
+    def test_persistent_all_chats_grant_covers_telegram_without_prompt(
+        self, db, monkeypatch
+    ):
+        _set_gateway_topic(
+            monkeypatch,
+            chat_id="179555559",
+            thread_id="",
+            profile_name="personal",
+            topic_isolation=False,
+        )
+        db.create_session(
+            "main-dm",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="179555559",
+                thread_id="",
+                profile_name="personal",
+                topic_isolation=False,
+            ),
+        )
+        db.append_message("main-dm", role="user", content="globalgrant current")
+        db.create_session(
+            "family-travel",
+            source="telegram",
+            access_scope=_telegram_scope(
+                chat_id="-1003966683704",
+                thread_id="359",
+                profile_name="family-chat",
+            ),
+        )
+        db.append_message("family-travel", role="user", content="globalgrant family")
+        db.create_session(
+            "other-platform",
+            source="discord",
+            access_scope=json.dumps({"origin": {
+                "platform": "discord",
+                "chat_id": "123",
+                "thread_id": "",
+                "profile_name": "other-profile",
+            }}),
+        )
+        db.append_message("other-platform", role="user", content="globalgrant discord")
+
+        persistent_target = {
+            "mode": "platform",
+            "platform": "telegram",
+            "chat_id": "*",
+            "thread_id": "",
+            "profile_name": "personal",
+            "label": "all chats on this platform",
+        }
+        monkeypatch.setattr(
+            recall_access_mod,
+            "_load_active_config",
+            lambda: ({"recall_access": {"grants": [{
+                "source": {
+                    "platform": "telegram",
+                    "chat_id": "179555559",
+                    "thread_id": "",
+                    "profile_name": "personal",
+                },
+                "target": persistent_target,
+            }]}}, None),
+        )
+
+        def unexpected_prompt(_question, _choices):
+            raise AssertionError("an existing persistent grant must not prompt again")
+
+        grant = json.loads(recall_access_tool(
+            target="telegram:-1003966683704:359",
+            reason="Проверить семейный топик Путешествия",
+            callback=unexpected_prompt,
+        ))
+        assert grant["granted"] is True
+        assert grant["approval"] == "existing_grant"
+
+        result = json.loads(session_search(query="globalgrant", limit=10, db=db))
+        assert {r["session_id"] for r in result["results"]} == {
+            "main-dm",
+            "family-travel",
+        }
+
+    def test_all_chats_alias_resolves_to_current_platform(self, monkeypatch):
+        _set_gateway_topic(
+            monkeypatch,
+            chat_id="179555559",
+            thread_id="",
+            profile_name="personal",
+            topic_isolation=False,
+        )
+        assert resolve_recall_target("all_chats") == {
+            "mode": "platform",
+            "platform": "telegram",
+            "chat_id": "*",
+            "thread_id": "",
+            "profile_name": "personal",
+            "label": "all chats on this platform",
+        }
+
     def test_recall_access_denial_does_not_expand_scope(self, db, monkeypatch):
         _set_gateway_topic(monkeypatch)
         db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())

@@ -8,6 +8,7 @@ import pytest
 
 import gateway.run as gateway_run
 from agent.i18n import t
+from gateway.durable_jobs import DurableJobStore
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 from gateway.session import SessionEntry, build_session_key
@@ -19,6 +20,9 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     # Ensure INVOCATION_ID is NOT set — systemd sets this in service mode,
     # which changes the restart call signature.
     monkeypatch.delenv("INVOCATION_ID", raising=False)
+    # /restart is explicitly operator-only; make the test sender the
+    # platform owner so this test exercises drain behaviour, not ACL denial.
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "u1")
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     event = MessageEvent(
@@ -48,8 +52,9 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
 
 
 @pytest.mark.asyncio
-async def test_drain_queue_mode_queues_follow_up_without_interrupt():
+async def test_drain_queue_mode_persists_follow_up_without_guessing_job(tmp_path):
     runner, adapter = make_restart_runner()
+    runner._durable_job_store = DurableJobStore(tmp_path / "jobs.sqlite3")
     runner._draining = True
     runner._restart_requested = True
     runner._busy_input_mode = "queue"
@@ -65,15 +70,19 @@ async def test_drain_queue_mode_queues_follow_up_without_interrupt():
 
     await adapter.handle_message(event)
 
-    assert session_key in adapter._pending_messages
-    assert adapter._pending_messages[session_key].text == "follow up"
+    assert session_key not in adapter._pending_messages
     assert not adapter._active_sessions[session_key].is_set()
-    assert any("queued for the next turn" in message for message in adapter.sent)
+    inbox = runner._durable_store().unrouted_inbox_events()
+    assert len(inbox) == 1
+    assert inbox[0]["request_text"] == "follow up"
+    assert inbox[0]["job_id"] is None
+    assert any("message saved" in message for message in adapter.sent)
 
 
 @pytest.mark.asyncio
-async def test_draining_rejects_new_session_messages():
+async def test_draining_rejects_new_session_messages(tmp_path):
     runner, _adapter = make_restart_runner()
+    runner._durable_job_store = DurableJobStore(tmp_path / "jobs.sqlite3")
     runner._draining = True
     runner._restart_requested = True
 
@@ -86,7 +95,14 @@ async def test_draining_rejects_new_session_messages():
 
     result = await runner._handle_message(event)
 
-    assert result == "⏳ Gateway is restarting and is not accepting new work right now."
+    assert result == (
+        "⏳ Gateway restarting — message saved and will be routed when it comes back."
+    )
+    assert event.durable_job_id is None
+    inbox = runner._durable_store().unrouted_inbox_events()
+    assert len(inbox) == 1
+    assert inbox[0]["request_text"] == "hello"
+    assert inbox[0]["job_id"] is None
 
 
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):

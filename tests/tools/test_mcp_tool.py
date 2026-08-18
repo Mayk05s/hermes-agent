@@ -4083,6 +4083,85 @@ def test_chainremind_guard_blocks_calendar_write_substitution():
     assert "google_calendar" in payload["error"]
 
 
+def test_chainremind_guard_blocks_calendar_move_without_false_negation():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(platform="cli")
+    try:
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "update_reminder",
+            {
+                "chain": [
+                    {"delay_min": 0, "text": "Встреча"},
+                    {"delay_min": 10, "text": "Встреча не подтверждена"},
+                ]
+            },
+            user_task="Перенеси встречу в календаре на завтра",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is not None
+    assert "explicitly requested a Calendar operation" in json.loads(result)["error"]
+
+
+def test_chainremind_guard_does_not_treat_calendar_rejection_as_write_intent():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        thread_id="576",
+    )
+    try:
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            {
+                "schedule": {"times": ["22:00"], "days": "2026-08-06"},
+                "chain": [
+                    {"delay_min": 0, "text": "Поговорить о квартирах"},
+                    {"delay_min": 15, "text": "Разговор ещё не подтверждён"},
+                ],
+                "target": "-1003966683704:576",
+            },
+            user_task=(
+                "Создай обычную крон задачу и напомни сегодня как тебе сказали! "
+                "При чем тут личный календарь вообще"
+            ),
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+
+
+def test_chainremind_guard_allows_explicit_not_calendar_correction():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _guard_chainremind_origin_target
+
+    tokens = set_session_vars(platform="cli")
+    try:
+        result = _guard_chainremind_origin_target(
+            "chainremind",
+            "create_reminder",
+            {
+                "chain": [
+                    {"delay_min": 0, "text": "Экзамены преподавателей"},
+                    {"delay_min": 10, "text": "Напоминание ещё не подтверждено"},
+                ]
+            },
+            user_task="Не добавляй в календарь, просто напомни в 22:00",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+
+
 def test_chainremind_guard_blocks_one_shot_globally():
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools.mcp_tool import _guard_chainremind_origin_target

@@ -333,6 +333,33 @@ class TestRunAgentViaProxy:
                     )
 
         assert "Proxy connection error" in result["final_response"]
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert "Connection refused" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_marks_retryable_proxy_http_error_failed(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+        session = _FakeSession(
+            _FakeSSEResponse(status=503, error_text="Service unavailable")
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="hi",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="test",
+                    )
+
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["error"].startswith("HTTP 503")
 
     @pytest.mark.asyncio
     async def test_skips_tool_messages_in_history(self, monkeypatch):

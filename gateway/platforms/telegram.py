@@ -109,7 +109,7 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
 
 
 MAX_COMMANDS_PER_SCOPE = 30
-_GROUP_OPERATOR_CALLBACK_PREFIXES: tuple[str, ...] = ("ea:", "sc:", "cl:")
+_GROUP_OPERATOR_CALLBACK_PREFIXES: tuple[str, ...] = ("ea:", "sc:", "cl:", "pa:")
 _GROUP_GATED_CALLBACK_PREFIXES: tuple[str, ...] = (
     "mp:",
     "mpg:",
@@ -121,6 +121,7 @@ _GROUP_GATED_CALLBACK_PREFIXES: tuple[str, ...] = (
     "ea:",
     "sc:",
     "cl:",
+    "pa:",
     "update_prompt:",
 )
 _MINIAPP_START_LINK_RE = re.compile(
@@ -520,6 +521,10 @@ class TelegramAdapter(BasePlatformAdapter):
     _TEXT_BATCH_FAST_DELAY_S = 0.18
     _TEXT_BATCH_SHORT_LEN = 1024
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
+    # A direct group mention can be an instruction for the next forwarded
+    # Telegram message. Hold only that narrow class slightly longer; normal
+    # text keeps the adaptive 180/240ms path.
+    _FORWARD_FOLLOWUP_DELAY_S = 0.8
 
     @staticmethod
     def _env_float_clamped(
@@ -556,6 +561,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
+        # Topic response rules are operator-facing runtime policy.  Keep the
+        # adapter instance alive while allowing config.yaml edits to take
+        # effect on the next message; hermes_cli.config already mtime-caches
+        # this read, so the unchanged fast path is only a stat + dict lookup.
+        self._topic_response_rules_hot_reload = True
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
@@ -590,6 +600,12 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Telegram can deliver a forwarded payload before the separately sent
+        # instruction that addresses the bot. Keep such unaddressed forwards
+        # briefly, keyed by chat/topic/sender, so reverse update order is still
+        # assembled as one request. They are never dispatched on their own.
+        self._held_forward_events: Dict[str, MessageEvent] = {}
+        self._held_forward_tasks: Dict[str, asyncio.Task] = {}
         # Successful Mini App MCP writes register the sections that must be
         # attached to the final response. This is deliberately tool-driven:
         # user/assistant text never guesses that a Mini App was changed.
@@ -2138,7 +2154,23 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        # Last-resort guard for direct gateway sends that bypass the normal
+        # BasePlatformAdapter response pipeline (for example, queued/durable
+        # handoffs).  A TTS tool result can be the entire response; sending it
+        # as text would expose the internal directive and local cache path.
+        # Restrict this to directive-only, single voice attachments so ordinary
+        # messages containing MEDIA: examples keep their existing semantics.
+        if "[[audio_as_voice]]" in content:
+            media_files, cleaned_content = self.extract_media(content)
+            if len(media_files) == 1 and media_files[0][1] and not cleaned_content.strip():
+                return await self.send_voice(
+                    chat_id=chat_id,
+                    audio_path=media_files[0][0],
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+
         try:
             thread_id = self._metadata_thread_id(metadata)
             pending_key = self._miniapp_pending_key(chat_id, thread_id)
@@ -3054,6 +3086,123 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    @staticmethod
+    def _pairing_owner_chat_ids() -> list[str]:
+        """Return concrete Telegram owner DM IDs for access notifications.
+
+        Pairing prompts are security-sensitive controls, so wildcard entries
+        are never treated as destinations. ``TELEGRAM_ALLOWED_USERS`` is the
+        primary owner list; numeric global owner IDs remain a compatibility
+        fallback for installations that use only ``GATEWAY_ALLOWED_USERS``.
+        """
+        owner_ids: list[str] = []
+        for env_key in ("TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
+            for value in os.getenv(env_key, "").split(","):
+                candidate = value.strip()
+                if not candidate or candidate == "*" or not candidate.lstrip("-").isdigit():
+                    continue
+                if candidate not in owner_ids:
+                    owner_ids.append(candidate)
+        return owner_ids
+
+    async def send_chat_pairing_request(
+        self,
+        *,
+        entry_id: str,
+        chat_id: str,
+        chat_name: str = "",
+        chat_type: str = "group",
+        thread_id: str = "",
+        requester_user_id: str = "",
+        requester_user_name: str = "",
+    ) -> int:
+        """Send a persistent group-access request to every Telegram owner DM.
+
+        Returns the number of owner chats that accepted the message. The
+        opaque pairing entry ID is the only callback payload; all authoritative
+        request details remain in ``PairingStore``.
+        """
+        if not self._bot:
+            return 0
+
+        owner_chat_ids = self._pairing_owner_chat_ids()
+        if not owner_chat_ids:
+            logger.warning(
+                "[%s] Cannot deliver Telegram chat pairing request %s: "
+                "no concrete owner ID in TELEGRAM_ALLOWED_USERS or GATEWAY_ALLOWED_USERS",
+                self.name,
+                entry_id,
+            )
+            return 0
+
+        title = str(chat_name or chat_id).strip() or str(chat_id)
+        requester = str(requester_user_name or requester_user_id).strip()
+        lines = [
+            "🔐 <b>Запрос доступа к новому чату</b>",
+            "",
+            f"Чат: <b>{_html.escape(title)}</b>",
+            f"ID: <code>{_html.escape(str(chat_id))}</code>",
+            f"Тип: {_html.escape(str(chat_type or 'group'))}",
+        ]
+        if thread_id:
+            lines.append(f"Тема: <code>{_html.escape(str(thread_id))}</code>")
+        if requester:
+            lines.append(f"Запросил: {_html.escape(requester)}")
+        text = "\n".join(lines)
+
+        if thread_id:
+            keyboard_rows = [
+                [
+                    InlineKeyboardButton(
+                        "✅ Только тему",
+                        callback_data=f"pa:t:{entry_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "✅ Весь чат",
+                        callback_data=f"pa:c:{entry_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Отклонить",
+                        callback_data=f"pa:x:{entry_id}",
+                    )
+                ],
+            ]
+        else:
+            keyboard_rows = [[
+                InlineKeyboardButton(
+                    "✅ Одобрить чат",
+                    callback_data=f"pa:c:{entry_id}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Отклонить",
+                    callback_data=f"pa:x:{entry_id}",
+                ),
+            ]]
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+
+        delivered = 0
+        for owner_chat_id in owner_chat_ids:
+            try:
+                await self._bot.send_message(
+                    chat_id=int(owner_chat_id),
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                    **self._link_preview_kwargs(),
+                )
+                delivered += 1
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to deliver chat pairing request %s to owner %s: %s",
+                    self.name,
+                    entry_id,
+                    owner_chat_id,
+                    exc,
+                )
+        return delivered
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -3693,6 +3842,76 @@ class TelegramAdapter(BasePlatformAdapter):
             if not (operator_allowed or requester_allowed):
                 await query.answer(text="⛔ Controls are owner-only outside private chat.")
                 return
+
+        # --- Chat-pairing callbacks (pa:scope:entry_id) ---
+        if data.startswith("pa:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"c", "t", "x"}:
+                await query.answer(text="Некорректные данные запроса.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_operator(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Только владелец может управлять доступом.")
+                return
+
+            scope_token, entry_id = parts[1], parts[2]
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+            resolver = getattr(runner, "_resolve_chat_pairing_request", None)
+            if not callable(resolver):
+                await query.answer(text="Обработчик доступа сейчас недоступен.")
+                return
+
+            action = "reject" if scope_token == "x" else "approve"
+            approval_scope = "topic" if scope_token == "t" else "chat"
+            try:
+                resolution = resolver(
+                    entry_id,
+                    action=action,
+                    approval_scope=approval_scope,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[%s] chat-pairing callback failed for %s: %s",
+                    self.name,
+                    entry_id,
+                    exc,
+                    exc_info=True,
+                )
+                await query.answer(text="Не удалось обработать запрос.")
+                return
+
+            if not resolution:
+                await query.answer(text="Запрос уже обработан или истёк.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+
+            if action == "reject":
+                label = "❌ Доступ отклонён"
+            elif approval_scope == "topic":
+                label = "✅ Доступ к теме одобрен"
+            else:
+                label = "✅ Доступ ко всему чату одобрен"
+
+            await query.answer(text=label)
+            original_text = str(getattr(query_message, "text", "") or "").strip()
+            try:
+                await query.edit_message_text(
+                    text=f"{original_text}\n\n{label}" if original_text else label,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
@@ -5020,7 +5239,71 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if response_mode == "mentions":
             return True
+        topic_override = self._telegram_topic_require_mention(message)
+        if topic_override is not None:
+            return topic_override
         return self._telegram_require_mention()
+
+    def _telegram_topic_response_rules(self) -> list[dict[str, Any]]:
+        """Return current topic rules, hot-reloaded from the main config.
+
+        Trigger gating runs before profile routing, so the long-lived Telegram
+        adapter must use the gateway's main config as the source of truth.  Unit
+        test adapters created without ``__init__`` intentionally keep using
+        their injected ``PlatformConfig``.
+        """
+        cached_rules = self.config.extra.get("topic_response_rules")
+        if not getattr(self, "_topic_response_rules_hot_reload", False):
+            return cached_rules if isinstance(cached_rules, list) else []
+
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            cfg = load_config_readonly() or {}
+            telegram_cfg = cfg.get("telegram") if isinstance(cfg, dict) else None
+            telegram_extra = (
+                telegram_cfg.get("extra") if isinstance(telegram_cfg, dict) else None
+            )
+            live_rules = (
+                telegram_extra.get("topic_response_rules")
+                if isinstance(telegram_extra, dict)
+                else None
+            )
+        except Exception as exc:
+            logger.debug("[%s] Failed to hot-reload topic response rules: %s", self.name, exc)
+            return cached_rules if isinstance(cached_rules, list) else []
+
+        # Missing/empty removes all overrides immediately.  Invalid non-list
+        # values fail closed to no overrides instead of retaining stale policy.
+        return live_rules if isinstance(live_rules, list) else []
+
+    def _telegram_topic_require_mention(self, message: Message) -> Optional[bool]:
+        """Return an exact topic's mention policy, or ``None`` when unset.
+
+        ``telegram.extra.topic_response_rules`` is a list of
+        ``{chat_id, thread_id, require_mention}`` mappings.  A matching rule
+        overrides the global ``require_mention`` value.  Chat-level response
+        modes and ``free_response_chats`` remain stronger: they are resolved by
+        the caller before this helper, so a free-response chat cannot be made
+        mention-only for one topic with this setting.  Missing thread IDs use
+        Telegram's General-topic ID (``1``), matching ``allowed_topics``.
+        """
+        rules = self._telegram_topic_response_rules()
+
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = getattr(message, "message_thread_id", None)
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if str(rule.get("chat_id", "")) != chat_id:
+                continue
+            if str(rule.get("thread_id", "")) != topic_id:
+                continue
+            require_mention = rule.get("require_mention")
+            if isinstance(require_mention, bool):
+                return require_mention
+        return None
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
@@ -5785,9 +6068,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
-        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
-            return False
-
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
         guest_mention = self._is_guest_mention(message)
@@ -5799,6 +6079,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if allowed and chat_id_str not in allowed:
             return guest_mention
 
+        # An exact Telegram reply to this bot is a stronger routing signal than
+        # a bot handle mentioned in the reply body.  Keep the allowlist and
+        # topic gates above intact, while accepting replies to this bot even
+        # when the text also names another bot.
+        if self._is_reply_to_bot(message):
+            return True
+
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+            return False
+
         response_mode = self._telegram_response_mode_for_chat(chat_id_str)
         if guest_mention:
             return True
@@ -5807,8 +6097,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_id_str in self._telegram_free_response_chats() and response_mode != "mentions":
             return True
         if not self._telegram_require_mention_for_message(message):
-            return True
-        if self._is_reply_to_bot(message):
             return True
         # When guest_mode is True, _is_guest_mention already called
         # _message_mentions_bot above — skip the redundant second call.
@@ -6730,6 +7018,65 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    async def _attach_replied_image(
+        self,
+        msg: Message,
+        event: MessageEvent,
+    ) -> bool:
+        """Cache the image targeted by a text/command reply and attach its pixels.
+
+        Telegram exposes the replied-to ``Message`` inline, but a text reply has
+        no media of its own. Without this bridge the gateway kept only the prior
+        message ID/caption, so replies to captionless photos were visually empty.
+        Current-message media remains authoritative; callers use this helper only
+        for text/command updates.
+        """
+
+        replied = getattr(msg, "reply_to_message", None)
+        if replied is None or event.media_urls:
+            return False
+
+        photo_sizes = list(getattr(replied, "photo", None) or [])
+        media = photo_sizes[-1] if photo_sizes else None
+        ext = ".jpg"
+        mime = "image/jpeg"
+
+        if media is None:
+            document = getattr(replied, "document", None)
+            document_mime = str(getattr(document, "mime_type", None) or "").lower()
+            if document is None or not document_mime.startswith("image/"):
+                return False
+            media = document
+            mime = document_mime
+            ext = _TELEGRAM_IMAGE_MIME_TO_EXT.get(document_mime, ".jpg")
+
+        try:
+            file_obj = await media.get_file()
+            image_bytes = await file_obj.download_as_bytearray()
+            file_path = str(getattr(file_obj, "file_path", None) or "").lower()
+            for candidate in _TELEGRAM_IMAGE_EXTENSIONS:
+                if file_path.endswith(candidate):
+                    ext = candidate
+                    mime = _TELEGRAM_IMAGE_EXT_TO_MIME.get(candidate, mime)
+                    break
+            cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+        except Exception as exc:
+            logger.warning(
+                "[Telegram] Failed to cache replied-to image: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
+
+        event.media_urls = [cached_path]
+        event.media_types = [mime]
+        logger.info(
+            "[Telegram] Cached replied-to image from message %s at %s",
+            getattr(replied, "message_id", "unknown"),
+            cached_path,
+        )
+        return True
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -6741,6 +7088,19 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg):
+            # Telegram represents "instruction, then forward" as two updates.
+            # The forward normally has no bot mention, but belongs to a still
+            # pending instruction when chat, topic and sender all match.
+            if self._is_forwarded_message(msg):
+                forwarded_event = self._build_message_event(
+                    msg, MessageType.TEXT, update_id=update.update_id
+                )
+                forwarded_event = self._apply_telegram_group_observe_attribution(
+                    forwarded_event
+                )
+                if self._merge_pending_forwarded_text(forwarded_event):
+                    return
+                self._hold_forward_for_instruction(forwarded_event)
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
@@ -6760,8 +7120,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._attach_replied_image(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        if self._is_group_chat(msg) and self._message_mentions_bot(msg):
+            event._await_forward_followup = True  # type: ignore[attr-defined]
         self._enqueue_text_event(event)
+        held_forward = self._pop_held_forward(event)
+        if held_forward is not None:
+            # Preserve semantic order even when Telegram delivered the forward
+            # first: instruction, then the content it applies to.
+            self._merge_pending_forwarded_text(held_forward)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -6779,6 +7147,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._attach_replied_image(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
@@ -6835,11 +7204,89 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.session import build_session_key
         self._apply_topic_recovery(event)
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        # Shared observed-group sessions intentionally clear source.user_id.
+        # Recover the sender from Telegram's raw message so different people in
+        # one topic can never be coalesced.
+        if event.source.chat_type in {"group", "supergroup"} and not event.source.user_id:
+            raw_user = getattr(getattr(event, "raw_message", None), "from_user", None)
+            sender_id = getattr(raw_user, "id", None) or "unknown"
+            return f"{session_key}:sender:{sender_id}"
+        return session_key
+
+    @staticmethod
+    def _is_forwarded_message(message: Message) -> bool:
+        """Return True for modern and legacy python-telegram-bot forwards."""
+        return any(
+            getattr(message, attr, None) is not None
+            for attr in (
+                "forward_origin",
+                "forward_date",
+                "forward_from",
+                "forward_from_chat",
+                "forward_sender_name",
+            )
+        )
+
+    def _merge_pending_forwarded_text(self, event: MessageEvent) -> bool:
+        """Attach a forward to a pending same-chat/topic/sender instruction."""
+        key = self._text_batch_key(event)
+        existing = self._pending_text_batches.get(key)
+        if existing is None or not getattr(existing, "_await_forward_followup", False):
+            return False
+        existing._await_forward_followup = False  # type: ignore[attr-defined]
+        self._enqueue_text_event(event)
+        logger.info(
+            "[Telegram] Merged forwarded text into pending instruction: "
+            "chat=%s thread=%s sender=%s",
+            event.source.chat_id,
+            event.source.thread_id or "",
+            getattr(
+                getattr(getattr(event, "raw_message", None), "from_user", None),
+                "id",
+                "unknown",
+            ),
+        )
+        return True
+
+    def _hold_forward_for_instruction(self, event: MessageEvent) -> None:
+        """Briefly retain an unaddressed forward without dispatching it alone."""
+        key = self._text_batch_key(event)
+        held_tasks = getattr(self, "_held_forward_tasks", None)
+        if held_tasks is None:
+            held_tasks = self._held_forward_tasks = {}
+        held_events = getattr(self, "_held_forward_events", None)
+        if held_events is None:
+            held_events = self._held_forward_events = {}
+        previous = held_tasks.pop(key, None)
+        if previous and not previous.done():
+            previous.cancel()
+        held_events[key] = event
+
+        async def expire() -> None:
+            try:
+                await asyncio.sleep(self._FORWARD_FOLLOWUP_DELAY_S)
+                held_events.pop(key, None)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if held_tasks.get(key) is asyncio.current_task():
+                    held_tasks.pop(key, None)
+
+        held_tasks[key] = asyncio.create_task(expire())
+
+    def _pop_held_forward(self, instruction: MessageEvent) -> Optional[MessageEvent]:
+        """Consume a reverse-ordered same-chat/topic/sender forward, if any."""
+        key = self._text_batch_key(instruction)
+        held = getattr(self, "_held_forward_events", {}).pop(key, None)
+        task = getattr(self, "_held_forward_tasks", {}).pop(key, None)
+        if task and not task.done():
+            task.cancel()
+        return held
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -6896,7 +7343,9 @@ class TelegramAdapter(BasePlatformAdapter):
             pending = self._pending_text_batches.get(key)
             last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
             total_len = len(getattr(pending, "text", "") or "") if pending else 0
-            if last_len >= self._SPLIT_THRESHOLD:
+            if getattr(pending, "_await_forward_followup", False):
+                delay = self._FORWARD_FOLLOWUP_DELAY_S
+            elif last_len >= self._SPLIT_THRESHOLD:
                 delay = self._text_batch_split_delay_seconds
             elif total_len <= self._TEXT_BATCH_FAST_LEN:
                 delay = min(self._text_batch_delay_seconds, self._TEXT_BATCH_FAST_DELAY_S)
@@ -6971,6 +7420,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         msg = update.message
         should_process = self._should_process_message(msg)
+        # Preserve the normal routing result before an always-transcribe policy
+        # turns an otherwise unaddressed voice note into a transcript-only event.
+        # The runner needs this to allow response_mode=all, direct mentions and
+        # replies-to-this-bot to continue to the agent after STT.
+        agent_dispatch_eligible = should_process
         passive_audio_transcription = False
         if self._telegram_audio_transcription_rule_matches_message(msg):
             should_process = True
@@ -6978,9 +7432,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # Chat-level voice transcription is a gateway policy, not an agent hint:
             # when enabled, voice notes are transcribed and echoed by the gateway
             # even if the same message would otherwise reach the agent via a
-            # mention, reply-to-bot, or free-response trigger.  After STT, only
-            # a configured audio-trigger keyword may continue the voice note to
-            # the agent; addressing and response mode never bypass that gate.
+            # mention, reply-to-bot, or free-response trigger.  The runner keeps
+            # that ordinary dispatch result through STT: addressed/free-response
+            # voice continues to the agent, while an otherwise passive voice note
+            # requires a configured audio-trigger keyword.
             # Telegram audio-file attachments remain opt-in via explicit
             # audio_transcription_rules.
             passive_audio_transcription = bool(getattr(msg, "voice", None)) and self._telegram_passive_audio_transcription_enabled(msg)
@@ -6992,6 +7447,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        if msg_type == MessageType.VOICE:
+            event.telegram_agent_dispatch_eligible = agent_dispatch_eligible
         
         # Add caption as text
         if msg.caption:
@@ -7014,7 +7471,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if should_process:
             event = self._apply_telegram_group_observe_attribution(event)
         if passive_audio_transcription:
-            setattr(event, "telegram_passive_audio_transcription", True)
+            event.telegram_passive_audio_transcription = True
 
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).
@@ -7461,7 +7918,7 @@ class TelegramAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return None
         prefix = f"{chat_id}:"
-        for key, cached_thread_id in self._dm_topics.items():
+        for key, cached_thread_id in getattr(self, "_dm_topics", {}).items():
             if cached_thread_id == thread_id_int and key.startswith(prefix):
                 return key.split(":", 1)[1]
         return None
@@ -7741,10 +8198,9 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
         """Clear all reactions from a Telegram message.
 
-        Calling ``set_message_reaction`` with ``reaction=None`` (or an empty
-        sequence) is the documented Bot API way to remove all bot-set
-        reactions on a message — equivalent to Bot API 10.0's
-        ``deleteMessageReaction`` but supported in PTB 22.6 already.
+        An explicit empty sequence is required here. ``reaction=None`` is
+        serialized by affected PTB versions as an invalid ``Reaction_empty``
+        object instead of an empty Bot API reaction list.
         """
         if not self._bot:
             return False
@@ -7752,7 +8208,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._bot.set_message_reaction(
                 chat_id=int(chat_id),
                 message_id=int(message_id),
-                reaction=None,
+                reaction=[],
             )
             logger.info("[%s] cleared message reactions", self.name)
             return True

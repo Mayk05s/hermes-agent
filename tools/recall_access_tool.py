@@ -106,6 +106,22 @@ def _same_filter(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
     return _filter_key(left) == _filter_key(right)
 
 
+def _same_source(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    """Compare grant sources independently of session_search boundary mode."""
+    left_norm = _norm_filter(left)
+    right_norm = _norm_filter(right)
+    return (
+        left_norm.get("platform") == right_norm.get("platform")
+        and left_norm.get("chat_id") == right_norm.get("chat_id")
+        and left_norm.get("thread_id") == right_norm.get("thread_id")
+        and (
+            not left_norm.get("profile_name")
+            or not right_norm.get("profile_name")
+            or left_norm.get("profile_name") == right_norm.get("profile_name")
+        )
+    )
+
+
 def _current_base_filter() -> Optional[Dict[str, str]]:
     try:
         from gateway.session_context import get_session_env
@@ -152,6 +168,29 @@ def _is_all_topics_alias(value: Any) -> bool:
         "ostalnye topiki",
         "drugie temy",
         "vse temy",
+    }
+
+
+def _all_chats_target(base: Dict[str, str]) -> Dict[str, str]:
+    """Return a consent scope covering every chat on the current platform."""
+    return {
+        "mode": "platform",
+        "platform": _clean(base.get("platform")).lower(),
+        "chat_id": "*",
+        "thread_id": "",
+        "profile_name": _clean(base.get("profile_name")) or "default",
+        "label": "all chats on this platform",
+    }
+
+
+def _is_all_chats_alias(value: Any) -> bool:
+    normalized = _normalize_alias(value)
+    return normalized in {
+        "all chats",
+        "all telegram chats",
+        "all chats on this platform",
+        "vse chaty",
+        "vse telegram chaty",
     }
 
 
@@ -385,6 +424,10 @@ def resolve_recall_target(
     # approving a search across sibling topics of the current chat, not across
     # DMs or other groups that happen to use the same profile.
     base = _current_base_filter() or {}
+    if not chat_id and _is_all_chats_alias(target_clean):
+        if not base.get("platform") or not base.get("chat_id"):
+            raise ValueError("The current gateway chat is unavailable.")
+        return _all_chats_target(base)
     if not chat_id and _is_all_topics_alias(target_clean):
         if not base.get("platform") or not base.get("chat_id"):
             raise ValueError("The current gateway chat is unavailable.")
@@ -516,7 +559,7 @@ def _runtime_grants_for(base_filter: Dict[str, str]) -> List[Dict[str, str]]:
         targets: List[Dict[str, str]] = []
         for grant in grants:
             duration = grant.get("duration")
-            if not _same_filter(grant.get("source") or {}, base_filter):
+            if not _same_source(grant.get("source") or {}, base_filter):
                 kept.append(grant)
                 continue
             if duration == "one_turn" and grant.get("message_id") != current_message:
@@ -538,7 +581,7 @@ def _persistent_grants_for(base_filter: Dict[str, str]) -> List[Dict[str, str]]:
     for grant in grants:
         if not isinstance(grant, dict):
             continue
-        if not _same_filter(grant.get("source") or {}, base_filter):
+        if not _same_source(grant.get("source") or {}, base_filter):
             continue
         target = grant.get("target") or {}
         if isinstance(target, dict):
@@ -561,6 +604,23 @@ def get_granted_access_filters(base_filter: Dict[str, str]) -> List[Dict[str, st
     return results
 
 
+def _filter_covers(granted: Dict[str, Any], requested: Dict[str, Any]) -> bool:
+    """Return whether an existing grant already includes the requested scope."""
+    granted_norm = _norm_filter(granted)
+    requested_norm = _norm_filter(requested)
+    if granted_norm.get("platform") != requested_norm.get("platform"):
+        return False
+    mode = granted_norm.get("mode") or "topic"
+    if mode == "platform":
+        return True
+    if granted_norm.get("chat_id") != requested_norm.get("chat_id"):
+        return False
+    if mode == "chat":
+        wanted_profile = granted_norm.get("profile_name")
+        return not wanted_profile or wanted_profile == requested_norm.get("profile_name")
+    return _same_filter(granted_norm, requested_norm)
+
+
 def _add_runtime_grant(source: Dict[str, str], target: Dict[str, str], duration: str, reason: str) -> None:
     session_key = _session_key()
     if not session_key:
@@ -578,7 +638,7 @@ def _add_runtime_grant(source: Dict[str, str], target: Dict[str, str], duration:
         grants[:] = [
             item for item in grants
             if not (
-                _same_filter(item.get("source") or {}, grant["source"])
+                _same_source(item.get("source") or {}, grant["source"])
                 and _same_filter(item.get("target") or {}, grant["target"])
                 and item.get("duration") == duration
             )
@@ -599,7 +659,7 @@ def _add_persistent_grant(source: Dict[str, str], target: Dict[str, str], reason
     for item in grants:
         if not isinstance(item, dict):
             continue
-        if _same_filter(item.get("source") or {}, source_norm) and _same_filter(item.get("target") or {}, target_norm):
+        if _same_source(item.get("source") or {}, source_norm) and _same_filter(item.get("target") or {}, target_norm):
             item["reason"] = _clean(reason)
             item["updated_at"] = time.time()
             _save_active_config(config, path)
@@ -677,6 +737,25 @@ def recall_access_tool(
             "message": "Target is the current chat/topic; no extra grant was needed.",
         }, ensure_ascii=False)
 
+    existing_grant = next(
+        (
+            granted
+            for granted in get_granted_access_filters(base)
+            if _filter_covers(granted, target_filter)
+        ),
+        None,
+    )
+    if existing_grant is not None:
+        return json.dumps({
+            "success": True,
+            "granted": True,
+            "duration": "persistent",
+            "source": _norm_filter(base),
+            "target": _norm_filter(target_filter),
+            "approval": "existing_grant",
+            "message": "Recall access was already granted; no confirmation was needed.",
+        }, ensure_ascii=False)
+
     explicitly_requested = (
         duration != "persistent"
         and _explicit_same_chat_transfer_requested(user_request, base, target_filter)
@@ -707,7 +786,15 @@ def recall_access_tool(
 
     reason_clean = _clean(reason) or "No reason provided"
     target_label = target_filter.get("label") or f"{target_filter['platform']}:{target_filter['chat_id']}:{target_filter['thread_id']}"
-    if target_filter.get("mode") == "chat":
+    if target_filter.get("mode") == "platform":
+        question = (
+            "Разрешить основному чату искать нужную информацию во всех Telegram-чатах?\n\n"
+            "Чаты и топики останутся отдельными контекстами; разрешение расширяет "
+            "только поиск по истории.\n"
+            f"Причина: {reason_clean}"
+        )
+        choices = ["Искать один раз", "На эту сессию", "Разрешать всегда", "Не искать"]
+    elif target_filter.get("mode") == "chat":
         question = (
             "Искать нужную информацию в других топиках этого чата?\n\n"
             "Текущий топик останется отдельным контекстом; разрешение только "
@@ -786,7 +873,8 @@ RECALL_ACCESS_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Use 'other_topics' for all sibling topics in the current "
-                    "chat/profile, a target alias from config (for example "
+                    "chat/profile, 'all_chats' for every chat on the current "
+                    "platform, a target alias from config (for example "
                     "'planning' or 'health'), or explicit "
                     "'platform:chat_id:thread_id'."
                 ),

@@ -2,7 +2,11 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    _persisted_user_message_with_image_refs,
+    _wrap_current_message_with_attachment_guard,
+)
 from gateway.session import SessionSource, build_session_key
 
 
@@ -77,3 +81,29 @@ async def test_native_image_buffer_not_cleared_by_other_sessions_without_images(
 
     assert runner._consume_pending_native_image_paths(build_session_key(source_a)) == ["/tmp/a.png"]
     assert runner._consume_pending_native_image_paths(build_session_key(source_b)) == []
+
+
+def test_persisted_image_message_keeps_path_without_image_bytes():
+    persisted = _persisted_user_message_with_image_refs(
+        "@TripiooBot сохрани",
+        ["/tmp/booking.jpg"],
+    )
+
+    assert persisted == (
+        "@TripiooBot сохрани\n\n[Image attached at: /tmp/booking.jpg]"
+    )
+    assert "base64" not in persisted
+
+
+def test_attachment_guard_precedes_current_caption_and_preserves_image_part():
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/jpeg;base64,abc"},
+    }
+    wrapped = _wrap_current_message_with_attachment_guard(
+        [{"type": "text", "text": "сохрани"}, image_part]
+    )
+
+    assert wrapped[0]["text"].startswith("[Current message attachment")
+    assert wrapped[0]["text"].endswith("сохрани")
+    assert wrapped[1] == image_part

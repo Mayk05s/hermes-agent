@@ -557,6 +557,12 @@ _SPECIALIST_CONTRACTS: Dict[str, Dict[str, Any]] = {
         "required_toolsets": ["skills", "file", "terminal", "web"],
         "label": "🧩 *Mini App Builder*",
     },
+    "sidense_video_prompt": {
+        "skill": "sidense-video-prompt-specialist",
+        "memory": "/home/hermes/.hermes/profiles/boxmap/memories/MEMORY.md",
+        "required_toolsets": ["skills", "vision"],
+        "label": "🎬 *Sidense Video Prompt*",
+    },
 }
 
 # Backwards-compatible name for tests/plugins that still import the old
@@ -598,6 +604,13 @@ _SPECIALIST_ALIASES = {
     "миниапов": "miniapp_builder",
     "миниаппов": "miniapp_builder",
     "создание миниаппов": "miniapp_builder",
+    "sidense": "sidense_video_prompt",
+    "sidense 2.0": "sidense_video_prompt",
+    "sidense-video-prompt-specialist": "sidense_video_prompt",
+    "sidense video prompt specialist": "sidense_video_prompt",
+    "video prompt specialist": "sidense_video_prompt",
+    "специалист sidense": "sidense_video_prompt",
+    "специалист по промптам sidense": "sidense_video_prompt",
 }
 
 
@@ -3016,11 +3029,13 @@ DELEGATE_TASK_SCHEMA = {
                     "medical",
                     "miniapp",
                     "miniapp_builder",
+                    "sidense_video_prompt",
                 ],
                 "description": (
                     "Optional first-class specialist label. Use health labels "
                     "for telegram_health work, or miniapp_builder for Telegram "
-                    "Mini App creation/deploy work. Hermes adds the specialist "
+                    "Mini App creation/deploy work, or sidense_video_prompt for "
+                    "BoxMap Sidense/Studio video packages. Hermes adds the specialist "
                     "skill/memory contract and required toolsets automatically."
                 ),
             },
@@ -3047,6 +3062,7 @@ DELEGATE_TASK_SCHEMA = {
                                 "medical",
                                 "miniapp",
                                 "miniapp_builder",
+                                "sidense_video_prompt",
                             ],
                             "description": (
                                 "Optional first-class specialist label "

@@ -1581,9 +1581,36 @@ class MessageEvent:
     # Durable gateway-job identity.  Normal inbound work receives this before
     # the agent starts; restart recovery reuses the same ID so execution state
     # and final-result delivery can be reconciled across gateway processes.
+    durable_inbox_id: Optional[str] = None
     durable_job_id: Optional[str] = None
     durable_recovery: bool = False
     durable_request_text: Optional[str] = None
+    # Job routing is deliberately separate from the public chat/thread key.
+    # Multiple independent jobs in one thread receive distinct execution keys,
+    # while semantic follow-ups keep the same job and are delivered as steer
+    # updates instead of becoming another assistant turn.
+    job_thread_key: Optional[str] = None
+    job_execution_key: Optional[str] = None
+    job_input_version: Optional[int] = None
+    job_route_action: Optional[str] = None
+    # Agent/provider outages are not terminal job results.  The runner sets
+    # this fence after preserving the turn transcript so the outer durable-job
+    # lifecycle leaves the job resumable instead of completing it with an
+    # infrastructure warning.
+    durable_defer_completion: bool = False
+    durable_resume_reason: Optional[str] = None
+
+    # Telegram voice routing state must survive dataclasses.replace() calls in
+    # the group-attribution/profile pipeline and durable inbox recovery.  Keep
+    # these as real fields instead of ad-hoc attributes: losing
+    # ``telegram_agent_dispatch_eligible`` turns an addressed/free-response
+    # voice note into a transcript-only event after STT.
+    telegram_agent_dispatch_eligible: bool = False
+    telegram_passive_audio_transcription: bool = False
+    telegram_voice_preprocessed: bool = False
+    telegram_voice_transcript_only: bool = False
+    telegram_transcript_only_history_text: Optional[str] = None
+    telegram_transcript_only_history_persisted: bool = False
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -1937,6 +1964,7 @@ class BasePlatformAdapter(ABC):
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
         self._durable_job_delivery_handler: Optional[Callable[..., Any]] = None
+        self._durable_job_delivery_validator: Optional[Callable[..., Any]] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -2303,6 +2331,13 @@ class BasePlatformAdapter(ABC):
     ) -> None:
         """Install the runner callback that persists final delivery receipts."""
         self._durable_job_delivery_handler = handler
+
+    def set_durable_job_delivery_validator(
+        self,
+        validator: Optional[Callable[..., Any]],
+    ) -> None:
+        """Install a last-moment fence against delivering a stale job result."""
+        self._durable_job_delivery_validator = validator
 
     def set_topic_recovery_fn(
         self,
@@ -4060,11 +4095,13 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         self._apply_topic_recovery(event)
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = str(getattr(event, "job_execution_key", None) or "")
+        if not session_key:
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -4267,15 +4304,21 @@ class BasePlatformAdapter(ABC):
         delivery_attempted = False
         delivery_succeeded = False
         delivery_error: Optional[str] = None
+        delivery_message_id: Optional[str] = None
+        delivery_message_ids: list[str] = []
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded, delivery_error
+            nonlocal delivery_attempted, delivery_succeeded, delivery_error, delivery_message_id
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
                 delivery_error = None
+                result_message_id = getattr(result, "message_id", None)
+                if result_message_id is not None:
+                    delivery_message_id = str(result_message_id)
+                    delivery_message_ids.append(delivery_message_id)
             else:
                 delivery_error = str(
                     getattr(result, "error", None) or "platform delivery failed"
@@ -4292,6 +4335,8 @@ class BasePlatformAdapter(ABC):
                     attempted=delivery_attempted,
                     succeeded=delivery_succeeded,
                     error=delivery_error,
+                    message_id=delivery_message_id,
+                    message_ids=delivery_message_ids,
                 )
                 if inspect.isawaitable(result):
                     await result
@@ -4393,6 +4438,30 @@ class BasePlatformAdapter(ABC):
                     session_key,
                 )
                 response = None
+            if response and getattr(event, "durable_job_id", None):
+                validator = getattr(self, "_durable_job_delivery_validator", None)
+                if callable(validator):
+                    try:
+                        validation = validator(event)
+                        if inspect.isawaitable(validation):
+                            validation = await validation
+                        if not validation:
+                            logger.info(
+                                "[%s] Suppressing stale durable-job response for %s",
+                                self.name,
+                                event.durable_job_id,
+                            )
+                            response = None
+                    except Exception:
+                        # Delivery fences fail closed: recovery can safely retry a
+                        # committed job, while an unchecked stale answer cannot be
+                        # retracted from a chat.
+                        logger.exception(
+                            "[%s] Durable-job delivery validation failed for %s",
+                            self.name,
+                            event.durable_job_id,
+                        )
+                        response = None
             if response:
                 if self.platform == Platform.TELEGRAM:
                     (

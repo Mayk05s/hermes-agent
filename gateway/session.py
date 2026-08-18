@@ -936,7 +936,8 @@ class SessionStore:
     def get_or_create_session(
         self,
         source: SessionSource,
-        force_new: bool = False
+        force_new: bool = False,
+        session_key_override: Optional[str] = None,
     ) -> SessionEntry:
         """
         Get an existing session or create a new one.
@@ -944,7 +945,7 @@ class SessionStore:
         Evaluates reset policy to determine if the existing session is stale.
         Creates a session record in SQLite when a new session starts.
         """
-        session_key = self._generate_session_key(source)
+        session_key = str(session_key_override or "").strip() or self._generate_session_key(source)
         now = _now()
 
         # SQLite calls are made outside the lock to avoid holding it during I/O.

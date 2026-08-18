@@ -129,6 +129,8 @@ def _parse_access_scope(raw: Any) -> Dict[str, Any]:
 def _origin_matches_filter(origin: Dict[str, Any], access_filter: Dict[str, str]) -> bool:
     if not isinstance(origin, dict):
         return False
+    if access_filter.get("mode") == "platform":
+        return _clean(origin.get("platform")) == access_filter.get("platform", "")
     if access_filter.get("mode") == "profile":
         wanted_profile = access_filter.get("profile_name") or "default"
         origin_profile = _clean(origin.get("profile_name")) or "default"

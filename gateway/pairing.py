@@ -387,6 +387,28 @@ class PairingStore:
             self._record_rate_limit(platform, rate_limit_id)
             return entry_id
 
+    def get_pending_entry(self, platform: str, entry_id: str) -> Optional[dict]:
+        """Return a copy of one pending request without exposing mutable state."""
+        with self._lock:
+            self._cleanup_expired(platform)
+            entry = self._load_json(self._pending_path(platform)).get(
+                str(entry_id or "").strip()
+            )
+            return dict(entry) if isinstance(entry, dict) else None
+
+    def mark_owner_notified(self, platform: str, entry_id: str) -> bool:
+        """Persist that an owner DM was accepted for this pending request."""
+        with self._lock:
+            self._cleanup_expired(platform)
+            path = self._pending_path(platform)
+            pending = self._load_json(path)
+            entry = pending.get(str(entry_id or "").strip())
+            if not isinstance(entry, dict):
+                return False
+            entry["owner_notified_at"] = time.time()
+            self._save_json(path, pending)
+            return True
+
     def approve_entry(
         self,
         platform: str,

@@ -6,7 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cli.config import set_config_value, config_command
+from hermes_cli.config import (
+    config_command,
+    set_config_value,
+    set_telegram_topic_response_mode,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +29,68 @@ def _read_env(tmp_path):
 def _read_config(tmp_path):
     config_path = tmp_path / "config.yaml"
     return config_path.read_text() if config_path.exists() else ""
+
+
+def _read_config_yaml(tmp_path):
+    import yaml
+
+    return yaml.safe_load(_read_config(tmp_path)) or {}
+
+
+class TestTelegramTopicResponseMode:
+    def test_upsert_preserves_other_topic_rules(self, _isolated_hermes_home):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "telegram:\n"
+            "  extra:\n"
+            "    require_mention: true\n"
+            "    topic_response_rules:\n"
+            "      - chat_id: -100\n"
+            "        thread_id: 5\n"
+            "        require_mention: true\n"
+            "      - chat_id: -100\n"
+            "        thread_id: 2203\n"
+            "        require_mention: true\n",
+            encoding="utf-8",
+        )
+
+        set_telegram_topic_response_mode(-100, 2203, "all")
+
+        config = _read_config_yaml(_isolated_hermes_home)
+        rules = config["telegram"]["extra"]["topic_response_rules"]
+        assert rules == [
+            {"chat_id": -100, "thread_id": 5, "require_mention": True},
+            {"chat_id": -100, "thread_id": 2203, "require_mention": False},
+        ]
+
+    def test_default_removes_only_exact_topic_rule(self, _isolated_hermes_home):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "telegram:\n"
+            "  extra:\n"
+            "    topic_response_rules:\n"
+            "      - {chat_id: -100, thread_id: 5, require_mention: false}\n"
+            "      - {chat_id: -100, thread_id: 2203, require_mention: false}\n",
+            encoding="utf-8",
+        )
+
+        set_telegram_topic_response_mode(-100, 2203, "default")
+
+        rules = _read_config_yaml(_isolated_hermes_home)["telegram"]["extra"][
+            "topic_response_rules"
+        ]
+        assert rules == [{"chat_id": -100, "thread_id": 5, "require_mention": False}]
+
+    def test_profile_invocation_updates_main_gateway_config(self, tmp_path):
+        gateway_home = tmp_path / "gateway"
+        profile_home = gateway_home / "profiles" / "boxmap"
+        profile_home.mkdir(parents=True)
+        gateway_home.joinpath("config.yaml").write_text("telegram: {}\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}):
+            changed_path = set_telegram_topic_response_mode(-100, 2203, "all")
+
+        assert changed_path == gateway_home / "config.yaml"
+        rules = _read_config_yaml(gateway_home)["telegram"]["extra"]["topic_response_rules"]
+        assert rules == [{"chat_id": -100, "thread_id": 2203, "require_mention": False}]
 
 
 # ---------------------------------------------------------------------------

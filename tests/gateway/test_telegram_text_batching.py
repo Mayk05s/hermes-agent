@@ -26,6 +26,8 @@ def _make_adapter():
     adapter.config = config
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
+    adapter._held_forward_events = {}
+    adapter._held_forward_tasks = {}
     adapter._text_batch_delay_seconds = 0.1  # fast for tests
     adapter._active_sessions = {}
     adapter._pending_messages = {}
@@ -39,6 +41,20 @@ def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
         text=text,
         message_type=MessageType.TEXT,
         source=SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"),
+    )
+
+
+def _make_group_event(text: str, *, user_id: str, thread_id: str = "2") -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003966683704",
+            chat_type="group",
+            thread_id=thread_id,
+        ),
+        raw_message=SimpleNamespace(from_user=SimpleNamespace(id=int(user_id))),
     )
 
 
@@ -121,6 +137,87 @@ class TestTextBatching:
 
         assert len(adapter._pending_text_batches) == 0
         assert len(adapter._pending_text_batch_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_instruction_then_forward_is_one_same_sender_topic_request(self):
+        adapter = _make_adapter()
+        instruction = _make_group_event(
+            "@TripiooBot переведи в доллар", user_id="179555559"
+        )
+        instruction._await_forward_followup = True
+        adapter._enqueue_text_event(instruction)
+
+        forwarded = _make_group_event("180 лари за ночь", user_id="179555559")
+        assert adapter._merge_pending_forwarded_text(forwarded) is True
+
+        await asyncio.sleep(0.2)
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.text == "@TripiooBot переведи в доллар\n180 лари за ночь"
+
+    @pytest.mark.asyncio
+    async def test_reverse_update_order_forward_then_instruction_is_one_request(self):
+        adapter = _make_adapter()
+        forwarded = _make_group_event("180 лари за ночь", user_id="179555559")
+        adapter._hold_forward_for_instruction(forwarded)
+
+        instruction = _make_group_event(
+            "@TripiooBot переведи в доллар", user_id="179555559"
+        )
+        instruction._await_forward_followup = True
+        adapter._enqueue_text_event(instruction)
+        held = adapter._pop_held_forward(instruction)
+        assert held is forwarded
+        assert adapter._merge_pending_forwarded_text(held) is True
+
+        await asyncio.sleep(0.2)
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.text == "@TripiooBot переведи в доллар\n180 лари за ночь"
+
+    @pytest.mark.asyncio
+    async def test_reverse_order_forward_never_crosses_sender_or_topic(self):
+        adapter = _make_adapter()
+        forwarded = _make_group_event("чужой forward", user_id="367599252")
+        adapter._hold_forward_for_instruction(forwarded)
+
+        other_sender = _make_group_event("@TripiooBot проверь", user_id="179555559")
+        other_topic = _make_group_event(
+            "@TripiooBot проверь", user_id="367599252", thread_id="796"
+        )
+        assert adapter._pop_held_forward(other_sender) is None
+        assert adapter._pop_held_forward(other_topic) is None
+        assert len(adapter._held_forward_events) == 1
+
+        tasks = list(adapter._held_forward_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def test_forward_followup_never_crosses_sender_or_topic(self):
+        adapter = _make_adapter()
+        instruction = _make_group_event("@TripiooBot проверь", user_id="179555559")
+        instruction._await_forward_followup = True
+        adapter._pending_text_batches[adapter._text_batch_key(instruction)] = instruction
+
+        other_user = _make_group_event("чужой forward", user_id="367599252")
+        other_topic = _make_group_event(
+            "forward из другой темы", user_id="179555559", thread_id="796"
+        )
+        assert adapter._merge_pending_forwarded_text(other_user) is False
+        assert adapter._merge_pending_forwarded_text(other_topic) is False
+        assert instruction.text == "@TripiooBot проверь"
+
+    def test_forward_detection_supports_modern_and_legacy_fields(self):
+        from gateway.platforms.telegram import TelegramAdapter
+
+        modern = SimpleNamespace(forward_origin=object(), forward_date=None)
+        legacy = SimpleNamespace(forward_origin=None, forward_date=object())
+        plain = SimpleNamespace(forward_origin=None, forward_date=None)
+
+        assert TelegramAdapter._is_forwarded_message(modern) is True
+        assert TelegramAdapter._is_forwarded_message(legacy) is True
+        assert TelegramAdapter._is_forwarded_message(plain) is False
 
     @pytest.mark.asyncio
     async def test_dm_topic_batching_recovers_thread_before_keying(self):

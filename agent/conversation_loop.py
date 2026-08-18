@@ -1090,6 +1090,10 @@ def run_conversation(
                         except Exception:
                             pass
                     _injected = True
+                    try:
+                        agent._notify_drained_steer_consumed()
+                    except Exception:
+                        logger.exception("Durable steer-consumption callback failed")
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",
                         _si,
@@ -1105,9 +1109,33 @@ def run_conversation(
                             agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
                         else:
                             agent._pending_steer = _pre_api_steer
+                        agent._pending_steer_versions = (
+                            list(
+                                getattr(
+                                    agent,
+                                    "_last_drained_steer_versions",
+                                    [],
+                                )
+                                or []
+                            )
+                            + list(
+                                getattr(agent, "_pending_steer_versions", [])
+                                or []
+                            )
+                        )
                 else:
                     existing = getattr(agent, "_pending_steer", None)
                     agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                    agent._pending_steer_versions = (
+                        list(
+                            getattr(agent, "_last_drained_steer_versions", [])
+                            or []
+                        )
+                        + list(
+                            getattr(agent, "_pending_steer_versions", []) or []
+                        )
+                    )
+                agent._last_drained_steer_versions = []
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -5046,6 +5074,7 @@ def run_conversation(
     _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
+    agent._last_drained_steer_versions = []
     agent._response_was_previewed = False
     
     # Include interrupt message if one triggered the interrupt

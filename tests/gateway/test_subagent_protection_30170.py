@@ -81,6 +81,9 @@ def _make_runner() -> GatewayRunner:
     runner._running_agents_ts = {}
     runner._pending_messages = {}
     runner._busy_ack_ts = {}
+    runner._busy_text_mode = "interrupt"
+    runner._session_run_generation = {}
+    runner._cleanup_progress_ids_by_run = {}
     runner._draining = False
     runner.adapters = {}
     runner.config = MagicMock()
@@ -90,6 +93,7 @@ def _make_runner() -> GatewayRunner:
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = True
     runner._is_user_authorized = lambda _source: True
+    runner._ensure_durable_job_route = AsyncMock(return_value=(None, False))
     return runner
 
 
@@ -252,6 +256,30 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         assert "queued" in content.lower()
         assert "/stop" in content
         assert "Interrupting" not in content
+
+    @pytest.mark.asyncio
+    async def test_busy_ack_message_id_joins_active_run_cleanup(self) -> None:
+        """Busy status messages must be deleted with the run's progress bubbles."""
+        runner = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+        adapter._send_with_retry.return_value = MagicMock(
+            success=True,
+            message_id="busy-42",
+        )
+        event = _make_event(text="hi mid-delegation")
+        sk = build_session_key(event.source)
+        generation = 7
+        tracked: list[str] = []
+        runner._session_run_generation[sk] = generation
+        runner._cleanup_progress_ids_by_run[(sk, generation)] = tracked
+        runner._running_agents[sk] = _make_parent_with_subagents()
+        runner.adapters[event.source.platform] = adapter
+
+        with patch("gateway.run.merge_pending_message_event"):
+            await runner._handle_active_session_busy_message(event, sk)
+
+        assert tracked == ["busy-42"]
 
     @pytest.mark.asyncio
     async def test_interrupt_still_fires_when_no_subagents(self) -> None:

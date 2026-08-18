@@ -117,6 +117,17 @@ class TestCalendarMutationCronGuard:
     def test_read_only_calendar_automations_remain_allowed(self, text):
         assert _cron_calendar_mutation_error(text) == ""
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Создай обычную крон задачу. При чем тут личный календарь вообще",
+            "Не добавляй в календарь, просто напомни в 22:00",
+            "Why did you use Calendar? Create a normal reminder instead",
+        ],
+    )
+    def test_calendar_rejections_do_not_block_one_shot_reminders(self, text):
+        assert _cron_calendar_mutation_error(text) == ""
+
 
 # =========================================================================
 # Skill-assembled cron prompt scanning (looser pattern set)
