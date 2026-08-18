@@ -1637,7 +1637,9 @@ def test_reads_and_non_miniapp_tools_do_not_map_to_buttons(tool_name):
         ("medications", "Открыть лекарства"),
         ("planning", "Открыть планирование"),
         ("menu", "Открыть меню"),
-        ("shopping", "Открыть покупки"),
+        ("shopping", "Открыть списки"),
+        ("shopping_buy_0JLQsNC-0YHRgtC-0Lk", "Открыть: купить"),
+        ("shopping_take_0JLQsNC-0YHRgtC-0Lk", "Открыть: взять"),
         ("boxmap", "Открыть сценарии"),
         ("social", "Открыть публикации"),
     ],
@@ -1647,6 +1649,21 @@ def test_full_miniapp_catalog_has_supported_buttons(start_param, expected_label)
 
     assert adapter._is_supported_inline_miniapp_param(start_param) is True
     assert adapter._miniapp_button_label(start_param) == expected_label
+
+
+def test_shopping_mutation_contract_preserves_case_sensitive_list_target():
+    adapter = _make_adapter()
+    start_param = "shopping_take_0JLQsNC-0YHRgtC-0Lk"
+
+    recorded = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "mcp_health_actions_add_shopping_items",
+        result={"_miniapp": {"changed": True, "start_param": start_param}},
+    )
+
+    assert recorded == start_param
+    assert adapter._miniapp_button_label(recorded) == "Открыть: взять"
 
 
 @pytest.mark.asyncio
@@ -1836,7 +1853,7 @@ async def test_multiple_miniapp_mcp_writes_attach_only_changed_apps():
 
     assert result.success is True
     rows = call_log[0]["reply_markup"].inline_keyboard
-    assert [row[0].text for row in rows] == ["Открыть меню", "Открыть покупки"]
+    assert [row[0].text for row in rows] == ["Открыть меню", "Открыть списки"]
 
 
 @pytest.mark.asyncio

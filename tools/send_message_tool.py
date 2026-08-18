@@ -92,6 +92,10 @@ _SUPPORTED_INLINE_MINIAPP_PARAMS: tuple[str, ...] = (
     "planning",
     "todo",
     "tasks",
+    "shopping",
+    "groceries",
+    "shopping_buy",
+    "shopping_take",
 )
 _MINIAPP_BUTTON_LABELS: dict[str, str] = {
     "health": "Открыть здоровье",
@@ -107,6 +111,10 @@ _MINIAPP_BUTTON_LABELS: dict[str, str] = {
     "planning": "Открыть планирование",
     "todo": "Открыть задачи",
     "tasks": "Открыть задачи",
+    "shopping": "Открыть списки",
+    "groceries": "Открыть списки",
+    "shopping_buy": "Открыть: купить",
+    "shopping_take": "Открыть: взять",
 }
 _MINIAPP_WEBAPP_BASE_URL = "https://miniapp.mayk05.pro/"
 
@@ -265,6 +273,10 @@ def _miniapp_label_key(start_param: str) -> str | None:
         return "fitness_day"
     if param.startswith("fitness_week_"):
         return "fitness_week"
+    if param == "shopping_buy" or param.startswith("shopping_buy_"):
+        return "shopping_buy"
+    if param == "shopping_take" or param.startswith("shopping_take_"):
+        return "shopping_take"
     if param in _MINIAPP_BUTTON_LABELS:
         return param
     return None
@@ -274,6 +286,12 @@ def _miniapp_shortcut_text(start_param: str) -> str:
     label_key = _miniapp_label_key(start_param) or ""
     if label_key == "planning" or label_key in {"todo", "tasks"}:
         return "Открой миниапп планирования."
+    if label_key in {"shopping", "groceries"}:
+        return "Открой списки в миниаппе."
+    if label_key == "shopping_buy":
+        return "Открой пункты «Купить» в миниаппе."
+    if label_key == "shopping_take":
+        return "Открой пункты «Взять» в миниаппе."
     if label_key == "health":
         return "Открой миниапп здоровья."
     if label_key.startswith("fitness"):

@@ -199,6 +199,8 @@ _SUPPORTED_INLINE_MINIAPP_PARAMS: tuple[str, ...] = (
     "recipes",
     "shopping",
     "groceries",
+    "shopping_buy",
+    "shopping_take",
     "social",
     "posts",
     "publishing",
@@ -226,8 +228,10 @@ _MINIAPP_BUTTON_LABELS: dict[str, str] = {
     "family-menu": "Открыть меню",
     "dishes": "Открыть блюда",
     "recipes": "Открыть блюда",
-    "shopping": "Открыть покупки",
-    "groceries": "Открыть покупки",
+    "shopping": "Открыть списки",
+    "groceries": "Открыть списки",
+    "shopping_buy": "Открыть: купить",
+    "shopping_take": "Открыть: взять",
     "social": "Открыть публикации",
     "posts": "Открыть публикации",
     "publishing": "Открыть публикации",
@@ -5928,6 +5932,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return "fitness_day"
         if param.startswith("fitness_week_"):
             return "fitness_week"
+        if param == "shopping_buy" or param.startswith("shopping_buy_"):
+            return "shopping_buy"
+        if param == "shopping_take" or param.startswith("shopping_take_"):
+            return "shopping_take"
         if param in _MINIAPP_BUTTON_LABELS:
             return param
         return None
@@ -5964,7 +5972,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if label_key in {"menu", "meals", "family_menu", "family-menu"}:
             return "Открой семейное меню в миниаппе."
         if label_key in {"shopping", "groceries"}:
-            return "Открой покупки в миниаппе."
+            return "Открой списки в миниаппе."
+        if label_key == "shopping_buy":
+            return "Открой пункты «Купить» в миниаппе."
+        if label_key == "shopping_take":
+            return "Открой пункты «Взять» в миниаппе."
         if label_key in {"dishes", "recipes"}:
             return "Открой блюда в миниаппе."
         if label_key == "health":
@@ -6144,7 +6156,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 raw_params = [raw_params]
             params = (
                 [
-                    str(param).strip().lower()
+                    str(param).strip()
                     for param in raw_params
                     if str(param or "").strip()
                 ]
