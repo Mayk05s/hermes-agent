@@ -86,15 +86,52 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+
+_HEALTH_ACTION_MUTATING_TOOLS = frozenset(
+    {
+        "record-nutrition-meal",
+        "replace-nutrition-meals",
+        "record-body-weight",
+        "update-nutrition-coaching-state",
+        "record-nutrition-coaching-advice",
+        "upsert-medication-reminder-rule",
+        "record-medication-intake",
+        "confirm-medication-intake",
+        "create-workout-slots",
+        "materialize-gtg-day",
+        "record-completed-set",
+        "restore-cancelled-workout-slot",
+        "repair-workout-history-facts",
+        "move-workout-slot",
+        "cancel-workout-slot",
+        "cleanup-cancelled-workout-slots",
+        "create-planning-task",
+        "update-planning-task",
+        "delete-planning-task",
+        "add-shopping-items",
+        "categorize-shopping-items",
+        "compose-shopping-items",
+        "dissolve-shopping-composite",
+        "move-shopping-items",
+        "add-menu-entries",
+        "replace-menu-entries",
+        "add-wishlist-items",
+        "update-wishlist-items",
+        "archive-wishlist-items",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2597,17 +2634,29 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
     def _handler(args: dict, **kwargs) -> str:
         user_task = str(kwargs.get("user_task") or "")
-        _enrich_planning_action_args_from_origin(server_name, tool_name, args)
-        calendar_route_error = _guard_calendar_backend_routing(
+        effective_tool_name = _effective_health_actions_tool_name(
             server_name,
             tool_name,
+        )
+        _prepare_health_group_chart_args(effective_tool_name, args)
+        health_origin_error = _bind_health_actions_to_telegram_requester(
+            server_name,
+            args,
+            tool_name=effective_tool_name,
+        )
+        if health_origin_error is not None:
+            return health_origin_error
+        _enrich_planning_action_args_from_origin(server_name, effective_tool_name, args)
+        calendar_route_error = _guard_calendar_backend_routing(
+            server_name,
+            effective_tool_name,
             user_task=user_task,
         )
         if calendar_route_error is not None:
             return calendar_route_error
         target_guard_error = _guard_chainremind_origin_target(
             server_name,
-            tool_name,
+            effective_tool_name,
             args,
             user_task=user_task,
         )
@@ -2650,7 +2699,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
-                result = await server.session.call_tool(tool_name, arguments=args)
+                result = await server.session.call_tool(effective_tool_name, arguments=args)
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
@@ -2721,7 +2770,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # through for non-auth exceptions.
             recovered = _handle_auth_error_and_retry(
                 server_name, exc, _call_once,
-                f"tools/call {tool_name}",
+                f"tools/call {effective_tool_name}",
             )
             if recovered is not None:
                 return recovered
@@ -2731,7 +2780,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # still valid — only the server-side session is stale.
             recovered = _handle_session_expired_and_retry(
                 server_name, exc, _call_once,
-                f"tools/call {tool_name}",
+                f"tools/call {effective_tool_name}",
             )
             if recovered is not None:
                 return recovered
@@ -2739,7 +2788,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _bump_server_error(server_name)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, exc,
+                server_name, effective_tool_name, exc,
             )
             return json.dumps({
                 "error": _sanitize_error(
@@ -2812,6 +2861,392 @@ def _guard_calendar_backend_routing(
     return None
 
 
+def _health_group_participant_display_name(
+    hermes_home: Path,
+    profile_name: str,
+    user_id: str,
+    fallback: str,
+) -> str:
+    """Return a human label without exposing the participant's Telegram ID."""
+    label = re.sub(r"[\x00-\x1f\x7f]+", " ", str(fallback or "")).strip()[:80]
+    memory_path = (
+        hermes_home
+        / "profiles"
+        / profile_name
+        / "memories"
+        / "scopes"
+        / f"{profile_name}-user-{user_id}"
+        / "USER.md"
+    )
+    try:
+        memory_text = memory_path.read_text(encoding="utf-8")
+    except OSError:
+        memory_text = ""
+    match = re.search(r"\bпрогресс\s+([А-ЯЁ][а-яё]+):", memory_text)
+    if match:
+        memory_name = match.group(1)
+        label = {"Александра": "Александр"}.get(memory_name, memory_name)
+    label = {"Mikhail": "Михаил"}.get(label, label)
+    return label or "Участник"
+
+
+def _health_group_report_excluded_admin_ids(hermes_home: Path) -> set[str]:
+    """Return concrete Telegram admin IDs that are operators, not participants."""
+    values: List[Any] = []
+    try:
+        import yaml
+
+        config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8")) or {}
+        telegram = config.get("telegram") if isinstance(config, dict) else {}
+        if isinstance(telegram, dict):
+            values.extend(telegram.get("allow_admin_from") or [])
+            values.extend(telegram.get("group_allow_admin_from") or [])
+    except Exception as exc:
+        logger.debug("Could not read Telegram admin exclusions: %s", exc)
+    for env_name in ("TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
+        values.extend(str(os.getenv(env_name, "") or "").split(","))
+    return {
+        str(value).strip()
+        for value in values
+        if re.fullmatch(r"\d{3,32}", str(value).strip())
+    }
+
+
+def _trusted_health_group_participants(
+    *,
+    chat_id: str,
+    profile_name: str,
+    requester_id: str,
+    requester_name: str,
+) -> List[Dict[str, str]]:
+    """Resolve only participants observed in the current trusted group chat."""
+    hermes_home = Path(
+        os.path.expanduser(
+            os.getenv("HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes"))
+        )
+    )
+    rows: List[str] = []
+    db_path = hermes_home / "gateway_jobs.sqlite3"
+    if db_path.exists():
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as database:
+                rows = [
+                    str(row[0] or "")
+                    for row in database.execute(
+                        """
+                        SELECT source_json
+                          FROM gateway_inbox_events
+                         WHERE platform = 'telegram'
+                           AND json_valid(source_json)
+                           AND COALESCE(json_extract(source_json, '$.chat_id'), '') = ?
+                           AND COALESCE(json_extract(source_json, '$.profile_name'), '') = ?
+                         ORDER BY created_at DESC
+                         LIMIT 5000
+                        """,
+                        (chat_id, profile_name),
+                    )
+                ]
+        except sqlite3.Error:
+            logger.exception("Could not resolve trusted health group roster")
+
+    candidates: List[tuple[str, str]] = [(requester_id, requester_name)]
+    for raw_source in rows:
+        try:
+            source = json.loads(raw_source)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        candidates.append(
+            (
+                str(source.get("user_id") or "").strip(),
+                str(source.get("user_name") or "").strip(),
+            )
+        )
+
+    participants: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    excluded_admin_ids = _health_group_report_excluded_admin_ids(hermes_home)
+    for user_id, user_name in candidates:
+        if (
+            user_id in seen
+            or user_id in excluded_admin_ids
+            or not re.fullmatch(r"\d{3,32}", user_id)
+        ):
+            continue
+        seen.add(user_id)
+        participants.append(
+            {
+                "telegramUserId": user_id,
+                "name": _health_group_participant_display_name(
+                    hermes_home,
+                    profile_name,
+                    user_id,
+                    user_name,
+                ),
+            }
+        )
+        if len(participants) >= 100:
+            break
+    return participants
+
+
+_EXPLICIT_HEALTH_GROUP_REPORT_RE = re.compile(
+    r"(?i)(?:"
+    r"\bгрупп\w*|"
+    r"\bпо\s+кажд\w*|"
+    r"\bвс(?:е|ех)\s+участник\w*|"
+    r"\bобщ\w*\s+(?:сводк\w*|статистик\w*|отч[её]т\w*|итог\w*)|"
+    r"\b(?:сводк\w*|статистик\w*|отч[её]т\w*|итог\w*)\s+(?:по|для)\s+(?:групп\w*|всех)"
+    r")"
+)
+_HEALTH_REPORT_RE = re.compile(
+    r"(?i)\b(?:сводк\w*|статистик\w*|отч[её]т\w*|итог\w*|график\w*)\b"
+)
+_PERSONAL_HEALTH_REPORT_RE = re.compile(
+    r"(?i)(?:\bмо[яйею]\b|\bмоего\b|\bдля\s+меня\b|\bу\s+меня\b)"
+)
+
+
+def _current_health_group_report_requested() -> bool:
+    """Classify a trusted current-group report request.
+
+    Explicit group wording works for every verified member. Configured
+    administrators are report operators rather than participants in this
+    profile, so an otherwise unqualified request such as ``сводка за сегодня``
+    is also a group request for them. A clearly personal request stays personal.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return False
+
+    platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    profile_name = (get_session_env("HERMES_SESSION_PROFILE_NAME", "") or "").strip()
+    chat_id = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    requester_id = (
+        (get_session_env("HERMES_SESSION_REQUESTER_USER_ID", "") or "").strip()
+        or (get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+    )
+    request = (get_session_env("HERMES_SESSION_USER_REQUEST", "") or "").strip()
+    if (
+        platform != "telegram"
+        or profile_name != "hudeem-tripio"
+        or not re.fullmatch(r"-\d{3,32}", chat_id)
+        or not request
+    ):
+        return False
+    if _EXPLICIT_HEALTH_GROUP_REPORT_RE.search(request):
+        return True
+    if not _HEALTH_REPORT_RE.search(request) or _PERSONAL_HEALTH_REPORT_RE.search(request):
+        return False
+
+    hermes_home = Path(
+        os.path.expanduser(
+            os.getenv("HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes"))
+        )
+    )
+    return requester_id in _health_group_report_excluded_admin_ids(hermes_home)
+
+
+def _effective_health_actions_tool_name(server_name: str, tool_name: str) -> str:
+    """Redirect an accidental personal statistics call to the group PNG tool."""
+    normalized = str(tool_name or "").strip().lower().replace("_", "-")
+    if (
+        server_name == "health-actions"
+        and normalized == "get-nutrition-statistics"
+        and _current_health_group_report_requested()
+    ):
+        return "render-group-nutrition-chart"
+    return tool_name
+
+
+def _prepare_health_group_chart_args(tool_name: str, args: dict) -> None:
+    """Give daily group summaries a useful seven-day visual window."""
+    normalized = str(tool_name or "").strip().lower().replace("_", "-")
+    if (
+        normalized != "render-group-nutrition-chart"
+        or not isinstance(args, dict)
+        or not _current_health_group_report_requested()
+    ):
+        return
+    try:
+        from gateway.session_context import get_session_env
+
+        request = (get_session_env("HERMES_SESSION_USER_REQUEST", "") or "").casefold()
+    except Exception:
+        request = ""
+
+    date_from = str(args.get("dateFrom") or "").strip()
+    date_to = str(args.get("dateTo") or "").strip()
+    if not date_to and ("сегодня" in request or "вчера" in request):
+        focus_day = datetime.now(ZoneInfo("Europe/Moscow")).date()
+        if "вчера" in request:
+            focus_day -= timedelta(days=1)
+        date_to = focus_day.isoformat()
+        args["dateTo"] = date_to
+    if not date_from and date_to:
+        try:
+            args["dateFrom"] = (
+                datetime.strptime(date_to, "%Y-%m-%d").date() - timedelta(days=6)
+            ).isoformat()
+        except ValueError:
+            return
+    elif date_from and date_from == date_to:
+        try:
+            args["dateFrom"] = (
+                datetime.strptime(date_to, "%Y-%m-%d").date() - timedelta(days=6)
+            ).isoformat()
+        except ValueError:
+            return
+
+
+def _bind_health_actions_to_telegram_requester(
+    server_name: str,
+    args: dict,
+    *,
+    tool_name: str = "",
+) -> Optional[str]:
+    """Bind health data access to the verified current Telegram sender.
+
+    Tool arguments are model-authored, so accepting ``telegramUserId`` from
+    them would allow accidental or adversarial cross-user access.  The
+    dedicated public health profile overrides it with gateway attribution and
+    fails closed if that attribution is absent.  Other profiles keep their
+    established behavior.
+    """
+    if server_name != "health-actions" or not isinstance(args, dict):
+        return None
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    profile_name = (get_session_env("HERMES_SESSION_PROFILE_NAME", "") or "").strip()
+    if platform != "telegram" or profile_name != "hudeem-tripio":
+        return None
+    requester_id = (
+        (get_session_env("HERMES_SESSION_REQUESTER_USER_ID", "") or "").strip()
+        or (get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+    )
+    if not re.fullmatch(r"\d{3,32}", requester_id):
+        return json.dumps(
+            {
+                "error": (
+                    "Health action blocked: the current Telegram sender "
+                    "could not be verified. Ask the user to send the request "
+                    "from a normal, non-anonymous Telegram account."
+                )
+            },
+            ensure_ascii=False,
+        )
+
+    normalized_tool_name = str(tool_name or "").strip().lower().replace("_", "-")
+    voice_confirmation_required = (
+        get_session_env(
+            "HERMES_SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED",
+            "",
+        )
+        or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if (
+        voice_confirmation_required
+        and normalized_tool_name in _HEALTH_ACTION_MUTATING_TOOLS
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    "Health action blocked: this voice transcript contains a "
+                    "high-impact ambiguity. Ask one short confirmation question "
+                    "and wait for the user's next message before mutating data."
+                )
+            },
+            ensure_ascii=False,
+        )
+
+    if (
+        normalized_tool_name in {"list-nutrition-journal", "list-body-weight-history"}
+        and _current_health_group_report_requested()
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    "This is a verified current-group report request. Personal journal "
+                    "and personal weight-history reads are blocked for this turn. Call "
+                    "render-group-nutrition-chart once and return its exact MEDIA tag."
+                )
+            },
+            ensure_ascii=False,
+        )
+    if normalized_tool_name in {
+        "get-group-nutrition-statistics",
+        "render-group-nutrition-chart",
+    }:
+        chat_id = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+        requester_name = (get_session_env("HERMES_SESSION_USER_NAME", "") or "").strip()
+        specialist_memory_scope = (
+            get_session_env("HERMES_SESSION_MEMORY_SCOPE", "") or ""
+        ).strip()
+        if not re.fullmatch(r"hudeem-tripio-user-\d{3,32}", specialist_memory_scope):
+            return json.dumps(
+                {
+                    "error": (
+                        "Group nutrition reports must be generated through the "
+                        "verified nutrition specialist skill. Delegate this request "
+                        "to specialist nutrition and return every PNG MEDIA tag it produces."
+                    )
+                },
+                ensure_ascii=False,
+            )
+        if not re.fullmatch(r"-\d{3,32}", chat_id):
+            return json.dumps(
+                {
+                    "error": (
+                        "Group nutrition statistics are available only from "
+                        "inside the current verified Telegram group."
+                    )
+                },
+                ensure_ascii=False,
+            )
+        participants = _trusted_health_group_participants(
+            chat_id=chat_id,
+            profile_name=profile_name,
+            requester_id=requester_id,
+            requester_name=requester_name,
+        )
+        if not participants:
+            return json.dumps(
+                {"error": "The verified participant roster for this group is unavailable."},
+                ensure_ascii=False,
+            )
+        # Discard all model-authored identity selectors. Only the roster built
+        # from gateway-attributed events in this exact chat reaches the API.
+        args.pop("telegramUserId", None)
+        args.pop("participantUserIds", None)
+        args.pop("groupChatId", None)
+        args["participants"] = participants
+        return None
+
+    args["telegramUserId"] = requester_id
+    if normalized_tool_name in {"record-nutrition-meal", "replace-nutrition-meals"}:
+        job_id = (get_session_env("HERMES_JOB_ID", "") or "").strip()
+        if job_id:
+            raw_meal_key = str(args.get("sourceMealKey") or "default").strip().lower()
+            meal_key = re.sub(r"[^\w-]+", "-", raw_meal_key, flags=re.UNICODE).strip("-")[:80] or "default"
+            # The model may suggest a key, but only the trusted durable job id
+            # can select the idempotency namespace. Repeated specialist calls
+            # for one meal therefore update one row instead of appending
+            # retries or clarification drafts as duplicates.
+            args["sourceActionId"] = f"gateway-job:{job_id}:meal:{meal_key}"
+    elif normalized_tool_name == "record-body-weight":
+        job_id = (get_session_env("HERMES_JOB_ID", "") or "").strip()
+        if job_id:
+            # A weight report has one canonical write per durable Telegram
+            # job. The database also upserts by participant and measurement
+            # date, so retries and later corrections stay idempotent.
+            args["sourceActionId"] = f"gateway-job:{job_id}:body-weight"
+    return None
+
+
 def _enrich_planning_action_args_from_origin(
     server_name: str,
     tool_name: str,
@@ -2836,6 +3271,15 @@ def _enrich_planning_action_args_from_origin(
         "update-planning-task",
         "delete-planning-task",
         "add-shopping-items",
+        "list-shopping-items",
+        "categorize-shopping-items",
+        "compose-shopping-items",
+        "dissolve-shopping-composite",
+        "move-shopping-items",
+        "add-wishlist-items",
+        "list-wishlist-items",
+        "update-wishlist-items",
+        "archive-wishlist-items",
     }
     normalized_tool_name = str(tool_name or "").replace("_", "-")
     if (
@@ -2855,11 +3299,16 @@ def _enrich_planning_action_args_from_origin(
         return
 
     chat_id = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
-    user_id = (get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+    user_id = (
+        (get_session_env("HERMES_SESSION_REQUESTER_USER_ID", "") or "").strip()
+        or (get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+    )
     if not chat_id:
         return
 
     chat_name = (get_session_env("HERMES_SESSION_CHAT_NAME", "") or "").strip()
+    thread_id = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
+    message_id = (get_session_env("HERMES_SESSION_MESSAGE_ID", "") or "").strip()
     chat_topic = (get_session_env("HERMES_SESSION_CHAT_TOPIC", "") or "").strip()
     user_name = (get_session_env("HERMES_SESSION_USER_NAME", "") or "").strip()
     configured_group_ids = os.environ.get(
@@ -2896,13 +3345,82 @@ def _enrich_planning_action_args_from_origin(
             # Do this at the trusted origin boundary so a generic model guess
             # such as "Работа" cannot discard the actual Telegram context.
             args["category"] = chat_topic[:80]
+        if "wishlist" in normalized_tool_name:
+            # Wishlist ownership is a property of the trusted Telegram topic,
+            # never a model-authored choice.  The health-actions backend checks
+            # the same mapping again before writing.
+            topic_members = {
+                "7": ("natali", "Натали"),
+                "8": ("mikhail", "Михаил"),
+                "9": ("artem", "Тёма"),
+            }
+            raw_topic_members = os.environ.get("WISHLIST_TOPIC_MEMBERS_JSON", "").strip()
+            if raw_topic_members:
+                try:
+                    configured_members = json.loads(raw_topic_members)
+                    parsed_members: Dict[str, tuple[str, str]] = {}
+                    if isinstance(configured_members, dict):
+                        configured_members = [
+                            {"topicThreadId": key, **value}
+                            for key, value in configured_members.items()
+                            if isinstance(value, dict)
+                        ]
+                    if isinstance(configured_members, list):
+                        for value in configured_members:
+                            if not isinstance(value, dict):
+                                continue
+                            mapped_chat_id = str(value.get("groupChatId") or "").strip()
+                            mapped_thread_id = str(value.get("topicThreadId") or "").strip()
+                            member_key = str(value.get("memberKey") or "").strip()
+                            display_name = str(value.get("displayName") or member_key).strip()
+                            if (
+                                mapped_thread_id
+                                and member_key
+                                and (not mapped_chat_id or mapped_chat_id == chat_id)
+                            ):
+                                parsed_members[mapped_thread_id] = (member_key, display_name)
+                    if parsed_members:
+                        topic_members = parsed_members
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    logger.warning("Ignoring invalid WISHLIST_TOPIC_MEMBERS_JSON")
+            if thread_id:
+                args["sourceThreadId"] = thread_id
+            else:
+                args.pop("sourceThreadId", None)
+            if normalized_tool_name != "list-wishlist-items":
+                if message_id:
+                    args["sourceMessageId"] = message_id
+                else:
+                    args.pop("sourceMessageId", None)
+                beneficiary = topic_members.get(thread_id)
+                if beneficiary:
+                    args["beneficiaryKey"], args["beneficiaryName"] = beneficiary
+                else:
+                    args.pop("beneficiaryKey", None)
+                    args.pop("beneficiaryName", None)
         for alias in ("chatId", "telegramChatInstance", "chatInstance", "chatTitle"):
             args.pop(alias, None)
+        if "wishlist" in normalized_tool_name:
+            for alias in ("telegramThreadId", "threadId", "telegramMessageId"):
+                args.pop(alias, None)
         return
 
     args["scope"] = "personal"
     for key in group_keys:
         args.pop(key, None)
+    if "wishlist" in normalized_tool_name:
+        # Wishlist is family-group-only.  Removing model-supplied origin data
+        # makes the remote backend fail closed for personal or unrelated chats.
+        for key in (
+            "sourceThreadId",
+            "telegramThreadId",
+            "threadId",
+            "sourceMessageId",
+            "telegramMessageId",
+            "beneficiaryKey",
+            "beneficiaryName",
+        ):
+            args.pop(key, None)
 
 
 def _guard_chainremind_origin_target(

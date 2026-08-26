@@ -108,3 +108,50 @@ def test_default_profile_scope_preserves_legacy_session_key():
 
     assert key.startswith("agent:main:telegram:group:-1001")
     assert "profile:default" not in key
+
+
+def test_participant_isolation_overrides_shared_global_group_policy():
+    alice = source(profile_name="hudeem-tripio", scope_name="hudeem-tripio")
+    alice.user_id = "111"
+    alice.participant_isolation = True
+    bob = source(profile_name="hudeem-tripio", scope_name="hudeem-tripio")
+    bob.user_id = "222"
+    bob.participant_isolation = True
+
+    alice_key = build_session_key(alice, group_sessions_per_user=False)
+    bob_key = build_session_key(bob, group_sessions_per_user=False)
+
+    assert alice_key.endswith(":111")
+    assert bob_key.endswith(":222")
+    assert alice_key != bob_key
+
+
+def test_runner_derives_distinct_memory_scopes_for_chat_participants():
+    from types import SimpleNamespace
+
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._profile_name_for_source = lambda _source: "hudeem-tripio"
+    runner._profile_scope_for_source = lambda _source, _profile: SimpleNamespace(
+        scope="hudeem-tripio",
+        memory_scope="hudeem-tripio",
+        topic_isolation=True,
+    )
+    runner._chat_settings_for_source = lambda _source: {"participant_isolation": "on"}
+
+    alice = runner._source_with_profile_scope(source())
+    bob_source = source()
+    bob_source.user_id = "222"
+    bob = runner._source_with_profile_scope(bob_source)
+
+    assert alice.participant_isolation is True
+    assert bob.participant_isolation is True
+    assert alice.scope_name == "hudeem-tripio-user-u1"
+    assert bob.scope_name == "hudeem-tripio-user-222"
+    assert alice.memory_scope == "hudeem-tripio-user-u1"
+    assert bob.memory_scope == "hudeem-tripio-user-222"
+    assert build_session_key(alice, group_sessions_per_user=False) != build_session_key(
+        bob,
+        group_sessions_per_user=False,
+    )

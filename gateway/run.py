@@ -654,13 +654,44 @@ def _build_replay_entry(role: str, content: Any, msg: Dict[str, Any]) -> Dict[st
 
 _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
 _OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
-_CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
+_CURRENT_ADDRESSED_MESSAGE_HEADER = (
+    "[Current addressed message - answer this message; use the observed context "
+    "to resolve references and the ongoing conversation, but never treat earlier "
+    "messages as separate pending requests]"
+)
 _CURRENT_ATTACHMENT_GUARD = (
     "[Current message attachment - primary evidence. Inspect the attached "
     "image(s) before interpreting the request and do not substitute images or "
     "facts from earlier messages. If the user asks to save/add/update anything, "
     "claim success only after the corresponding write operation succeeds.]"
 )
+
+_SELF_CONTAINED_TTS_INTENT_RE = re.compile(
+    r"\b(?:озвуч(?:ь|ить|ка|ку)|сделай\s+(?:аудио|озвучку)|скажи)\b",
+    re.IGNORECASE,
+)
+_SELF_CONTAINED_TTS_VOICE_RE = re.compile(
+    r"\bголос(?:ом|а)?\s+[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{1,40}\b",
+    re.IGNORECASE,
+)
+_SELF_CONTAINED_TTS_QUOTE_RE = re.compile(r'["«][^"»\n]{1,2000}["»]')
+_CONTEXT_DEPENDENT_TTS_RE = re.compile(
+    r"\b(?:прошл\w*|предыдущ\w*|этим\s+же|тем\s+же|как\s+(?:раньше|до\s+этого))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_self_contained_tts_request(text: Any) -> bool:
+    """Return True when a TTS turn already contains its voice and exact text."""
+
+    value = str(text or "").strip()
+    if not value or _CONTEXT_DEPENDENT_TTS_RE.search(value):
+        return False
+    return bool(
+        _SELF_CONTAINED_TTS_INTENT_RE.search(value)
+        and _SELF_CONTAINED_TTS_VOICE_RE.search(value)
+        and _SELF_CONTAINED_TTS_QUOTE_RE.search(value)
+    )
 
 
 def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
@@ -1054,7 +1085,7 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -2048,7 +2079,7 @@ def _auto_skills_to_load_for_session(
     return pending
 
 
-_GATEWAY_SENDER_ID_RE = re.compile(r"\[[^\]\n|]+\|(\d+)\]")
+_GATEWAY_SENDER_ID_RE = re.compile(r"\[([^\]\n|]+)\|(\d+)\]")
 _GATEWAY_REPLY_BEFORE_SENDER_RE = re.compile(
     r'\[Replying to: "(?P<quoted>.*)"\]\r?\n\r?\n'
     r'(?P<sender>\[[^\]\n|]+\|\d+\]\s*)',
@@ -2062,9 +2093,20 @@ def _gateway_attributed_requester_user_id(message_text: str) -> str:
     reply_match = _GATEWAY_REPLY_BEFORE_SENDER_RE.search(text)
     if reply_match:
         direct_sender = _GATEWAY_SENDER_ID_RE.search(reply_match.group("sender"))
-        return direct_sender.group(1) if direct_sender else ""
+        return direct_sender.group(2) if direct_sender else ""
     direct_sender = _GATEWAY_SENDER_ID_RE.search(text)
-    return direct_sender.group(1) if direct_sender else ""
+    return direct_sender.group(2) if direct_sender else ""
+
+
+def _gateway_attributed_requester_user_name(message_text: str) -> str:
+    """Return the gateway-inserted sender name for the direct current message."""
+    text = str(message_text or "")
+    reply_match = _GATEWAY_REPLY_BEFORE_SENDER_RE.search(text)
+    if reply_match:
+        direct_sender = _GATEWAY_SENDER_ID_RE.search(reply_match.group("sender"))
+        return direct_sender.group(1).strip() if direct_sender else ""
+    direct_sender = _GATEWAY_SENDER_ID_RE.search(text)
+    return direct_sender.group(1).strip() if direct_sender else ""
 
 
 def _gateway_turn_requester_user_id(source: Any, message_text: str) -> str:
@@ -2322,6 +2364,18 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _is_interrupted_durable_result(agent_result: Any, final_response: str) -> bool:
+    """Recognize control-interrupt output that must never complete a durable job.
+
+    The normal conversation loop sets ``interrupted=True``.  Keep the canonical
+    text fallback for custom/older transports that may preserve the generated
+    interrupt response while dropping the structured flag.
+    """
+    if isinstance(agent_result, dict) and agent_result.get("interrupted"):
+        return True
+    return str(final_response or "").lstrip().startswith("Operation interrupted:")
 
 
 def _preserve_queued_followup_history_offset(
@@ -2612,9 +2666,11 @@ class GatewayRunner:
         except Exception as exc:
             logger.debug("checkpoint auto-maintenance skipped: %s", exc)
 
-        # DM pairing store for code-based user authorization
+        # Pairing stores are profile-owned even though one router gateway owns
+        # Telegram polling and delivery for every profile.
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
+        self._profile_pairing_stores = {"default": self.pairing_store}
         
         # Event hook system
         from gateway.hooks import HookRegistry
@@ -2998,6 +3054,138 @@ class GatewayRunner:
             logger.warning("Failed to read profile config for %s: %s", profile_name, exc)
             return {}
 
+    def _incident_owner_policy(self) -> tuple[Optional[Any], list[str]]:
+        """Resolve destination exclusively from personal policy + adapter owners."""
+        personal_config = self._load_profile_config_for_name("personal")
+        gateway_config = personal_config.get("gateway")
+        policy = gateway_config.get("incident_escalation") if isinstance(gateway_config, dict) else None
+        if not isinstance(policy, dict) or not is_truthy_value(policy.get("enabled"), default=False):
+            return None, []
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        resolver = getattr(adapter, "_pairing_owner_chat_ids", None)
+        if adapter is None or not callable(resolver):
+            return None, []
+        owners = [str(value).strip() for value in resolver() if str(value).strip()]
+        configured = str(policy.get("owner_chat_id") or "").strip()
+        if configured:
+            if configured not in owners:
+                logger.warning("Personal incident owner is not in the adapter owner allowlist")
+                return None, []
+            owners = [configured]
+        return adapter, owners
+
+    async def _deliver_profile_incident(self, incident_id: str) -> bool:
+        store = self._durable_store()
+        incident = store.claim_profile_incident_delivery(incident_id)
+        if incident is None:
+            return False
+        adapter, owners = self._incident_owner_policy()
+        if adapter is None or not owners:
+            store.finish_profile_incident_delivery(
+                incident_id, success=False, delivery_code="owner_policy_unavailable"
+            )
+            return False
+        from gateway.profile_incidents import render_owner_notification
+
+        delivered = True
+        for owner in owners:
+            try:
+                result = await adapter.send(owner, render_owner_notification(incident))
+                delivered = delivered and getattr(result, "success", True) is not False
+            except Exception:
+                delivered = False
+                logger.warning("Sanitized incident delivery failed: ref=%s", incident_id)
+        store.finish_profile_incident_delivery(
+            incident_id,
+            success=delivered,
+            delivery_code="delivered" if delivered else "adapter_failed",
+        )
+        return delivered
+
+    async def _profile_incident_delivery_watcher(self, interval: float = 30.0) -> None:
+        """Retry durable owner delivery after transient failures/restarts."""
+        while True:
+            try:
+                for row in self._durable_store().retryable_profile_incidents():
+                    await self._deliver_profile_incident(str(row["incident_id"]))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Sanitized incident retry pass failed")
+            await asyncio.sleep(interval)
+
+    async def _register_profile_incident(
+        self,
+        *,
+        source_profile: str,
+        job_id: str,
+        fields: Dict[str, str],
+    ) -> Dict[str, Any]:
+        from gateway.profile_incidents import normalize_job_id, safe_projection
+
+        trusted_job_id = normalize_job_id(job_id)
+        incident, created = self._durable_store().register_profile_incident(
+            source_job_id=trusted_job_id,
+            source_profile=str(source_profile or "").strip(),
+            category=fields["category"],
+            component=fields["component"],
+            incident_status=fields["incident_status"],
+            code=fields["code"],
+            origin=fields["origin"],
+        )
+        if incident.get("delivery_status") != "delivered":
+            await self._deliver_profile_incident(str(incident["incident_id"]))
+        refreshed = next(
+            row for row in self._durable_store().profile_incidents_for_job(trusted_job_id)
+            if row["incident_id"] == incident["incident_id"]
+        )
+        result = safe_projection(refreshed)
+        result["created"] = created
+        return result
+
+    async def _notify_profile_incident(
+        self,
+        source: SessionSource,
+        *,
+        job_id: str = "",
+        agent_result: Optional[Dict[str, Any]] = None,
+        exception: Optional[BaseException] = None,
+    ) -> bool:
+        """Route automatic failures through the same durable sanitized path."""
+        if not job_id:
+            return False
+        from gateway.profile_incidents import automatic_fields
+
+        fields = automatic_fields(
+            agent_result=agent_result,
+            exception=exception,
+            retryable_provider_failure=_is_retryable_provider_failure_result(
+                agent_result if isinstance(agent_result, dict) else {}
+            ),
+        )
+        try:
+            result = await self._register_profile_incident(
+                source_profile=str(getattr(source, "profile_name", "") or "default").strip(),
+                job_id=job_id,
+                fields=fields,
+            )
+        except (KeyError, PermissionError, ValueError):
+            logger.warning("Automatic incident rejected by trusted job/profile boundary")
+            return False
+        return result.get("delivery_status") == "delivered"
+
+    def _owner_incident_lookup(self, *, job_id: str, profile: str, requester: str) -> list[dict]:
+        """Owner-only exact lookup; query never joins/selects gateway payloads."""
+        from gateway.profile_incidents import normalize_job_id, safe_projection
+
+        if str(profile or "").strip() != "personal":
+            raise PermissionError("owner_only")
+        adapter, owners = self._incident_owner_policy()
+        if adapter is None or str(requester or "").strip() not in owners:
+            raise PermissionError("owner_only")
+        exact = normalize_job_id(job_id)
+        return [safe_projection(row) for row in self._durable_store().profile_incidents_for_job(exact)]
+
     def _profile_scope_for_source(self, source: SessionSource, profile_name: str):
         from gateway.profile_scopes import normalize_profile_scopes_config, resolve_scope_for_source
 
@@ -3010,15 +3198,42 @@ class GatewayRunner:
         scope = self._profile_scope_for_source(source, profile_name)
         memory_scope = getattr(scope, "memory_scope", "") or getattr(scope, "scope", "") or "default"
         topic_isolation = bool(getattr(scope, "topic_isolation", False))
+        participant_isolation = (
+            str(self._chat_settings_for_source(source).get("participant_isolation") or "default")
+            .strip()
+            .lower()
+            == "on"
+        )
+        scope_name = getattr(scope, "scope", "") or "default"
+        if participant_isolation:
+            participant_id = str(source.user_id_alt or source.user_id or "").strip()
+            if participant_id:
+                safe_participant = re.sub(r"[^a-z0-9_-]+", "-", participant_id.lower()).strip("-_")
+                if not safe_participant:
+                    safe_participant = hashlib.sha256(participant_id.encode("utf-8")).hexdigest()[:16]
+                # Keep the dynamic profile/scope token within the same 64-char
+                # bound used by persisted scope names while retaining a stable
+                # collision-resistant suffix for unusual platform identifiers.
+                safe_participant = safe_participant[:24]
+                participant_suffix = f"user-{safe_participant}"
+                scope_name = f"{scope_name[:38]}-{participant_suffix}"[:64]
+                memory_scope = f"{memory_scope[:38]}-{participant_suffix}"[:64]
+            else:
+                logger.warning(
+                    "participant-isolated route missing sender identity: platform=%s chat=%s",
+                    getattr(getattr(source, "platform", None), "value", source.platform),
+                    source.chat_id,
+                )
         routed = dataclasses.replace(
             source,
             profile_name=profile_name,
-            scope_name=getattr(scope, "scope", "") or "default",
+            scope_name=scope_name,
             memory_scope=memory_scope,
-            topic_isolation=topic_isolation,
+            topic_isolation=topic_isolation or participant_isolation,
+            participant_isolation=participant_isolation,
         )
         logger.info(
-            "profile route: platform=%s chat=%s thread=%s -> profile=%s scope=%s memory_scope=%s topic_isolation=%s",
+            "profile route: platform=%s chat=%s thread=%s -> profile=%s scope=%s memory_scope=%s topic_isolation=%s participant_isolation=%s",
             getattr(getattr(source, "platform", None), "value", source.platform),
             source.chat_id,
             source.thread_id or "",
@@ -3026,6 +3241,7 @@ class GatewayRunner:
             routed.scope_name,
             routed.memory_scope,
             routed.topic_isolation,
+            routed.participant_isolation,
         )
         return routed
 
@@ -5017,15 +5233,50 @@ class GatewayRunner:
             }
             for index, path in enumerate(media_urls)
         ]
+        request_text = (
+            getattr(event, "durable_request_text", None)
+            if getattr(event, "durable_request_text", None) is not None
+            else event.text or ""
+        )
+        # Shared Telegram group sessions intentionally clear ``source.user_id``
+        # so the public conversation remains one session. Durable inbox rows,
+        # however, must retain the verified author of each individual turn:
+        # participant-scoped context and job steering both depend on it. Keep
+        # the shared session source untouched and enrich only the persisted
+        # copy from Telegram's raw sender (or its adapter-generated attribution
+        # after restart/recovery).
+        durable_source = source
+        if (
+            _gateway_platform_value(source.platform) == "telegram"
+            and str(getattr(source, "chat_type", "") or "").lower()
+            in {"group", "supergroup", "forum"}
+            and not str(getattr(source, "user_id", "") or "").strip()
+        ):
+            raw_user = getattr(getattr(event, "raw_message", None), "from_user", None)
+            requester_user_id = str(getattr(raw_user, "id", "") or "").strip()
+            requester_user_id = requester_user_id or _gateway_attributed_requester_user_id(
+                str(request_text or "")
+            )
+            requester_user_name = str(
+                getattr(raw_user, "full_name", "")
+                or getattr(raw_user, "username", "")
+                or ""
+            ).strip()
+            requester_user_name = (
+                requester_user_name
+                or _gateway_attributed_requester_user_name(str(request_text or ""))
+            )
+            if requester_user_id:
+                durable_source = dataclasses.replace(
+                    source,
+                    user_id=requester_user_id,
+                    user_name=requester_user_name or None,
+                )
         inbox, created = store.ingest_event(
             thread_key=thread_key,
             platform=_gateway_platform_value(source.platform),
-            source=source,
-            request_text=(
-                getattr(event, "durable_request_text", None)
-                if getattr(event, "durable_request_text", None) is not None
-                else event.text or ""
-            ),
+            source=durable_source,
+            request_text=request_text,
             message_id=event.message_id,
             platform_update_id=event.platform_update_id,
             reply_to_message_id=event.reply_to_message_id,
@@ -5318,6 +5569,7 @@ class GatewayRunner:
         )
         from gateway.job_router import decide_job_route
 
+        inbox_source = store.source_dict(inbox)
         decision = await decide_job_route(
             message=str(
                 getattr(event, "durable_request_text", None)
@@ -5327,8 +5579,8 @@ class GatewayRunner:
             active_jobs=active_jobs,
             recent_jobs=recent_jobs,
             replied_job_id=replied_job_id,
-            sender_user_id=str(source.user_id or ""),
-            sender_user_name=str(source.user_name or ""),
+            sender_user_id=str(inbox_source.get("user_id") or source.user_id or ""),
+            sender_user_name=str(inbox_source.get("user_name") or source.user_name or ""),
             message_type=str(
                 getattr(getattr(event, "message_type", None), "value", None)
                 or "text"
@@ -5337,12 +5589,48 @@ class GatewayRunner:
         )
         if decision.action == "attach" and decision.job_id:
             target_before_attach = store.get(decision.job_id)
-            job = store.attach_event_to_job(
-                str(inbox["event_id"]),
-                decision.job_id,
-                confidence=decision.confidence,
-                reason=decision.reason,
-            )
+            try:
+                job = store.attach_event_to_job(
+                    str(inbox["event_id"]),
+                    decision.job_id,
+                    confidence=decision.confidence,
+                    reason=decision.reason,
+                )
+            except RuntimeError:
+                # The semantic router inspected an active job, but that job
+                # can finish before attach_event_to_job takes its transaction
+                # lock.  Do not drop the inbound Telegram message in that
+                # narrow race: branch it as a new child job from the just-
+                # completed target so it retains the relevant conversation.
+                target_after_attach = store.get(decision.job_id)
+                target_status = str(
+                    (target_after_attach or {}).get("status") or ""
+                )
+                if (
+                    target_after_attach is None
+                    or target_status in {"pending", "running", "resume_pending"}
+                ):
+                    raise
+                parent_job = target_after_attach or target_before_attach or {}
+                job, _ = store.create_job_for_event(
+                    str(inbox["event_id"]),
+                    parent_job_id=decision.job_id,
+                    branch_id=str(parent_job.get("branch_id") or "") or None,
+                    routing_summary=str(event.text or "")[:1000],
+                    confidence=decision.confidence,
+                    reason=f"attach_race_terminal: {decision.reason}",
+                )
+                self._populate_event_job_route(event, job)
+                event.job_route_action = "new_job"
+                logger.info(
+                    "Durable attach race for inbox %s: target %s became %s; "
+                    "created child job %s",
+                    inbox["event_id"],
+                    decision.job_id,
+                    target_status or "missing",
+                    job["job_id"],
+                )
+                return job, False
             self._populate_event_job_route(event, job)
             event.job_route_action = "attach"
             execution_key = str(job.get("session_key") or "")
@@ -6652,6 +6940,7 @@ class GatewayRunner:
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
+        asyncio.create_task(self._profile_incident_delivery_watcher())
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
@@ -8866,6 +9155,50 @@ class GatewayRunner:
             return False
         return bool(getattr(adapter, "enforces_own_access_policy", False))
 
+    def _pairing_store_for_source(self, source: SessionSource):
+        """Return the pairing store owned by the source's routed profile."""
+        from gateway.pairing import PairingStore
+
+        profile = str(
+            getattr(source, "profile_name", "")
+            or self._profile_name_for_source(source)
+            or "default"
+        ).strip()
+        stores = getattr(self, "_profile_pairing_stores", None)
+        if not isinstance(stores, dict):
+            stores = {"default": self.pairing_store}
+            self._profile_pairing_stores = stores
+        if profile in stores:
+            return stores[profile]
+        profile_home = get_default_hermes_root() / "profiles" / profile
+        store = PairingStore(hermes_home=profile_home)
+        stores[profile] = store
+        logger.info(
+            "pairing store route: platform=%s chat=%s -> profile=%s dir=%s",
+            getattr(getattr(source, "platform", None), "value", source.platform),
+            source.chat_id,
+            profile,
+            store._pairing_dir,
+        )
+        return store
+
+    def _pairing_store_for_entry(self, platform: str, entry_id: str):
+        """Find an owner-DM callback entry across profile-owned stores."""
+        stores = getattr(self, "_profile_pairing_stores", None)
+        if not isinstance(stores, dict):
+            stores = {"default": self.pairing_store}
+            self._profile_pairing_stores = stores
+        root = get_default_hermes_root() / "profiles"
+        if root.is_dir():
+            from gateway.pairing import PairingStore
+            for profile_home in root.iterdir():
+                if profile_home.is_dir() and profile_home.name not in stores:
+                    stores[profile_home.name] = PairingStore(hermes_home=profile_home)
+        for store in stores.values():
+            if store.get_pending_entry(platform, entry_id) is not None:
+                return store
+        return self.pairing_store
+
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
@@ -8943,7 +9276,8 @@ class GatewayRunner:
         # not carry a stable sender but still have a stable chat_id.
         if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
             platform_name = source.platform.value if source.platform else ""
-            if self.pairing_store.is_chat_approved(
+            pairing_store = self._pairing_store_for_source(source)
+            if pairing_store.is_chat_approved(
                 platform_name,
                 source.chat_id,
                 source.thread_id or "",
@@ -9088,7 +9422,7 @@ class GatewayRunner:
         platform_name = source.platform.value if source.platform else ""
         if (
             source.chat_type not in {"group", "forum", "channel"}
-            and self.pairing_store.is_approved(platform_name, user_id)
+            and self._pairing_store_for_source(source).is_approved(platform_name, user_id)
         ):
             return True
 
@@ -9397,28 +9731,48 @@ class GatewayRunner:
     ) -> Optional[dict]:
         """Resolve a Telegram owner-DM access prompt against persistent state."""
         platform_name = "telegram"
-        pending = self.pairing_store.get_pending_entry(platform_name, entry_id)
+        pairing_store = self._pairing_store_for_entry(platform_name, entry_id)
+        pending = pairing_store.get_pending_entry(platform_name, entry_id)
         if not isinstance(pending, dict) or pending.get("subject_type") != "chat":
             return None
 
         if action == "reject":
-            if not self.pairing_store.reject_entry(platform_name, entry_id):
+            if not pairing_store.reject_entry(platform_name, entry_id):
                 return None
             return {"status": "rejected", "request": pending}
 
-        result = self.pairing_store.approve_entry(
+        setup = pending.get("setup") if isinstance(pending.get("setup"), dict) else {}
+        selected_profile = str(setup.get("profile") or "").strip()
+        if not selected_profile:
+            return {
+                "status": "needs_profile",
+                "request": pending,
+            }
+        selected_scope = str(setup.get("approval_scope") or approval_scope or "chat")
+        selected_settings = (
+            dict(setup.get("settings") or {})
+            if isinstance(setup.get("settings"), dict)
+            else {}
+        )
+
+        result = pairing_store.approve_entry(
             platform_name,
             entry_id,
-            approval_scope=approval_scope,
+            approval_scope=selected_scope,
         )
         if not result:
             return None
 
         route = None
+        chat_settings = None
         try:
-            from gateway.pairing_routes import upsert_pairing_profile_route
+            from gateway.pairing_routes import (
+                upsert_pairing_chat_settings,
+                upsert_pairing_profile_route,
+            )
 
-            route = upsert_pairing_profile_route(result, "default")
+            route = upsert_pairing_profile_route(result, selected_profile)
+            chat_settings = upsert_pairing_chat_settings(result, selected_settings)
         except Exception:
             # The pairing grant itself is authoritative for access and has
             # already been committed. Keep it effective even if the optional
@@ -9427,13 +9781,285 @@ class GatewayRunner:
                 "Failed to create default profile route for Telegram pairing %s",
                 entry_id,
             )
-        return {"status": "approved", "request": pending, "pairing": result, "route": route}
+        return {
+            "status": "approved",
+            "request": pending,
+            "pairing": result,
+            "route": route,
+            "chat_settings": chat_settings,
+            "profile": selected_profile,
+            "settings": selected_settings,
+        }
 
-    async def _handle_group_pairing_request(self, event: MessageEvent) -> Optional[str]:
-        """Create a pending pairing request for an unauthorized group/channel."""
+    @staticmethod
+    def _chat_pairing_profile_token(profile: str) -> str:
+        return hashlib.sha256(str(profile).encode("utf-8")).hexdigest()[:10]
+
+    def _chat_pairing_profile_choices(self) -> list[dict[str, str]]:
+        from hermes_cli import profiles as profiles_mod
+
+        choices: list[dict[str, str]] = []
+        for item in profiles_mod.list_profiles():
+            name = str(getattr(item, "name", "") or "").strip()
+            if not name:
+                continue
+            choices.append({
+                "name": name,
+                "token": self._chat_pairing_profile_token(name),
+            })
+        if not any(item["name"] == "default" for item in choices):
+            choices.insert(0, {
+                "name": "default",
+                "token": self._chat_pairing_profile_token("default"),
+            })
+        return choices
+
+    def _configure_chat_pairing_request(
+        self,
+        entry_id: str,
+        *,
+        profile_token: Optional[str] = None,
+        approval_scope: Optional[str] = None,
+        settings_patch: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Update and return the persistent Telegram onboarding draft."""
+        platform_name = "telegram"
+        pairing_store = self._pairing_store_for_entry(platform_name, entry_id)
+        pending = pairing_store.get_pending_entry(platform_name, entry_id)
+        if not isinstance(pending, dict) or pending.get("subject_type") != "chat":
+            return None
+
+        selected_profile = None
+        choices = self._chat_pairing_profile_choices()
+        if profile_token is not None:
+            selected_profile = next(
+                (
+                    item["name"]
+                    for item in choices
+                    if item["token"] == str(profile_token)
+                ),
+                None,
+            )
+            if selected_profile is None:
+                raise ValueError("Selected profile no longer exists")
+
+        if (
+            selected_profile is not None
+            or approval_scope is not None
+            or settings_patch is not None
+        ):
+            pending = pairing_store.update_chat_request_setup(
+                platform_name,
+                entry_id,
+                approval_scope=approval_scope,
+                profile=selected_profile,
+                settings_patch=settings_patch,
+            )
+            if not isinstance(pending, dict):
+                return None
+
+        setup = pending.get("setup") if isinstance(pending.get("setup"), dict) else {}
+        return {
+            "request_entry_id": str(entry_id),
+            "request": pending,
+            "setup": {
+                "approval_scope": str(setup.get("approval_scope") or "chat"),
+                "profile": str(setup.get("profile") or ""),
+                "settings": dict(setup.get("settings") or {}),
+            },
+            "profiles": choices,
+        }
+
+    def _create_chat_pairing_profile(
+        self,
+        entry_id: str,
+        *,
+        profile_name: str,
+        clone_from_default: bool = False,
+    ) -> Optional[dict]:
+        """Create and select a profile for a pending Telegram chat request."""
+        platform_name = "telegram"
+        pairing_store = self._pairing_store_for_entry(platform_name, entry_id)
+        pending = pairing_store.get_pending_entry(platform_name, entry_id)
+        if not isinstance(pending, dict) or pending.get("subject_type") != "chat":
+            return None
+
+        from hermes_cli import profiles as profiles_mod
+
+        profile = profiles_mod.normalize_profile_name(profile_name)
+        profiles_mod.validate_profile_name(profile)
+        if profile == "default":
+            raise ValueError("Имя default зарезервировано; выберите другое имя")
+        if profiles_mod.profile_exists(profile):
+            raise FileExistsError(
+                f"Профиль '{profile}' уже существует; выберите его в списке или задайте другое имя"
+            )
+
+        clone = bool(clone_from_default)
+        path = profiles_mod.create_profile(
+            name=profile,
+            clone_from="default" if clone else None,
+            clone_config=clone,
+            no_skills=False,
+        )
+        if not clone:
+            profiles_mod.seed_profile_skills(path, quiet=True)
+        if not profiles_mod.check_alias_collision(profile):
+            profiles_mod.create_wrapper_script(profile)
+
+        updated = pairing_store.update_chat_request_setup(
+            platform_name,
+            entry_id,
+            profile=profile,
+        )
+        if not isinstance(updated, dict):
+            return None
+        return self._configure_chat_pairing_request(entry_id)
+
+    def _restart_chat_pairing_request(
+        self,
+        chat_id: str,
+        *,
+        thread_id: str = "",
+    ) -> Optional[dict]:
+        """Start a fresh draft from an authenticated owner retry button."""
+        platform_name = "telegram"
+        clean_chat_id = str(chat_id or "").strip()
+        clean_thread_id = str(thread_id or "").strip()
+        if not clean_chat_id:
+            return None
+
+        approved = [
+            item
+            for item in self.pairing_store.list_approved(platform_name)
+            if str(item.get("chat_id") or "").strip() == clean_chat_id
+            and (
+                str(item.get("thread_id") or "").strip() == clean_thread_id
+                or not clean_thread_id
+            )
+        ]
+        known = approved[0] if approved else {}
+        entry_id = self.pairing_store.generate_chat_request(
+            platform_name,
+            clean_chat_id,
+            str(known.get("chat_name") or known.get("user_name") or clean_chat_id),
+            chat_type=str(known.get("chat_type") or "group"),
+            thread_id=clean_thread_id,
+            requester_user_id=str(known.get("requester_user_id") or ""),
+            requester_user_name=str(known.get("requester_user_name") or ""),
+            bypass_rate_limit=True,
+        )
+        if not entry_id:
+            return None
+        return self._configure_chat_pairing_request(entry_id)
+
+    def _telegram_pairing_card_context(self, target_chat_id: str) -> Optional[str]:
+        """Build authoritative context when an owner replies to an access card."""
+        clean_chat_id = str(target_chat_id or "").strip()
+        if not clean_chat_id:
+            return None
+
+        try:
+            from gateway.chat_settings import (
+                INHERIT,
+                SETTING_FIELDS,
+                normalize_chat_settings_config,
+                resolve_chat_settings,
+            )
+            from gateway.profile_routing import (
+                find_profile_route_for_source,
+                normalize_profile_routes_config,
+                resolve_profile_for_source,
+            )
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            target_source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=clean_chat_id,
+                chat_type="group",
+            )
+            routes_cfg = normalize_profile_routes_config(cfg.get("profile_routes"))
+            route = find_profile_route_for_source(routes_cfg, target_source)
+            profile = resolve_profile_for_source(routes_cfg, target_source)
+
+            settings_cfg = normalize_chat_settings_config(cfg.get("chat_settings"))
+            effective_settings = resolve_chat_settings(
+                settings_cfg,
+                platform="telegram",
+                chat_id=clean_chat_id,
+            )
+            explicit_setting = next(
+                (
+                    item
+                    for item in settings_cfg.settings
+                    if item.platform == "telegram" and item.chat_id == clean_chat_id
+                ),
+                None,
+            )
+            explicit_values = (
+                {
+                    key: value
+                    for key, value in explicit_setting.values.items()
+                    if key in SETTING_FIELDS and value != INHERIT
+                }
+                if explicit_setting is not None
+                else {}
+            )
+            approved_entries = [
+                item
+                for item in self.pairing_store.list_approved("telegram")
+                if str(item.get("chat_id") or "").strip() == clean_chat_id
+            ]
+            approved = bool(approved_entries)
+            chat_name = next(
+                (
+                    str(item.get("chat_name") or item.get("user_name") or "").strip()
+                    for item in approved_entries
+                    if item.get("chat_name") or item.get("user_name")
+                ),
+                "",
+            )
+            chat_layer_summary = ", ".join(
+                f"{key}={effective_settings.get(key)}"
+                for key in SETTING_FIELDS
+            )
+            explicit_summary = (
+                ", ".join(f"{key}={value}" for key, value in explicit_values.items())
+                or "нет, всё наследуется"
+            )
+            return (
+                "[Системный контекст Hermes: пользователь отвечает на карточку "
+                "доступа/настройки конкретного Telegram-чата. Его вопрос относится "
+                "ТОЛЬКО к целевому чату ниже, а не к текущему личному чату и не к "
+                "другим Telegram-чатам. Не подменяй этот chat_id данными основного DM.]\n"
+                f"Целевой чат: {chat_name or clean_chat_id}\n"
+                f"target_chat_id: {clean_chat_id}\n"
+                f"Доступ одобрен: {'да' if approved else 'нет'}\n"
+                f"Профиль: {profile}\n"
+                f"Явный маршрут: {route.id if route else 'нет'}\n"
+                f"Явные настройки чата: {explicit_summary}\n"
+                "Настройки слоя chat_settings после общих defaults "
+                f"(default означает наследование профиля): {chat_layer_summary}"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to build Telegram pairing-card context for chat %s",
+                clean_chat_id,
+            )
+            return None
+
+    async def _handle_group_pairing_request(
+        self,
+        event: MessageEvent,
+        *,
+        allow_reconfigure: bool = False,
+    ) -> Optional[str]:
+        """Create a pending access or reconfiguration request for a group."""
         source = event.source
         platform_name = source.platform.value if source.platform else "unknown"
-        if self.pairing_store.is_chat_approved(
+        pairing_store = self._pairing_store_for_source(source)
+        if not allow_reconfigure and pairing_store.is_chat_approved(
             platform_name,
             source.chat_id,
             source.thread_id or "",
@@ -9441,7 +10067,7 @@ class GatewayRunner:
             return ""
 
         requester_user_id, requester_user_name = self._group_pairing_requester(event)
-        entry_id = self.pairing_store.generate_chat_request(
+        entry_id = pairing_store.generate_chat_request(
             platform_name,
             source.chat_id,
             source.chat_name or "",
@@ -9456,7 +10082,7 @@ class GatewayRunner:
 
         if entry_id:
             pending_entry = None
-            get_pending_entry = getattr(self.pairing_store, "get_pending_entry", None)
+            get_pending_entry = getattr(pairing_store, "get_pending_entry", None)
             if callable(get_pending_entry):
                 pending_entry = get_pending_entry(platform_name, entry_id)
             already_notified = bool(
@@ -9483,7 +10109,7 @@ class GatewayRunner:
                     )
                 if delivered_to_owner:
                     mark_owner_notified = getattr(
-                        self.pairing_store,
+                        pairing_store,
                         "mark_owner_notified",
                         None,
                     )
@@ -9634,17 +10260,31 @@ class GatewayRunner:
             # In DMs: offer pairing code. Other group messages stay silent.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
+                pairing_store = self._pairing_store_for_source(source)
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                if pairing_store._is_rate_limited(platform_name, source.user_id):
                     return None
-                code = self.pairing_store.generate_code(
+                code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
+                        notify_owner = getattr(adapter, "send_dm_pairing_request", None)
+                        if callable(notify_owner):
+                            try:
+                                await notify_owner(
+                                    user_id=source.user_id,
+                                    user_name=source.user_name or "",
+                                    code=code,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to notify owner about %s DM pairing request",
+                                    platform_name,
+                                )
                         await adapter.send(
                             source.chat_id,
                             f"Hi~ I don't recognize you yet!\n\n"
@@ -9661,7 +10301,7 @@ class GatewayRunner:
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
         # A configured notification-only Telegram topic can hand substantial
@@ -9752,10 +10392,13 @@ class GatewayRunner:
         if not is_internal:
             if self._is_telegram_group_start_command_event(event):
                 logger.info(
-                    "Ignoring Telegram group /start platform ping for chat %s",
+                    "Handling Telegram group /start as onboarding/reconfiguration for chat %s",
                     source.chat_id,
                 )
-                return None
+                return await self._handle_group_pairing_request(
+                    event,
+                    allow_reconfigure=True,
+                )
             _chat_command = event.get_command()
             if _chat_command:
                 _private_chat_denial = self._private_chat_only_command_denial(
@@ -10873,7 +11516,13 @@ class GatewayRunner:
                         )
                     self._schedule_durable_job_provider_retry(durable_job_id)
                     result_is_current = False
-                elif self._draining and not durable_result_text.strip():
+                elif self._draining and (
+                    not durable_result_text.strip()
+                    or _is_interrupted_durable_result(
+                        _agent_result,
+                        durable_result_text,
+                    )
+                ):
                     store.mark_resume_pending(
                         durable_job_id,
                         "restart_timeout"
@@ -10953,6 +11602,7 @@ class GatewayRunner:
         event: MessageEvent,
         source: SessionSource,
         history: List[Dict[str, Any]],
+        session_key: Optional[str] = None,
     ) -> Optional[str]:
         """Prepare inbound event text for the agent.
 
@@ -10971,10 +11621,11 @@ class GatewayRunner:
         message_text = event.text or ""
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
-        # Use the same helper every other call site uses so the write key here
-        # matches the consume key at the run_conversation site — even if the
-        # session store overrides build_session_key's default behavior.
-        session_key = self._session_key_for_source(source)
+        # Durable jobs execute in a private ``:job:gw_*`` session rather than
+        # the source's public chat session.  Prefer that already-resolved key so
+        # the run_conversation consumer sees this turn's images; the fallback
+        # keeps direct/unit callers on the canonical source key.
+        session_key = session_key or self._session_key_for_source(source)
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
@@ -11288,49 +11939,136 @@ class GatewayRunner:
         event: MessageEvent,
         session_entry: SessionEntry,
     ) -> List[Dict[str, Any]]:
-        """Seed a new job branch from public history, never live private work."""
+        """Seed a job from the canonical topic timeline and its parent branch."""
         job_id = str(getattr(event, "durable_job_id", None) or "")
         store = self._durable_store()
         job = store.get(job_id) if store is not None and job_id else None
         if not job:
             return []
-        source_session_id = ""
-        parent_job_id = str(job.get("parent_job_id") or "")
-        if parent_job_id:
-            parent = store.get(parent_job_id)
-            source_session_id = str((parent or {}).get("session_id") or "")
-        if not source_session_id:
-            thread_key = str(job.get("thread_key") or "")
-            try:
-                self.session_store._ensure_loaded()
-                legacy_entry = self.session_store._entries.get(thread_key)
-            except Exception:
-                legacy_entry = None
-            if legacy_entry is not None:
-                source_session_id = str(legacy_entry.session_id or "")
-        if not source_session_id or source_session_id == session_entry.session_id:
-            return []
-        source_history = self.session_store.load_transcript(source_session_id)
-        public_history: List[Dict[str, Any]] = []
-        for item in source_history[-80:]:
-            role = item.get("role")
-            content = item.get("content")
-            if role not in {"user", "assistant"} or not content:
-                continue
-            if item.get("tool_calls") or item.get("tool_call_id"):
-                continue
-            public_history.append({"role": role, "content": str(content)})
-        if public_history:
-            self.session_store.rewrite_transcript(
-                session_entry.session_id, public_history
-            )
+
+        # A named-voice TTS request containing the exact quoted phrase is a
+        # complete instruction. Replaying unrelated group work can turn a
+        # one-line audio request into continuation of an old scenario/task.
+        # Context-dependent requests ("the previous voice", "same as before")
+        # deliberately keep the normal topic-history path.
+        if _is_self_contained_tts_request(job.get("request_text")):
             store.append_job_event(
                 job_id,
                 "context_seeded",
                 {
-                    "source_session_id": source_session_id,
-                    "message_count": len(public_history),
+                    "source_session_ids": [],
+                    "message_count": 0,
+                    "durable_group_message_count": 0,
+                    "suppressed_reason": "self_contained_tts",
                 },
+            )
+            return []
+
+        from gateway.durable_jobs import TRUSTED_GROUP_CONTEXT_WINDOW_SECONDS
+
+        context_cutoff = float(job.get("created_at") or time.time())
+        context_start = context_cutoff - TRUSTED_GROUP_CONTEXT_WINDOW_SECONDS
+        source_session_ids: List[str] = []
+        thread_key = str(job.get("thread_key") or "")
+        try:
+            self.session_store._ensure_loaded()
+            legacy_entry = self.session_store._entries.get(thread_key)
+        except Exception:
+            legacy_entry = None
+        if legacy_entry is not None:
+            public_session_id = str(legacy_entry.session_id or "")
+            public_updated_at = getattr(legacy_entry, "updated_at", None)
+            try:
+                public_updated_epoch = (
+                    public_updated_at.timestamp()
+                    if isinstance(public_updated_at, datetime)
+                    else float(public_updated_at)
+                )
+            except (TypeError, ValueError, OverflowError):
+                public_updated_epoch = context_cutoff
+            if public_session_id and public_updated_epoch >= context_start:
+                source_session_ids.append(public_session_id)
+
+        parent_job_id = str(job.get("parent_job_id") or "")
+        if parent_job_id:
+            parent = store.get(parent_job_id)
+            parent_session_id = str((parent or {}).get("session_id") or "")
+            if parent_session_id and parent_session_id not in source_session_ids:
+                source_session_ids.append(parent_session_id)
+
+        source_session_ids = [
+            source_session_id
+            for source_session_id in source_session_ids
+            if source_session_id != session_entry.session_id
+        ]
+
+        public_history: List[Dict[str, Any]] = []
+        seen_platform_message_ids: set[str] = set()
+        seen_observed_fallbacks: set[tuple[str, str]] = set()
+
+        durable_group_history = store.trusted_group_request_history(
+            job_id=job_id,
+        )
+        if not isinstance(durable_group_history, list):
+            durable_group_history = []
+
+        def _append_seeded_item(item: Dict[str, Any]) -> None:
+            role = item.get("role")
+            content = item.get("content")
+            if role not in {"user", "assistant"} or not content:
+                return
+            if item.get("tool_calls") or item.get("tool_call_id"):
+                return
+            platform_message_id = item.get("message_id") or item.get(
+                "platform_message_id"
+            )
+            if platform_message_id:
+                platform_message_id = str(platform_message_id)
+                if platform_message_id in seen_platform_message_ids:
+                    return
+                seen_platform_message_ids.add(platform_message_id)
+            elif item.get("observed"):
+                observed_fallback = (str(role), str(content))
+                if observed_fallback in seen_observed_fallbacks:
+                    return
+                seen_observed_fallbacks.add(observed_fallback)
+            seeded_item: Dict[str, Any] = {
+                "role": role,
+                "content": str(content),
+            }
+            if item.get("observed"):
+                seeded_item["observed"] = True
+            if platform_message_id:
+                seeded_item["message_id"] = platform_message_id
+            public_history.append(seeded_item)
+
+        for source_session_id in source_session_ids:
+            source_history = self.session_store.load_transcript(source_session_id)
+            for item in source_history[-80:]:
+                _append_seeded_item(item)
+
+        # ``response_mode=all`` messages and model-silent group turns execute
+        # in their own durable branches, so they never land in the canonical
+        # public transcript above.  Merge their trusted inbox rows as observed
+        # context before parent-branch history.  This is the bridge that keeps
+        # "listen always" independent from "respond only on mention".
+        for item in durable_group_history:
+            _append_seeded_item(item)
+        if public_history:
+            self.session_store.rewrite_transcript(
+                session_entry.session_id, public_history
+            )
+            seed_payload: Dict[str, Any] = {
+                "source_session_ids": source_session_ids,
+                "message_count": len(public_history),
+                "durable_group_message_count": len(durable_group_history),
+            }
+            if source_session_ids:
+                seed_payload["source_session_id"] = source_session_ids[0]
+            store.append_job_event(
+                job_id,
+                "context_seeded",
+                seed_payload,
             )
         return public_history
 
@@ -12010,6 +12748,7 @@ class GatewayRunner:
             event=event,
             source=source,
             history=history,
+            session_key=session_key,
         )
         if message_text is None:
             # Legacy/no-durable-store fallback. Normal durable Telegram voice
@@ -12022,6 +12761,24 @@ class GatewayRunner:
                 str(getattr(event, "job_thread_key", None) or self._session_key_for_source(source)),
             )
             return
+
+        # Voice transcription is untrusted input. The nutrition profile gets
+        # a system-level invariant against invented identities/medical context,
+        # plus a confirmation gate only for high-impact STT interpretations.
+        from gateway.health_voice_guard import build_health_voice_guard
+
+        _voice_guard = build_health_voice_guard(
+            platform=source.platform,
+            profile_name=str(getattr(source, "profile_name", "") or ""),
+            message_type=event.message_type,
+            transcript=str(
+                getattr(event, "telegram_voice_transcript_text", "")
+                or event.text
+                or message_text
+            ),
+        )
+        if _voice_guard is not None:
+            context_prompt = f"{context_prompt}\n\n{_voice_guard.instruction}"
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -12050,26 +12807,50 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=session_entry.session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                durable_job_id=getattr(event, "durable_job_id", None),
-                durable_recovery=bool(
-                    getattr(event, "durable_recovery", False)
-                ),
-                durable_request_text=getattr(
-                    event,
-                    "durable_request_text",
-                    None,
-                ),
+            from contextlib import nullcontext
+            from gateway.session_context import override_session_env
+
+            _voice_confirmation_context = (
+                override_session_env(
+                    "HERMES_SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED",
+                    "true",
+                )
+                if _voice_guard is not None and _voice_guard.requires_confirmation
+                else nullcontext()
             )
+            with _voice_confirmation_context:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=session_entry.session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    durable_job_id=getattr(event, "durable_job_id", None),
+                    durable_recovery=bool(
+                        getattr(event, "durable_recovery", False)
+                    ),
+                    durable_request_text=getattr(
+                        event,
+                        "durable_request_text",
+                        None,
+                    ),
+                )
+
+            if (
+                _voice_guard is not None
+                and _voice_guard.requires_confirmation
+                and not agent_result.get("failed")
+            ):
+                # The user sees one deterministic clarification even if the
+                # model attempted to add interpretation-dependent advice.
+                agent_result["final_response"] = (
+                    _voice_guard.confirmation_question
+                    or "Подтверди, пожалуйста, неоднозначную часть голосового сообщения."
+                )
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -12096,6 +12877,12 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            if agent_result.get("failed"):
+                await self._notify_profile_incident(
+                    source,
+                    job_id=str(getattr(event, "durable_job_id", "") or ""),
+                    agent_result=agent_result,
+                )
             if (
                 getattr(event, "durable_job_id", None)
                 and _is_retryable_provider_failure_result(agent_result)
@@ -12512,6 +13299,11 @@ class GatewayRunner:
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            await self._notify_profile_incident(
+                source,
+                job_id=str(getattr(event, "durable_job_id", "") or ""),
+                exception=e,
+            )
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
             status_hint = ""
@@ -18777,6 +19569,29 @@ class GatewayRunner:
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
+        requester_user_id = _gateway_turn_requester_user_id(
+            context.source,
+            user_request_text,
+        )
+        participant_request_context = ""
+        if job_id and requester_user_id:
+            try:
+                participant_request_context = (
+                    self._durable_job_store.trusted_participant_request_context(
+                        job_id=str(job_id),
+                        platform=context.source.platform.value,
+                        chat_id=str(context.source.chat_id or ""),
+                        user_id=str(requester_user_id),
+                        profile_name=str(
+                            getattr(context.source, "profile_name", "") or "default"
+                        ),
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "Could not build trusted participant request context",
+                    exc_info=True,
+                )
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -18784,10 +19599,7 @@ class GatewayRunner:
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             chat_topic=str(context.source.chat_topic or ""),
             user_id=str(context.source.user_id) if context.source.user_id else "",
-            requester_user_id=_gateway_turn_requester_user_id(
-                context.source,
-                user_request_text,
-            ),
+            requester_user_id=requester_user_id,
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
@@ -18803,6 +19615,7 @@ class GatewayRunner:
             memory_scope=str(getattr(context.source, "memory_scope", "") or "default"),
             topic_isolation="true" if getattr(context.source, "topic_isolation", False) else "false",
             user_request=str(user_request_text or ""),
+            participant_request_context=participant_request_context,
             job_id=str(job_id or ""),
         )
 
@@ -19039,6 +19852,7 @@ class GatewayRunner:
 
         enriched_parts, transcripts = await self._transcribe_audio_paths_for_inbound_voice(audio_paths)
         transcript_text = "\n\n".join(t for t in transcripts if t)
+        event.telegram_voice_transcript_text = transcript_text
         if transcript_text and self._telegram_show_transcription_enabled(rule, source=source):
             adapter = self.adapters.get(Platform.TELEGRAM)
             if adapter:
@@ -20545,7 +21359,7 @@ class GatewayRunner:
         _cleanup_generation = int(
             run_generation
             if run_generation is not None
-            else self._session_run_generation.get(session_key, 0)
+            else getattr(self, "_session_run_generation", {}).get(session_key, 0)
         )
         _cleanup_registry_key = (session_key, _cleanup_generation) if session_key else None
         if _cleanup_progress and _cleanup_registry_key is not None:
@@ -21360,6 +22174,7 @@ class GatewayRunner:
                     "profile.scope": str(getattr(source, "scope_name", "") or "default"),
                     "profile.memory_scope": str(getattr(source, "memory_scope", "") or "default"),
                     "profile.topic_isolation": "true" if getattr(source, "topic_isolation", False) else "false",
+                    "agent.skip_memory": "true" if agent_cfg_local.get("skip_memory", False) else "false",
                     "source.platform": getattr(getattr(source, "platform", None), "value", source.platform),
                     "source.chat_id": str(getattr(source, "chat_id", "") or ""),
                     "source.thread_id": str(getattr(source, "thread_id", "") or ""),
@@ -21395,6 +22210,7 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+                    skip_memory=bool(agent_cfg_local.get("skip_memory", False)),
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
@@ -22718,6 +23534,7 @@ class GatewayRunner:
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
+                        session_key=session_key,
                     )
                     if next_message is None:
                         return result

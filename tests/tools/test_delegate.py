@@ -31,6 +31,7 @@ from tools.delegate_tool import (
     _build_child_system_prompt,
     _toolset_satisfied,
     _strip_blocked_tools,
+    _trusted_specialist_runtime_grants,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
@@ -168,7 +169,256 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertEqual(result, [])
 
 
-class TestHealthSpecialistContracts(unittest.TestCase):
+class TestSpecialistContracts(unittest.TestCase):
+    def test_nutrition_specialist_uses_verified_participant_memory_scope(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-5526305849",
+            user_id="222333444",
+            requester_user_id="222333444",
+            profile_name="hudeem-tripio",
+            memory_scope="hudeem-tripio",
+            user_request="Хочу безопасно похудеть на 5 кг.",
+            participant_request_context=(
+                "Завтрак: овсяная каша 150 г.\n\n"
+                "--- next message from the same participant ---\n\n"
+                "Каша на воде, сейчас."
+            ),
+        )
+        try:
+            task = _apply_specialist_contract(
+                {
+                    "goal": "Используй сведения из общей истории.",
+                    "context": "Другой участник весит 90 кг.",
+                    "specialist": "nutrition",
+                }
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        self.assertEqual(task["_specialist"], "nutrition")
+        self.assertEqual(task["_specialist_label"], "🥗 *Питание*")
+        self.assertEqual(
+            task["_specialist_memory_scope"],
+            "hudeem-tripio-user-222333444",
+        )
+        self.assertIn("private nutrition memory is already", task["goal"])
+        self.assertIn("do not call a nonexistent memory read action", task["goal"])
+        self.assertNotIn('memory(action="read")', task["goal"])
+        self.assertNotIn("222333444", task["goal"])
+        self.assertIn("Завтрак: овсяная каша 150 г.", task["context"])
+        self.assertIn("Каша на воде, сейчас.", task["context"])
+        self.assertIn("The final item is the current request", task["context"])
+        self.assertIn("Do not re-record an earlier completed meal", task["context"])
+        self.assertNotIn("Хочу безопасно похудеть на 5 кг.", task["context"])
+        self.assertNotIn("Другой участник", task["context"])
+        self.assertNotIn("общей истории", task["goal"])
+        self.assertEqual(
+            task["toolsets"],
+            ["skills", "memory", "health-actions", "vision"],
+        )
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"telegram": {"allow_admin_from": ["111222333"]}},
+    )
+    def test_admin_summary_contract_requires_group_png(self, _mock_config):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-5526305849",
+            requester_user_id="111222333",
+            profile_name="hudeem-tripio",
+            memory_scope="hudeem-tripio",
+            user_request="@TripiooBot сводка за сегодня",
+            participant_request_context="@TripiooBot сводка за сегодня",
+        )
+        try:
+            task = _apply_specialist_contract(
+                {"goal": "Сделай сводку.", "specialist": "nutrition"}
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        self.assertTrue(task["_specialist_group_report_required"])
+        self.assertIn("render-group-nutrition-chart exactly once", task["goal"])
+        self.assertIn("PNG chart is mandatory", task["context"])
+        self.assertNotIn("personal nutrition-statistics", task["context"])
+
+    def test_nutrition_specialist_runtime_grants_fail_closed_without_scope(self):
+        self.assertEqual(_trusted_specialist_runtime_grants("nutrition", None), [])
+        self.assertEqual(
+            _trusted_specialist_runtime_grants(
+                "nutrition",
+                "hudeem-tripio-user-222333444",
+            ),
+            ["skills", "memory", "health-actions", "vision"],
+        )
+
+    def test_nutrition_specialist_rejects_missing_verified_telegram_identity(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-5526305849",
+            profile_name="hudeem-tripio",
+        )
+        try:
+            result = json.loads(
+                delegate_task(
+                    goal="Помоги снизить вес.",
+                    specialist="nutrition",
+                    parent_agent=_make_mock_parent(),
+                )
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        self.assertIn("verified Telegram participant identity is missing", result["error"])
+
+    def test_nutrition_specialist_rejects_shared_context_without_direct_request(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-5526305849",
+            user_id="222333444",
+            requester_user_id="222333444",
+            profile_name="hudeem-tripio",
+        )
+        try:
+            result = json.loads(
+                delegate_task(
+                    goal="Используй общую историю чата.",
+                    context="Данные другого участника.",
+                    specialist="nutrition",
+                    parent_agent=_make_mock_parent(),
+                )
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        self.assertIn("trusted current Telegram request is missing", result["error"])
+
+    def test_nutrition_child_gets_private_memory_without_parent_memory_tool(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["delegation"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            MockAgent.return_value = child
+            built = _build_child_agent(
+                task_index=0,
+                goal="Give a nutrition recommendation.",
+                context=None,
+                toolsets=["skills", "memory", "health-actions", "vision"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                specialist="nutrition",
+                specialist_required_toolsets=["skills", "memory", "health-actions", "vision"],
+                specialist_memory_scope="hudeem-tripio-user-222333444",
+            )
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(parent.enabled_toolsets, ["delegation"])
+        self.assertEqual(
+            kwargs["enabled_toolsets"],
+            ["skills", "memory", "health-actions", "vision"],
+        )
+        self.assertFalse(kwargs["skip_memory"])
+        self.assertEqual(
+            built._delegate_memory_scope,
+            "hudeem-tripio-user-222333444",
+        )
+
+    def test_nutrition_worker_thread_receives_requester_and_private_memory_scope(self):
+        import tempfile
+        from pathlib import Path
+
+        from gateway.session_context import (
+            clear_session_vars,
+            get_session_env,
+            set_session_vars,
+        )
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.memory_tool import get_memory_dir
+
+        captured = {}
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["delegation"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_home = Path(tmp) / "hudeem-tripio"
+            profile_home.mkdir()
+            home_token = set_hermes_home_override(profile_home)
+            session_tokens = set_session_vars(
+                platform="telegram",
+                chat_id="-5526305849",
+                user_id="222333444",
+                requester_user_id="222333444",
+                profile_name="hudeem-tripio",
+                scope_name="hudeem-tripio",
+                memory_scope="hudeem-tripio",
+                user_request="Хочу безопасно похудеть на 5 кг.",
+            )
+            try:
+                with patch("run_agent.AIAgent") as MockAgent:
+                    child = MagicMock()
+
+                    def run_child(*, user_message, task_id):
+                        captured["requester"] = get_session_env(
+                            "HERMES_SESSION_REQUESTER_USER_ID"
+                        )
+                        captured["memory_scope"] = get_session_env(
+                            "HERMES_SESSION_MEMORY_SCOPE"
+                        )
+                        captured["home"] = str(get_hermes_home())
+                        captured["memory_dir"] = str(get_memory_dir())
+                        return {
+                            "final_response": "ok",
+                            "completed": True,
+                            "api_calls": 1,
+                        }
+
+                    child.run_conversation.side_effect = run_child
+                    MockAgent.return_value = child
+                    result = json.loads(
+                        delegate_task(
+                            goal="Помоги безопасно снизить вес.",
+                            specialist="nutrition",
+                            parent_agent=parent,
+                        )
+                    )
+            finally:
+                clear_session_vars(session_tokens)
+                reset_hermes_home_override(home_token)
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(captured["requester"], "222333444")
+        self.assertEqual(
+            captured["memory_scope"],
+            "hudeem-tripio-user-222333444",
+        )
+        self.assertEqual(captured["home"], str(profile_home))
+        self.assertEqual(
+            captured["memory_dir"],
+            str(
+                profile_home
+                / "memories"
+                / "scopes"
+                / "hudeem-tripio-user-222333444"
+            ),
+        )
+
     def test_explicit_nutrition_specialist_adds_contract_and_toolsets(self):
         task = _apply_specialist_contract(
             {
@@ -710,6 +960,40 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test error trace", parent_agent=parent))
             trace = result["results"][0]["tool_trace"]
             self.assertEqual(trace[0]["status"], "error")
+
+    def test_tool_trace_accepts_structured_content_blocks(self):
+        """MCP/vision content blocks must not crash delegate completion."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "vision_analyze", "arguments": "{}"}}
+                    ]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tc_1",
+                        "content": [{"type": "text", "text": "Image loaded"}],
+                    },
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Analyze image", parent_agent=parent))
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["tool_trace"][0]["status"], "ok")
+        self.assertGreater(entry["tool_trace"][0]["result_bytes"], 0)
 
     def test_parallel_tool_calls_paired_correctly(self):
         """Parallel tool calls should each get their own result via tool_call_id matching."""
@@ -2107,6 +2391,29 @@ class TestDelegateEventEnum(unittest.TestCase):
         cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
         cb("tool.completed", tool_name="terminal")
         parent._delegate_spinner.print_above.assert_not_called()
+
+    def test_progress_callback_relays_tool_completion_transport_metadata(self):
+        """Delegated MCP writes must reach gateway Mini App tracking."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(0, "test goal", parent, task_count=1)
+        result = '{"_miniapp":{"changed":true,"start_param":"nutrition_history"}}'
+        cb(
+            "tool.completed",
+            tool_name="mcp_health_actions_record_nutrition_meal",
+            duration=0.1,
+            is_error=False,
+            result=result,
+        )
+
+        parent.tool_progress_callback.assert_called_once()
+        args, kwargs = parent.tool_progress_callback.call_args
+        self.assertEqual(args[0], "tool.completed")
+        self.assertEqual(args[1], "mcp_health_actions_record_nutrition_meal")
+        self.assertFalse(kwargs["is_error"])
+        self.assertEqual(kwargs["result"], result)
 
     def test_progress_callback_ignores_unknown_events(self):
         """Unknown event types are silently ignored."""

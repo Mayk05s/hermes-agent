@@ -10,6 +10,8 @@ from gateway.session import SessionSource
 INHERIT = "default"
 
 TRISTATE_FIELDS = {
+    "participant_isolation",
+    "observe_unmentioned",
     "transcribe_audio",
     "audio_trigger",
     "show_transcription",
@@ -23,6 +25,8 @@ TRISTATE_FIELDS = {
 }
 SETTING_FIELDS = (
     "response_mode",
+    "participant_isolation",
+    "observe_unmentioned",
     "transcribe_audio",
     "audio_trigger",
     "show_transcription",

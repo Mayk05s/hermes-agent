@@ -1041,7 +1041,7 @@ class TestSendToPlatformChunking:
 
         sent_calls = []
 
-        async def fake_send(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+        async def fake_send(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, miniapp_bot_username=None):
             sent_calls.append(media_files or [])
             return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(len(sent_calls))}
 
@@ -1299,6 +1299,8 @@ class TestSendTelegramHtmlDetection:
 
 class TestSendTelegramMiniappButtons:
     def test_startapp_link_is_sent_as_inline_button(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MINIAPP_WEBAPP_URL", raising=False)
+        monkeypatch.delenv("MINIAPP_WEBAPP_URL", raising=False)
         bot = MagicMock()
         bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
         bot.send_photo = AsyncMock()
@@ -1345,6 +1347,34 @@ class TestSendTelegramMiniappButtons:
         assert button.text == "Открыть планирование"
         assert button.url == "https://t.me/TripiooBot?startapp=planning"
         assert button.web_app is None
+
+    def test_percent_encoded_shopping_link_is_repaired(self, monkeypatch):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram(
+                "tok",
+                "-100123",
+                "Список готов.\nhttps://t.me/TripiooBot?startapp="
+                "shopping_buy_%D0%9E%D1%81%D0%BD%D0%BE%D0%B2%D0%BD%D0%BE%D0%B9",
+            )
+        )
+
+        assert result["success"] is True
+        kwargs = bot.send_message.await_args.kwargs
+        assert kwargs["text"] == "Список готов\\."
+        button = kwargs["reply_markup"].inline_keyboard[0][0]
+        assert button.url == (
+            "https://t.me/TripiooBot?startapp="
+            "shopping_buy_0J7RgdC90L7QstC90L7QuQ"
+        )
 
 
 class TestSendTelegramThreadIdMapping:

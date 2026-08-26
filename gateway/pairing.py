@@ -89,10 +89,21 @@ class PairingStore:
       - _rate_limits.json         : rate limit tracking
     """
 
-    def __init__(self):
-        self._pairing_dir = Path(PAIRING_DIR)
-        if self._pairing_dir == _INITIAL_PAIRING_DIR:
-            self._pairing_dir = get_hermes_dir("platforms/pairing", "pairing")
+    def __init__(self, hermes_home: Optional[Path] = None):
+        """Create a store for one Hermes profile.
+
+        ``hermes_home`` lets the single profile-routing gateway persist access
+        state in the profile that owns a chat without changing process-global
+        ``HERMES_HOME``. Omitting it preserves the legacy active-home lookup.
+        """
+        if hermes_home is None:
+            self._pairing_dir = Path(PAIRING_DIR)
+            if self._pairing_dir == _INITIAL_PAIRING_DIR:
+                self._pairing_dir = get_hermes_dir("platforms/pairing", "pairing")
+        else:
+            home = Path(hermes_home)
+            legacy = home / "pairing"
+            self._pairing_dir = legacy if legacy.exists() else home / "platforms" / "pairing"
         self._pairing_dir.mkdir(parents=True, exist_ok=True)
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
@@ -339,12 +350,15 @@ class PairingStore:
         thread_id: str = "",
         requester_user_id: str = "",
         requester_user_name: str = "",
+        bypass_rate_limit: bool = False,
     ) -> Optional[str]:
         """
         Create a pending pairing request for a group/channel chat.
 
         Unlike DM pairing, this does not need to reveal a code in the chat.
         The dashboard can approve the pending entry by its opaque entry_id.
+        ``bypass_rate_limit`` is reserved for an authenticated owner retry;
+        untrusted group traffic must keep the default rate limit.
         """
         with self._lock:
             self._cleanup_expired(platform)
@@ -363,7 +377,7 @@ class PairingStore:
             if self._is_locked_out(platform):
                 return None
 
-            if self._is_rate_limited(platform, rate_limit_id):
+            if not bypass_rate_limit and self._is_rate_limited(platform, rate_limit_id):
                 return None
 
             if len(pending) >= MAX_PENDING_PER_PLATFORM:
@@ -381,6 +395,11 @@ class PairingStore:
                 "thread_id": clean_thread_id,
                 "requester_user_id": self._normalize_user_id(platform, requester_user_id),
                 "requester_user_name": requester_user_name,
+                "setup": {
+                    "approval_scope": "chat",
+                    "profile": "",
+                    "settings": {},
+                },
                 "created_at": time.time(),
             }
             self._save_json(self._pending_path(platform), pending)
@@ -408,6 +427,69 @@ class PairingStore:
             entry["owner_notified_at"] = time.time()
             self._save_json(path, pending)
             return True
+
+    def update_chat_request_setup(
+        self,
+        platform: str,
+        entry_id: str,
+        *,
+        approval_scope: Optional[str] = None,
+        profile: Optional[str] = None,
+        settings_patch: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Persist owner-selected onboarding choices for one chat request."""
+        with self._lock:
+            self._cleanup_expired(platform)
+            path = self._pending_path(platform)
+            pending = self._load_json(path)
+            clean_entry_id = str(entry_id or "").strip()
+            entry = pending.get(clean_entry_id)
+            if not isinstance(entry, dict) or entry.get("subject_type") != "chat":
+                return None
+
+            setup = entry.get("setup")
+            if not isinstance(setup, dict):
+                setup = {}
+            next_setup = {
+                "approval_scope": str(setup.get("approval_scope") or "chat"),
+                "profile": str(setup.get("profile") or ""),
+                "settings": dict(setup.get("settings") or {}),
+            }
+
+            if approval_scope is not None:
+                normalized_scope = self._normalize_chat_approval_scope(approval_scope)
+                if normalized_scope == "topic" and not str(entry.get("thread_id") or "").strip():
+                    normalized_scope = "chat"
+                next_setup["approval_scope"] = normalized_scope
+
+            if profile is not None:
+                next_setup["profile"] = str(profile or "").strip()
+
+            if settings_patch is not None:
+                from gateway.chat_settings import (
+                    SETTING_FIELDS,
+                    normalize_chat_settings_config,
+                )
+
+                unknown = set(settings_patch) - set(SETTING_FIELDS)
+                if unknown:
+                    raise ValueError(
+                        "Unknown chat setting(s): " + ", ".join(sorted(unknown))
+                    )
+                merged_settings = dict(next_setup["settings"])
+                merged_settings.update(settings_patch)
+                normalized = normalize_chat_settings_config({
+                    "settings": [{
+                        "platform": platform,
+                        "chat_id": str(entry.get("chat_id") or ""),
+                        **merged_settings,
+                    }]
+                })
+                next_setup["settings"] = dict(normalized.settings[0].values)
+
+            entry["setup"] = next_setup
+            self._save_json(path, pending)
+            return dict(entry)
 
     def approve_entry(
         self,

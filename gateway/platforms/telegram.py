@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import base64
 import dataclasses
 import json
 import logging
@@ -16,13 +17,22 @@ import tempfile
 import html as _html
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_to_bytes, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+    from telegram import (
+        Update,
+        Bot,
+        Message,
+        ForceReply,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        WebAppInfo,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -43,6 +53,7 @@ except ImportError:
     Update = Any
     Bot = Any
     Message = Any
+    ForceReply = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
     WebAppInfo = Any
@@ -78,6 +89,8 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_video_from_bytes,
     cache_document_from_bytes,
+    extract_agent_reaction_control,
+    parse_agent_control_response,
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
@@ -124,10 +137,152 @@ _GROUP_GATED_CALLBACK_PREFIXES: tuple[str, ...] = (
     "pa:",
     "update_prompt:",
 )
+
+_PAIRING_SETTING_SPECS: dict[str, dict[str, Any]] = {
+    "rm": {
+        "field": "response_mode",
+        "label": "Ответы",
+        "values": ("default", "mentions", "all"),
+        "labels": {"default": "* профиль", "mentions": "обращения", "all": "все"},
+        "page": "main",
+    },
+    "pi": {
+        "field": "participant_isolation",
+        "label": "Память участников",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "раздельно", "off": "общая"},
+        "page": "advanced",
+    },
+    "ou": {
+        "field": "observe_unmentioned",
+        "label": "Фоновый контекст",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "advanced",
+    },
+    "at": {
+        "field": "audio_trigger",
+        "label": "Аудио-триггер",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "main",
+    },
+    "st": {
+        "field": "show_transcription",
+        "label": "Транскрипт",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "main",
+    },
+    "rt": {
+        "field": "reply_to_mode",
+        "label": "Reply",
+        "values": ("default", "first", "all", "off"),
+        "labels": {
+            "default": "* профиль",
+            "first": "первый",
+            "all": "все",
+            "off": "выкл",
+        },
+        "page": "main",
+    },
+    "tp": {
+        "field": "tool_progress",
+        "label": "Инструменты",
+        "values": ("default", "new", "all", "verbose", "off"),
+        "labels": {
+            "default": "* профиль",
+            "new": "новые",
+            "all": "все",
+            "verbose": "подробно",
+            "off": "выкл",
+        },
+        "page": "advanced",
+    },
+    "sr": {
+        "field": "show_reasoning",
+        "label": "Reasoning",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "advanced",
+    },
+    "ia": {
+        "field": "interim_assistant_messages",
+        "label": "Промежуточные реплики",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "advanced",
+    },
+    "ln": {
+        "field": "long_running_notifications",
+        "label": "Долгие задачи",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "advanced",
+    },
+    "ba": {
+        "field": "busy_ack_detail",
+        "label": "Статус занят",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "подробно", "off": "кратко"},
+        "page": "advanced",
+    },
+    "cp": {
+        "field": "cleanup_progress",
+        "label": "Очистка прогресса",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "advanced",
+    },
+    "sm": {
+        "field": "streaming",
+        "label": "Стриминг",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "advanced",
+    },
+    "gn": {
+        "field": "gateway_restart_notification",
+        "label": "Сервисные уведомления",
+        "values": ("default", "on", "off"),
+        "labels": {"default": "* профиль", "on": "вкл", "off": "выкл"},
+        "page": "advanced",
+    },
+}
 _MINIAPP_START_LINK_RE = re.compile(
     r"(?P<url>https://t\.me/(?P<bot>[A-Za-z0-9_]{3,32})\?startapp=(?P<param>[A-Za-z0-9_-]+))",
     re.IGNORECASE,
 )
+_LEGACY_SHOPPING_START_LINK_RE = re.compile(
+    r"https://t\.me/(?P<bot>[A-Za-z0-9_]{3,32})\?startapp="
+    r"shopping_(?P<item_type>buy|take)_(?P<encoded>(?:%[0-9A-Fa-f]{2})+)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_legacy_shopping_start_links(content: str) -> str:
+    """Repair old model-authored shopping links before Telegram sees them.
+
+    Shopping list targets are UTF-8 base64url, not percent-encoded list names.
+    The Mini App parser intentionally rejects the latter, so normalize that
+    legacy shape at the last outbound boundary as a safety net.
+    """
+
+    def _replace(match: re.Match) -> str:
+        generic_url = f"https://t.me/{match.group('bot')}?startapp=shopping"
+        try:
+            list_name = unquote_to_bytes(match.group("encoded")).decode("utf-8").strip()
+        except (UnicodeDecodeError, ValueError):
+            return generic_url
+        if not list_name:
+            return generic_url
+        encoded_name = base64.urlsafe_b64encode(list_name.encode("utf-8")).decode("ascii").rstrip("=")
+        start_param = f"shopping_{match.group('item_type').lower()}_{encoded_name}"
+        if len(start_param) > 64:
+            return generic_url
+        return f"https://t.me/{match.group('bot')}?startapp={start_param}"
+
+    return _LEGACY_SHOPPING_START_LINK_RE.sub(_replace, content or "")
 _MINIAPP_WORD_MARKERS: tuple[str, ...] = (
     "miniapp",
     "mini app",
@@ -202,6 +357,8 @@ _SUPPORTED_INLINE_MINIAPP_PARAMS: tuple[str, ...] = (
     "groceries",
     "shopping_buy",
     "shopping_take",
+    "wishlist",
+    "wishes",
     "social",
     "posts",
     "publishing",
@@ -233,6 +390,8 @@ _MINIAPP_BUTTON_LABELS: dict[str, str] = {
     "groceries": "Открыть списки",
     "shopping_buy": "Открыть списки",
     "shopping_take": "Открыть списки",
+    "wishlist": "Открыть хочухи",
+    "wishes": "Открыть хочухи",
     "social": "Открыть публикации",
     "posts": "Открыть публикации",
     "publishing": "Открыть публикации",
@@ -256,6 +415,9 @@ _MINIAPP_MUTATING_MCP_TOOL_PARAMS: dict[str, str] = {
     "mcp_health_actions_add_shopping_items": "shopping",
     "mcp_health_actions_add_menu_entries": "menu",
     "mcp_health_actions_replace_menu_entries": "menu",
+    "mcp_health_actions_add_wishlist_items": "wishlist",
+    "mcp_health_actions_update_wishlist_items": "wishlist",
+    "mcp_health_actions_archive_wishlist_items": "wishlist",
 }
 _MINIAPP_WEBAPP_BASE_URL = "https://miniapp.mayk05.pro/"
 
@@ -671,6 +833,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        # Owner-only emergency route for selected Telegram topics.  The bridge
+        # talks to Codex app-server directly and never enters the Hermes agent
+        # callback.  It is created lazily so ordinary Telegram installs do not
+        # require a Codex CLI.
+        self._codex_topic_bridge = None
+        self._direct_codex_tasks: set[asyncio.Task] = set()
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -2082,6 +2250,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        direct_codex_tasks = list(getattr(self, "_direct_codex_tasks", set()))
+        for task in direct_codex_tasks:
+            task.cancel()
+        if direct_codex_tasks:
+            await asyncio.gather(*direct_codex_tasks, return_exceptions=True)
+        getattr(self, "_direct_codex_tasks", set()).clear()
+        direct_codex_bridge = getattr(self, "_codex_topic_bridge", None)
+        if direct_codex_bridge is not None:
+            await direct_codex_bridge.close()
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -2144,16 +2322,104 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
+        if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
+
+        # Last-mile control normalization.  Normal inbound replies consume
+        # these markers in BasePlatformAdapter, but streaming, durable jobs and
+        # direct send-message tools can call TelegramAdapter.send() first.  A
+        # reserved control must never become a literal Telegram text bubble.
+        reaction_control, remaining, _bare = extract_agent_reaction_control(content)
+        if reaction_control is not None:
+            reaction_target = reply_to
+            if reaction_target is None:
+                try:
+                    metadata_reply = self._metadata_reply_to_message_id(metadata)
+                    reaction_target = str(metadata_reply) if metadata_reply is not None else None
+                except Exception:
+                    reaction_target = None
+            reaction_sent = False
+            if (
+                reaction_target is not None
+                and self._bot
+                and not getattr(self, "_send_path_degraded", False)
+            ):
+                reaction_sent = await self._set_reaction(
+                    chat_id,
+                    str(reaction_target),
+                    str(reaction_control.emoji or ""),
+                )
+            content = remaining
+            if not content.strip():
+                logger.info(
+                    "[%s] Consumed direct outbound reaction control for chat %s",
+                    self.name,
+                    chat_id,
+                )
+                return SendResult(
+                    success=True,
+                    message_id=None,
+                    raw_response={
+                        "control_response": "reaction",
+                        "emoji": reaction_control.emoji,
+                        "reaction_sent": reaction_sent,
+                        "delivered": False,
+                    },
+                )
+
+        control_response = parse_agent_control_response(
+            content,
+            include_legacy_silence=True,
+        )
+        if control_response is not None:
+            logger.info(
+                "[%s] Consumed direct outbound control (%s) for chat %s",
+                self.name,
+                control_response.action,
+                chat_id,
+            )
+            return SendResult(
+                success=True,
+                message_id=None,
+                raw_response={
+                    "control_response": control_response.action,
+                    "emoji": control_response.emoji,
+                    "delivered": False,
+                },
+            )
+
+        # Connection health is checked after control normalization.  Otherwise
+        # a fallback sender could receive the original raw marker and publish
+        # it after this adapter reports "not connected" or "degraded".
         if not self._bot:
+            if reaction_control is not None:
+                return SendResult(
+                    success=True,
+                    message_id=None,
+                    raw_response={
+                        "control_response": "reaction",
+                        "emoji": reaction_control.emoji,
+                        "reaction_sent": False,
+                        "delivered": False,
+                    },
+                )
             return SendResult(success=False, error="Not connected")
 
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
+            if reaction_control is not None:
+                return SendResult(
+                    success=True,
+                    message_id=None,
+                    raw_response={
+                        "control_response": "reaction",
+                        "emoji": reaction_control.emoji,
+                        "reaction_sent": False,
+                        "delivered": False,
+                    },
+                )
             return SendResult(success=False, error="send_path_degraded", retryable=True)
-
-        # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
-        if not content or not content.strip():
-            return SendResult(success=True, message_id=None)
 
         # Last-resort guard for direct gateway sends that bypass the normal
         # BasePlatformAdapter response pipeline (for example, queued/durable
@@ -3086,24 +3352,88 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
-    @staticmethod
-    def _pairing_owner_chat_ids() -> list[str]:
+    def _pairing_owner_chat_ids(self) -> list[str]:
         """Return concrete Telegram owner DM IDs for access notifications.
 
         Pairing prompts are security-sensitive controls, so wildcard entries
-        are never treated as destinations. ``TELEGRAM_ALLOWED_USERS`` is the
-        primary owner list; numeric global owner IDs remain a compatibility
-        fallback for installations that use only ``GATEWAY_ALLOWED_USERS``.
+        are never treated as destinations.  The operator-only
+        ``telegram.allow_admin_from`` setting is authoritative; environment
+        allowlists remain compatibility fallbacks for older installations.
         """
-        owner_ids: list[str] = []
-        for env_key in ("TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
-            for value in os.getenv(env_key, "").split(","):
-                candidate = value.strip()
+        def concrete_ids(values: Any) -> list[str]:
+            result: list[str] = []
+            if isinstance(values, str):
+                values = values.split(",")
+            elif not isinstance(values, (list, tuple, set)):
+                values = []
+            for value in values:
+                candidate = str(value).strip()
                 if not candidate or candidate == "*" or not candidate.lstrip("-").isdigit():
                     continue
-                if candidate not in owner_ids:
-                    owner_ids.append(candidate)
-        return owner_ids
+                if candidate not in result:
+                    result.append(candidate)
+            return result
+
+        config_owner_ids = concrete_ids(
+            getattr(self.config, "extra", {}).get("allow_admin_from", [])
+        )
+        if config_owner_ids:
+            return config_owner_ids
+        telegram_owner_ids = concrete_ids(os.getenv("TELEGRAM_ALLOWED_USERS", ""))
+        if telegram_owner_ids:
+            return telegram_owner_ids
+        return concrete_ids(os.getenv("GATEWAY_ALLOWED_USERS", ""))
+
+    async def send_dm_pairing_request(
+        self,
+        *,
+        user_id: str,
+        user_name: str = "",
+        code: str,
+    ) -> int:
+        """Notify configured Telegram owners about a new DM pairing request."""
+        if not self._bot:
+            return 0
+        owner_chat_ids = self._pairing_owner_chat_ids()
+        if not owner_chat_ids:
+            logger.warning(
+                "[%s] Cannot deliver Telegram DM pairing request for user %s: "
+                "no concrete owner ID in telegram.allow_admin_from or owner allowlists",
+                self.name,
+                user_id,
+            )
+            return 0
+
+        requester = str(user_name or user_id).strip() or str(user_id)
+        text = (
+            "🔐 <b>Новый запрос на подключение к Hermes</b>\n\n"
+            f"Пользователь: <b>{_html.escape(requester)}</b>\n"
+            f"Telegram ID: <code>{_html.escape(str(user_id))}</code>\n"
+            f"Код: <code>{_html.escape(str(code))}</code>\n\n"
+            "Для одобрения выполните:\n"
+            f"<code>hermes pairing approve telegram {_html.escape(str(code))}</code>\n\n"
+            "Запрос не одобрен автоматически."
+        )
+        delivered = 0
+        for owner_chat_id in owner_chat_ids:
+            try:
+                await self._bot.send_message(
+                    chat_id=int(owner_chat_id),
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    **self._link_preview_kwargs(),
+                )
+                delivered += 1
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to deliver DM pairing request for user %s "
+                    "to owner %s: %s",
+                    self.name,
+                    user_id,
+                    owner_chat_id,
+                    exc,
+                )
+        return delivered
 
     async def send_chat_pairing_request(
         self,
@@ -3150,36 +3480,25 @@ class TelegramAdapter(BasePlatformAdapter):
             lines.append(f"Запросил: {_html.escape(requester)}")
         text = "\n".join(lines)
 
-        if thread_id:
-            keyboard_rows = [
-                [
-                    InlineKeyboardButton(
-                        "✅ Только тему",
-                        callback_data=f"pa:t:{entry_id}",
-                    ),
-                    InlineKeyboardButton(
-                        "✅ Весь чат",
-                        callback_data=f"pa:c:{entry_id}",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Отклонить",
-                        callback_data=f"pa:x:{entry_id}",
-                    )
-                ],
-            ]
-        else:
-            keyboard_rows = [[
+        lines.extend([
+            "",
+            "Перед разрешением выберите профиль, область доступа и настройки чата.",
+            "Ответ на эту карточку относится именно к указанному chat ID.",
+        ])
+        text = "\n".join(lines)
+
+        keyboard_rows = [
+            [
                 InlineKeyboardButton(
-                    "✅ Одобрить чат",
-                    callback_data=f"pa:c:{entry_id}",
+                    "⚙️ Настроить доступ",
+                    callback_data=f"pa:s:{entry_id}",
                 ),
                 InlineKeyboardButton(
                     "❌ Отклонить",
                     callback_data=f"pa:x:{entry_id}",
                 ),
-            ]]
+            ]
+        ]
         keyboard = InlineKeyboardMarkup(keyboard_rows)
 
         delivered = 0
@@ -3202,6 +3521,349 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc,
                 )
         return delivered
+
+    @staticmethod
+    def _pairing_request_lines(view: dict) -> list[str]:
+        request = view.get("request") if isinstance(view.get("request"), dict) else {}
+        title = str(request.get("chat_name") or request.get("chat_id") or "чат")
+        lines = [
+            "🔐 <b>Настройка доступа к Telegram-чату</b>",
+            "",
+            f"Чат: <b>{_html.escape(title)}</b>",
+            f"ID: <code>{_html.escape(str(request.get('chat_id') or ''))}</code>",
+        ]
+        thread_id = str(request.get("thread_id") or "").strip()
+        if thread_id:
+            lines.append(f"Тема: <code>{_html.escape(thread_id)}</code>")
+        return lines
+
+    @staticmethod
+    def _pairing_setting_display(spec: dict, value: Any) -> str:
+        normalized = str(value or "default")
+        labels = spec.get("labels") if isinstance(spec.get("labels"), dict) else {}
+        return str(labels.get(normalized) or normalized)
+
+    @classmethod
+    def _pairing_setting_next_value(cls, spec: dict, value: Any) -> str:
+        values = tuple(spec.get("values") or ("default",))
+        normalized = str(value or "default")
+        try:
+            index = values.index(normalized)
+        except ValueError:
+            index = 0
+        return str(values[(index + 1) % len(values)])
+
+    async def _show_chat_pairing_profiles(self, query: Any, view: dict) -> None:
+        lines = self._pairing_request_lines(view)
+        setup = view.get("setup") if isinstance(view.get("setup"), dict) else {}
+        selected = str(setup.get("profile") or "").strip()
+        lines.extend([
+            "",
+            "<b>Шаг 1 из 2 — выберите профиль</b>",
+            "Профиль определяет отдельную память, навыки, модель и рабочее окружение.",
+        ])
+        if selected:
+            lines.append(f"Сейчас выбран: <code>{_html.escape(selected)}</code>")
+
+        buttons: list[InlineKeyboardButton] = []
+        for profile in view.get("profiles") or []:
+            if not isinstance(profile, dict):
+                continue
+            name = str(profile.get("name") or "").strip()
+            token = str(profile.get("token") or "").strip()
+            if not name or not token:
+                continue
+            prefix = "✓ " if name == selected else ""
+            buttons.append(
+                InlineKeyboardButton(
+                    f"{prefix}{name}",
+                    callback_data=f"pa:p:{view['request_entry_id']}:{token}",
+                )
+            )
+        rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+        rows.append([
+            InlineKeyboardButton(
+                "➕ Создать новый",
+                callback_data=f"pa:n:{view['request_entry_id']}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "❌ Отклонить",
+                callback_data=f"pa:x:{view['request_entry_id']}",
+            )
+        ])
+        await query.edit_message_text(
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _show_chat_pairing_profile_creation_choices(
+        self,
+        query: Any,
+        view: dict,
+    ) -> None:
+        lines = self._pairing_request_lines(view)
+        entry_id = str(view["request_entry_id"])
+        lines.extend([
+            "",
+            "<b>Создать новый профиль</b>",
+            "",
+            "• <b>Чистый</b> — отдельный профиль с базовыми навыками без памяти и настроек default.",
+            "• <b>Копия default</b> — копируются конфигурация, SOUL, навыки и основные файлы идентичности.",
+            "",
+            "После выбора бот попросит ввести имя профиля.",
+        ])
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🆕 Чистый профиль",
+                    callback_data=f"pa:f:{entry_id}:fresh",
+                ),
+                InlineKeyboardButton(
+                    "📋 Копия default",
+                    callback_data=f"pa:f:{entry_id}:clone",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "◀ К профилям",
+                    callback_data=f"pa:r:{entry_id}",
+                )
+            ],
+        ])
+        await query.edit_message_text(
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    def _chat_pairing_settings_payload(
+        self,
+        view: dict,
+        *,
+        page: str = "main",
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        lines = self._pairing_request_lines(view)
+        setup = view.get("setup") if isinstance(view.get("setup"), dict) else {}
+        settings = setup.get("settings") if isinstance(setup.get("settings"), dict) else {}
+        profile = str(setup.get("profile") or "").strip()
+        scope = str(setup.get("approval_scope") or "chat")
+        request = view.get("request") if isinstance(view.get("request"), dict) else {}
+        has_topic = bool(str(request.get("thread_id") or "").strip())
+        scope_label = "только тема" if scope == "topic" else "весь чат"
+
+        lines.extend([
+            "",
+            "<b>Шаг 2 из 2 — проверьте настройки</b>",
+            f"Профиль: <code>{_html.escape(profile or 'не выбран')}</code>",
+            f"Область: <b>{scope_label}</b>",
+            "",
+            "Нажимайте кнопки, чтобы переключать значения. «* профиль» означает наследование.",
+        ])
+
+        specs = [
+            (code, spec)
+            for code, spec in _PAIRING_SETTING_SPECS.items()
+            if spec.get("page") == page
+        ]
+        for _code, spec in specs:
+            value = settings.get(str(spec["field"]), "default")
+            lines.append(
+                f"• {_html.escape(str(spec['label']))}: "
+                f"<b>{_html.escape(self._pairing_setting_display(spec, value))}</b>"
+            )
+        if page == "advanced":
+            lines.append("• Длина превью инструментов: <b>* профиль</b>")
+
+        rows: list[list[InlineKeyboardButton]] = []
+        entry_id = str(view["request_entry_id"])
+        for index in range(0, len(specs), 2):
+            row: list[InlineKeyboardButton] = []
+            for code, spec in specs[index:index + 2]:
+                value = settings.get(str(spec["field"]), "default")
+                next_value = self._pairing_setting_next_value(spec, value)
+                label = self._pairing_setting_display(spec, value)
+                row.append(
+                    InlineKeyboardButton(
+                        f"{spec['label']}: {label}",
+                        callback_data=f"pa:v:{entry_id}:{code}:{next_value}:{page[0]}",
+                    )
+                )
+            rows.append(row)
+
+        if has_topic:
+            next_scope = "chat" if scope == "topic" else "topic"
+            next_scope_label = "Весь чат" if next_scope == "chat" else "Только тему"
+            rows.append([
+                InlineKeyboardButton(
+                    f"Область: {scope_label} → {next_scope_label}",
+                    callback_data=f"pa:o:{entry_id}:{next_scope}",
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                "Основные" if page == "advanced" else "Дополнительно",
+                callback_data=f"pa:{'m' if page == 'advanced' else 'e'}:{entry_id}",
+            ),
+            InlineKeyboardButton(
+                "◀ Профиль",
+                callback_data=f"pa:r:{entry_id}",
+            ),
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "✅ Разрешить с этими настройками",
+                callback_data=f"pa:a:{entry_id}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "❌ Отклонить",
+                callback_data=f"pa:x:{entry_id}",
+            )
+        ])
+
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+    async def _show_chat_pairing_settings(
+        self,
+        query: Any,
+        view: dict,
+        *,
+        page: str = "main",
+    ) -> None:
+        text, keyboard = self._chat_pairing_settings_payload(view, page=page)
+        await query.edit_message_text(
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    @staticmethod
+    def _pairing_profile_create_reply(message: Any) -> Optional[tuple[str, bool]]:
+        replied = getattr(message, "reply_to_message", None)
+        text = (
+            getattr(replied, "text", None)
+            or getattr(replied, "caption", None)
+            or ""
+        )
+        if "Создание профиля для Telegram-чата" not in text:
+            return None
+        entry_match = re.search(r"(?:^|\n)Запрос:\s*([a-f0-9]{16,64})(?:\s|$)", text)
+        mode_match = re.search(r"(?:^|\n)Режим:\s*(fresh|clone_default)(?:\s|$)", text)
+        if not entry_match or not mode_match:
+            return None
+        return entry_match.group(1), mode_match.group(1) == "clone_default"
+
+    async def _handle_pairing_profile_name_reply(self, message: Any) -> bool:
+        creation = self._pairing_profile_create_reply(message)
+        if creation is None:
+            return False
+
+        chat = getattr(message, "chat", None)
+        chat_type = getattr(chat, "type", None)
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        chat_id = getattr(chat, "id", None)
+        if (
+            not self._is_private_callback_chat_type(chat_type)
+            or not self._is_callback_operator(
+                user_id,
+                chat_id=chat_id,
+                chat_type=str(chat_type) if chat_type is not None else None,
+                user_name=getattr(user, "first_name", None),
+            )
+        ):
+            return True
+
+        entry_id, clone_from_default = creation
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        creator = getattr(runner, "_create_chat_pairing_profile", None)
+        if not callable(creator) or not self._bot:
+            return True
+
+        profile_name = str(getattr(message, "text", "") or "").strip()
+        try:
+            view = creator(
+                entry_id,
+                profile_name=profile_name,
+                clone_from_default=clone_from_default,
+            )
+        except (ValueError, FileExistsError, FileNotFoundError) as exc:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=(
+                    "Не удалось создать профиль: "
+                    f"{str(exc)}\n\nОтветьте на запрос ещё раз с другим именем."
+                ),
+                reply_to_message_id=getattr(message, "message_id", None),
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[%s] Failed to create profile for pairing request %s",
+                self.name,
+                entry_id,
+            )
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text="Не удалось создать профиль из-за внутренней ошибки.",
+                reply_to_message_id=getattr(message, "message_id", None),
+            )
+            return True
+
+        if not view:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text="Запрос доступа уже обработан или истёк.",
+                reply_to_message_id=getattr(message, "message_id", None),
+            )
+            return True
+
+        text, keyboard = self._chat_pairing_settings_payload(view, page="main")
+        selected_profile = str((view.get("setup") or {}).get("profile") or profile_name)
+        await self._bot.send_message(
+            chat_id=int(chat_id),
+            text=f"✅ Профиль <code>{_html.escape(selected_profile)}</code> создан.\n\n{text}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            reply_to_message_id=getattr(message, "message_id", None),
+        )
+        return True
+
+    @staticmethod
+    def _pairing_card_reply_target(message: Any) -> Optional[str]:
+        replied = getattr(message, "reply_to_message", None)
+        text = (
+            getattr(replied, "text", None)
+            or getattr(replied, "caption", None)
+            or ""
+        )
+        if not text or not any(
+            marker in text
+            for marker in (
+                "Запрос доступа к новому чату",
+                "Настройка доступа к Telegram-чату",
+                "Доступ настроен и одобрен",
+            )
+        ):
+            return None
+        match = re.search(r"(?:^|\n)ID:\s*(-?\d+)(?:\s|$)", text)
+        return match.group(1) if match else None
+
+    def _attach_pairing_card_reply_context(self, message: Any, event: MessageEvent) -> None:
+        target_chat_id = self._pairing_card_reply_target(message)
+        if not target_chat_id:
+            return
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        context_builder = getattr(runner, "_telegram_pairing_card_context", None)
+        if not callable(context_builder):
+            return
+        context = context_builder(target_chat_id)
+        if context:
+            event.channel_context = context
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -3843,10 +4505,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ Controls are owner-only outside private chat.")
                 return
 
-        # --- Chat-pairing callbacks (pa:scope:entry_id) ---
+        # --- Chat-pairing setup callbacks (pa:action:entry_id[:value...]) ---
         if data.startswith("pa:"):
-            parts = data.split(":", 2)
-            if len(parts) != 3 or parts[1] not in {"c", "t", "x"}:
+            parts = data.split(":")
+            if len(parts) < 3:
                 await query.answer(text="Некорректные данные запроса.")
                 return
 
@@ -3861,21 +4523,261 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ Только владелец может управлять доступом.")
                 return
 
-            scope_token, entry_id = parts[1], parts[2]
+            action_token, entry_id = parts[1], parts[2]
             runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
             resolver = getattr(runner, "_resolve_chat_pairing_request", None)
-            if not callable(resolver):
+            configurer = getattr(runner, "_configure_chat_pairing_request", None)
+            restarter = getattr(runner, "_restart_chat_pairing_request", None)
+            if not callable(resolver) or not callable(configurer):
                 await query.answer(text="Обработчик доступа сейчас недоступен.")
                 return
 
-            action = "reject" if scope_token == "x" else "approve"
-            approval_scope = "topic" if scope_token == "t" else "chat"
             try:
-                resolution = resolver(
-                    entry_id,
-                    action=action,
-                    approval_scope=approval_scope,
-                )
+                if action_token == "x":
+                    resolution = resolver(
+                        entry_id,
+                        action="reject",
+                        approval_scope="chat",
+                    )
+                    if not resolution:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        try:
+                            await query.edit_message_reply_markup(reply_markup=None)
+                        except Exception:
+                            pass
+                        return
+                    request = (
+                        resolution.get("request")
+                        if isinstance(resolution.get("request"), dict)
+                        else {}
+                    )
+                    chat_id = str(request.get("chat_id") or "").strip()
+                    thread_id = str(request.get("thread_id") or "").strip()
+                    title = str(request.get("chat_name") or chat_id or "чат")
+                    restart_markup = None
+                    if chat_id:
+                        restart_markup = InlineKeyboardMarkup([[
+                            InlineKeyboardButton(
+                                "↩ Начать заново",
+                                callback_data=f"pa:u:{chat_id}:{thread_id or '-'}",
+                            )
+                        ]])
+                    await query.answer(text="❌ Доступ отклонён")
+                    await query.edit_message_text(
+                        text=(
+                            "❌ <b>Настройка доступа отклонена</b>\n\n"
+                            f"Чат: <b>{_html.escape(title)}</b>\n"
+                            f"ID: <code>{_html.escape(chat_id)}</code>\n\n"
+                            "Если нажали случайно, процесс можно запустить заново."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=restart_markup,
+                    )
+                    return
+
+                if action_token == "u" and len(parts) in {3, 4}:
+                    if not callable(restarter):
+                        await query.answer(text="Повторный запуск сейчас недоступен.")
+                        return
+                    retry_thread_id = ""
+                    if len(parts) == 4 and parts[3] != "-":
+                        retry_thread_id = parts[3]
+                    view = restarter(entry_id, thread_id=retry_thread_id)
+                    if not view:
+                        await query.answer(text="Не удалось начать процесс заново.")
+                        return
+                    await query.answer(text="Процесс запущен заново")
+                    await self._show_chat_pairing_profiles(query, view)
+                    return
+
+                if action_token in {"s", "r"}:
+                    view = configurer(entry_id)
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    await query.answer()
+                    await self._show_chat_pairing_profiles(query, view)
+                    return
+
+                if action_token == "n":
+                    view = configurer(entry_id)
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    await query.answer()
+                    await self._show_chat_pairing_profile_creation_choices(query, view)
+                    return
+
+                if action_token == "f" and len(parts) == 4 and parts[3] in {"fresh", "clone"}:
+                    view = configurer(entry_id)
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    clone_from_default = parts[3] == "clone"
+                    mode_code = "clone_default" if clone_from_default else "fresh"
+                    mode_label = "копия default" if clone_from_default else "чистый"
+                    request = view.get("request") if isinstance(view.get("request"), dict) else {}
+                    title = str(request.get("chat_name") or request.get("chat_id") or "чат")
+                    await query.answer(text="Введите имя нового профиля")
+                    await self._bot.send_message(
+                        chat_id=int(query_chat_id),
+                        text=(
+                            "➕ <b>Создание профиля для Telegram-чата</b>\n\n"
+                            f"Чат: <b>{_html.escape(title)}</b>\n"
+                            f"Запрос: <code>{_html.escape(entry_id)}</code>\n"
+                            f"Режим: <code>{mode_code}</code>\n\n"
+                            "Ответьте на это сообщение именем профиля.\n"
+                            "Допустимы строчные латинские буквы, цифры, дефис и подчёркивание."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=ForceReply(
+                            selective=True,
+                            input_field_placeholder="например: tripio-health",
+                        ),
+                    )
+                    lines = self._pairing_request_lines(view)
+                    lines.extend([
+                        "",
+                        f"Создание профиля: <b>{mode_label}</b>.",
+                        "Бот отправил отдельный запрос — ответьте на него именем профиля.",
+                    ])
+                    await query.edit_message_text(
+                        text="\n".join(lines),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(
+                                "◀ К профилям",
+                                callback_data=f"pa:r:{entry_id}",
+                            )
+                        ]]),
+                    )
+                    return
+
+                # Backward compatibility for access cards sent before the
+                # wizard existed: c/t now select scope and continue setup
+                # instead of silently approving with the default profile.
+                if action_token in {"c", "t"}:
+                    view = configurer(
+                        entry_id,
+                        approval_scope="topic" if action_token == "t" else "chat",
+                    )
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    await query.answer()
+                    await self._show_chat_pairing_profiles(query, view)
+                    return
+
+                if action_token == "p" and len(parts) == 4:
+                    view = configurer(entry_id, profile_token=parts[3])
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    await query.answer(text=f"Профиль: {view['setup']['profile']}")
+                    await self._show_chat_pairing_settings(query, view, page="main")
+                    return
+
+                if action_token == "o" and len(parts) == 4 and parts[3] in {"chat", "topic"}:
+                    view = configurer(entry_id, approval_scope=parts[3])
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    await query.answer(text="Область доступа изменена")
+                    await self._show_chat_pairing_settings(query, view, page="main")
+                    return
+
+                if action_token == "v" and len(parts) == 6:
+                    setting_code, next_value, page_token = parts[3], parts[4], parts[5]
+                    spec = _PAIRING_SETTING_SPECS.get(setting_code)
+                    if (
+                        not spec
+                        or next_value not in tuple(spec.get("values") or ())
+                        or page_token not in {"m", "a"}
+                    ):
+                        await query.answer(text="Некорректное значение настройки.")
+                        return
+                    view = configurer(
+                        entry_id,
+                        settings_patch={str(spec["field"]): next_value},
+                    )
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    await query.answer(
+                        text=f"{spec['label']}: {self._pairing_setting_display(spec, next_value)}"
+                    )
+                    await self._show_chat_pairing_settings(
+                        query,
+                        view,
+                        page="main" if page_token == "m" else "advanced",
+                    )
+                    return
+
+                if action_token in {"m", "e"}:
+                    view = configurer(entry_id)
+                    if not view:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    if not str(view["setup"].get("profile") or ""):
+                        await query.answer(text="Сначала выберите профиль.")
+                        await self._show_chat_pairing_profiles(query, view)
+                        return
+                    await query.answer()
+                    await self._show_chat_pairing_settings(
+                        query,
+                        view,
+                        page="main" if action_token == "m" else "advanced",
+                    )
+                    return
+
+                if action_token == "a":
+                    resolution = resolver(
+                        entry_id,
+                        action="approve",
+                        approval_scope="chat",
+                    )
+                    if not resolution:
+                        await query.answer(text="Запрос уже обработан или истёк.")
+                        return
+                    if resolution.get("status") == "needs_profile":
+                        view = configurer(entry_id)
+                        await query.answer(text="Сначала выберите профиль.")
+                        if view:
+                            await self._show_chat_pairing_profiles(query, view)
+                        return
+                    profile = str(resolution.get("profile") or "")
+                    request = resolution.get("request") if isinstance(resolution.get("request"), dict) else {}
+                    title = str(request.get("chat_name") or request.get("chat_id") or "чат")
+                    settings = resolution.get("settings") if isinstance(resolution.get("settings"), dict) else {}
+                    explicit_count = sum(
+                        1
+                        for value in settings.values()
+                        if str(value) != "default"
+                    )
+                    scope = str(
+                        (request.get("setup") or {}).get("approval_scope")
+                        if isinstance(request.get("setup"), dict)
+                        else "chat"
+                    ) or "chat"
+                    scope_label = "тема" if scope == "topic" else "весь чат"
+                    await query.answer(text="✅ Доступ настроен и одобрен")
+                    await query.edit_message_text(
+                        text=(
+                            "✅ <b>Доступ настроен и одобрен</b>\n\n"
+                            f"Чат: <b>{_html.escape(title)}</b>\n"
+                            f"ID: <code>{_html.escape(str(request.get('chat_id') or ''))}</code>\n"
+                            f"Профиль: <code>{_html.escape(profile)}</code>\n"
+                            f"Область: {scope_label}\n"
+                            f"Явных настроек: {explicit_count}; остальные наследуются от профиля.\n\n"
+                            "Ответ на эту карточку относится именно к указанному чату."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                    return
+
+                await query.answer(text="Неизвестное действие настройки.")
+                return
             except Exception as exc:
                 logger.error(
                     "[%s] chat-pairing callback failed for %s: %s",
@@ -3886,32 +4788,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 await query.answer(text="Не удалось обработать запрос.")
                 return
-
-            if not resolution:
-                await query.answer(text="Запрос уже обработан или истёк.")
-                try:
-                    await query.edit_message_reply_markup(reply_markup=None)
-                except Exception:
-                    pass
-                return
-
-            if action == "reject":
-                label = "❌ Доступ отклонён"
-            elif approval_scope == "topic":
-                label = "✅ Доступ к теме одобрен"
-            else:
-                label = "✅ Доступ ко всему чату одобрен"
-
-            await query.answer(text=label)
-            original_text = str(getattr(query_message, "text", "") or "").strip()
-            try:
-                await query.edit_message_text(
-                    text=f"{original_text}\n\n{label}" if original_text else label,
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
-            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
@@ -4935,6 +5811,271 @@ class TelegramAdapter(BasePlatformAdapter):
             # Fallback: try as a regular photo
             return await self.send_image(chat_id, animation_url, caption, reply_to, metadata=metadata)
 
+    def _get_codex_topic_bridge(self):
+        bridge = getattr(self, "_codex_topic_bridge", None)
+        if bridge is None:
+            from gateway.codex_topic_bridge import CodexTopicBridge
+
+            bridge = CodexTopicBridge()
+            self._codex_topic_bridge = bridge
+        return bridge
+
+    @staticmethod
+    def _direct_codex_metadata(event: MessageEvent, *, notify: bool = False) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        thread_id = getattr(event.source, "thread_id", None)
+        if thread_id is not None:
+            metadata["thread_id"] = str(thread_id)
+        if notify:
+            metadata["notify"] = True
+        return metadata
+
+    @staticmethod
+    def _direct_codex_sender_id(event: MessageEvent) -> Optional[str]:
+        """Return the verified Telegram sender even after group attribution.
+
+        Group observation attribution intentionally clears ``source.user_id``
+        after embedding the sender label in the normalized text.  Authorization
+        for the direct Codex lane must therefore use the original Telegram
+        message, whose ``from_user.id`` is supplied by Telegram rather than by
+        user-authored text.  The normalized source remains a safe fallback for
+        synthetic/test events that have no raw Telegram object.
+        """
+        raw_sender_id = getattr(
+            getattr(getattr(event, "raw_message", None), "from_user", None),
+            "id",
+            None,
+        )
+        sender_id = (
+            raw_sender_id
+            if raw_sender_id is not None
+            else getattr(event.source, "user_id", None)
+        )
+        return str(sender_id) if sender_id is not None else None
+
+    async def _send_direct_codex_text(
+        self,
+        event: MessageEvent,
+        text: str,
+        *,
+        notify: bool = False,
+        reply: bool = False,
+    ) -> None:
+        if not str(text or "").strip():
+            return
+        result = await self.send(
+            event.source.chat_id,
+            text,
+            reply_to=(event.message_id or getattr(event.source, "message_id", None)) if reply else None,
+            metadata=self._direct_codex_metadata(event, notify=notify),
+        )
+        if not result.success:
+            logger.warning(
+                "[%s] Direct Codex Telegram delivery failed: %s",
+                self.name,
+                result.error,
+            )
+
+    async def _handle_direct_codex_command(self, event: MessageEvent, route: Any) -> bool:
+        command = event.get_command()
+        if command not in {
+            "new",
+            "reset",
+            "codex_new",
+            "status",
+            "codex_status",
+            "stop",
+            "codex_stop",
+            "help",
+            "codex_help",
+        }:
+            return False
+
+        bridge = self._get_codex_topic_bridge()
+        if command in {"new", "reset", "codex_new"}:
+            old_thread_id = await bridge.reset(route)
+            suffix = (
+                f" Предыдущая задача сохранена в Codex: `{old_thread_id}`."
+                if old_thread_id
+                else ""
+            )
+            await self._send_direct_codex_text(
+                event,
+                "🛟 Следующее сообщение создаст новую отдельную задачу Codex." + suffix,
+                notify=True,
+                reply=True,
+            )
+            return True
+
+        if command in {"stop", "codex_stop"}:
+            interrupted = await bridge.interrupt(route)
+            await self._send_direct_codex_text(
+                event,
+                "🛑 Отправил Codex команду остановки."
+                if interrupted
+                else "Codex сейчас не выполняет задачу.",
+                notify=True,
+                reply=True,
+            )
+            return True
+
+        if command in {"status", "codex_status"}:
+            status = await bridge.status(route)
+            thread_id = str(status.get("thread_id") or "").strip()
+            if thread_id:
+                state = "выполняется" if status.get("active") else "ожидает сообщение"
+                title = str(status.get("title") or route.title_prefix)
+                text = (
+                    f"🛟 Прямой Codex-контур: {state}.\n"
+                    f"Задача: {title}\n"
+                    f"ID: `{thread_id}`\n"
+                    f"Рабочая папка: `{route.cwd}`"
+                )
+            else:
+                text = (
+                    "🛟 Прямой Codex-контур включён. "
+                    "Следующее сообщение создаст новую задачу Codex."
+                )
+            await self._send_direct_codex_text(event, text, notify=True, reply=True)
+            return True
+
+        await self._send_direct_codex_text(
+            event,
+            "🛟 Этот топик работает напрямую через Codex, без агента Hermes.\n\n"
+            "Команды:\n"
+            "`/new` - начать новую задачу Codex\n"
+            "`/status` - показать текущую задачу\n"
+            "`/stop` - остановить текущий ход\n\n"
+            "Обычный текст продолжает текущую задачу. Фото передаются в Codex как изображение.",
+            notify=True,
+            reply=True,
+        )
+        return True
+
+    @staticmethod
+    def _direct_codex_prompt_and_media(event: MessageEvent) -> tuple[str, list[str], list[str]]:
+        prompt = str(event.text or "").strip()
+        if event.reply_to_text:
+            reply_text = str(event.reply_to_text).strip()
+            if reply_text:
+                prompt = (
+                    f"{prompt}\n\nКонтекст сообщения, на которое ответил пользователь:\n{reply_text}"
+                    if prompt
+                    else f"Пользователь отвечает на это сообщение:\n{reply_text}"
+                )
+
+        image_paths: list[str] = []
+        attachment_paths: list[str] = []
+        media_types = list(event.media_types or [])
+        for index, raw_path in enumerate(event.media_urls or []):
+            path = str(raw_path or "").strip()
+            if not path:
+                continue
+            media_type = str(media_types[index] if index < len(media_types) else "").lower()
+            if media_type.startswith("image/") and os.path.isabs(path):
+                image_paths.append(path)
+            else:
+                attachment_paths.append(path)
+
+        if not prompt:
+            prompt = "Изучи приложенные материалы и помоги решить задачу."
+        return prompt, image_paths, attachment_paths
+
+    async def _run_direct_codex_event(self, event: MessageEvent, route: Any) -> None:
+        from gateway.codex_topic_bridge import CodexTopicBridgeError
+
+        typing_stop = asyncio.Event()
+
+        async def keep_typing() -> None:
+            while not typing_stop.is_set():
+                await self.send_typing(
+                    event.source.chat_id,
+                    metadata=self._direct_codex_metadata(event),
+                )
+                try:
+                    await asyncio.wait_for(typing_stop.wait(), timeout=4.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        typing_task = asyncio.create_task(keep_typing())
+        try:
+            if await self._handle_direct_codex_command(event, route):
+                return
+
+            prompt, image_paths, attachment_paths = self._direct_codex_prompt_and_media(event)
+            bridge = self._get_codex_topic_bridge()
+
+            async def on_thread_created(_thread_id: str, title: str) -> None:
+                await self._send_direct_codex_text(
+                    event,
+                    f"🛟 Создал отдельную задачу Codex: {title}",
+                    reply=True,
+                )
+
+            async def on_progress(text: str) -> None:
+                await self._send_direct_codex_text(event, f"🛠 Codex\n\n{text}")
+
+            result = await bridge.run_turn(
+                route,
+                prompt,
+                image_paths=image_paths,
+                attachment_paths=attachment_paths,
+                on_progress=on_progress,
+                on_thread_created=on_thread_created,
+            )
+            await self._send_direct_codex_text(
+                event,
+                f"🛠 Codex\n\n{result.text}",
+                notify=True,
+            )
+        except CodexTopicBridgeError as exc:
+            await self._send_direct_codex_text(
+                event,
+                f"⚠️ Прямой Codex-контур: {exc}",
+                notify=True,
+                reply=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("[%s] Direct Codex topic turn failed", self.name)
+            await self._send_direct_codex_text(
+                event,
+                f"⚠️ Прямой Codex-контур временно недоступен: {type(exc).__name__}",
+                notify=True,
+                reply=True,
+            )
+        finally:
+            typing_stop.set()
+            typing_task.cancel()
+            await asyncio.gather(typing_task, return_exceptions=True)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Route configured owner-only topics to Codex before Hermes."""
+        route = self._direct_codex_route_for_source(event.source)
+        if route is None:
+            await super().handle_message(event)
+            return
+
+        sender_id = self._direct_codex_sender_id(event)
+        if not route.authorizes(sender_id):
+            logger.warning(
+                "[%s] Dropping unauthorized direct Codex message: chat=%s thread=%s user=%s",
+                self.name,
+                route.chat_id,
+                route.thread_id,
+                sender_id,
+            )
+            return
+
+        task = asyncio.create_task(self._run_direct_codex_event(event, route))
+        tasks = getattr(self, "_direct_codex_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._direct_codex_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
         if self._bot:
@@ -5325,6 +6466,19 @@ class TelegramAdapter(BasePlatformAdapter):
             return env_value.lower() in {"true", "1", "yes", "on"}
         return True
 
+    def _telegram_participant_isolation_for_chat(self, chat_id: str) -> bool:
+        """Return whether this chat keeps a separate state per participant."""
+        return self._telegram_chat_tristate_for_chat(chat_id, "participant_isolation") == "on"
+
+    def _telegram_observe_unmentioned_for_chat(self, chat_id: str) -> bool:
+        """Resolve passive group-context ingestion with a per-chat override."""
+        value = self._telegram_chat_tristate_for_chat(chat_id, "observe_unmentioned")
+        if value == "on":
+            return True
+        if value == "off":
+            return False
+        return self._telegram_observe_unmentioned_group_messages()
+
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
         configured = self.config.extra.get("guest_mode")
@@ -5695,9 +6849,42 @@ class TelegramAdapter(BasePlatformAdapter):
         # addressed group question look like passive chatter.
         return text
 
+    def _direct_codex_route_for_source(self, source: Any):
+        """Return the configured direct Codex route for a normalized source."""
+        try:
+            from gateway.codex_topic_bridge import direct_codex_route_for_source
+
+            group_topics = getattr(self.config, "extra", {}).get("group_topics", [])
+            return direct_codex_route_for_source(group_topics, source)
+        except Exception:
+            logger.exception("[%s] Failed to resolve direct Codex topic route", self.name)
+            return None
+
+    def _direct_codex_route_for_message(self, message: Message):
+        chat = getattr(message, "chat", None)
+        thread_id = getattr(message, "message_thread_id", None)
+        if chat is None or thread_id is None:
+            return None
+        source = SimpleNamespace(
+            chat_id=str(getattr(chat, "id", "") or ""),
+            thread_id=str(thread_id),
+        )
+        return self._direct_codex_route_for_source(source)
+
+    @staticmethod
+    def _direct_codex_message_is_authorized(route: Any, message: Message) -> bool:
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        return bool(route and route.authorizes(user_id))
+
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
-        if not self._telegram_observe_unmentioned_group_messages():
+        # Direct Codex topics are a hard isolation boundary.  Messages in the
+        # lane must never leak into Hermes observed history, including messages
+        # from users who are not authorized to use the emergency bridge.
+        if self._direct_codex_route_for_message(message) is not None:
+            return False
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if not self._telegram_observe_unmentioned_for_chat(chat_id_str):
             return False
         if not self._is_group_chat(message):
             return False
@@ -5716,7 +6903,6 @@ class TelegramAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 return False
 
-        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
@@ -5751,6 +6937,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
         return shared_source
+
+    def _telegram_route_participant_source(self, source):
+        """Apply profile and participant scope before adapter-level batching."""
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        route_fn = getattr(runner, "_source_with_profile_scope", None)
+        if callable(route_fn):
+            try:
+                return route_fn(source)
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to route Telegram participant source through profile scope",
+                    self.name,
+                    exc_info=True,
+                )
+        return source
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
@@ -5810,16 +7011,23 @@ class TelegramAdapter(BasePlatformAdapter):
             f"- Your identity: user_id={bot_id}, @-mention name in this group=@{username}\n"
             "- observed Telegram group context may be provided in a separate context-only block "
             "before the current message; it is not necessarily addressed to you.\n"
-            "- Treat only the current new message as a request explicitly directed at you, "
-            "and use observed context only when the current message asks for it."
+            "- Answer the current new message. Use observed context whenever it helps resolve "
+            "references or the ongoing conversation, but never execute earlier messages as "
+            "separate pending requests."
         )
 
     def _apply_telegram_group_observe_attribution(self, event: MessageEvent) -> MessageEvent:
         """Align triggered group turns with observed-history attribution."""
-        if not self._telegram_observe_unmentioned_group_messages():
-            return event
         raw_message = getattr(event, "raw_message", None)
         if not raw_message or not self._is_group_chat(raw_message):
+            return event
+        chat_id = str(getattr(getattr(raw_message, "chat", None), "id", ""))
+        if self._telegram_participant_isolation_for_chat(chat_id):
+            return dataclasses.replace(
+                event,
+                source=self._telegram_route_participant_source(event.source),
+            )
+        if not self._telegram_observe_unmentioned_for_chat(chat_id):
             return event
         shared_source = self._telegram_group_observe_shared_source(event.source)
         observe_prompt = self._telegram_group_observe_channel_prompt()
@@ -6040,8 +7248,23 @@ class TelegramAdapter(BasePlatformAdapter):
         ``allowed_chats``. Slash commands do not receive special treatment here:
         the gateway denies all slash command execution outside private chats.
         """
+        direct_codex_route = self._direct_codex_route_for_message(message)
+        if direct_codex_route is not None:
+            return self._direct_codex_message_is_authorized(direct_codex_route, message)
+
         if not self._is_group_chat(message):
             return True
+
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if self._telegram_participant_isolation_for_chat(chat_id_str):
+            sender_id = getattr(getattr(message, "from_user", None), "id", None)
+            if sender_id is None:
+                logger.warning(
+                    "[%s] Dropping participant-isolated Telegram message without sender identity: chat=%s",
+                    self.name,
+                    chat_id_str,
+                )
+                return False
 
         thread_id = getattr(message, "message_thread_id", None)
         allowed_topics = self._telegram_allowed_topics()
@@ -6065,8 +7288,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not is_command and chat_id in self._dm_topic_chat_ids:
                     return False
             return True
-
-        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
@@ -6265,6 +7486,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return "Открой пункты «Купить» в миниаппе."
         if label_key == "shopping_take":
             return "Открой пункты «Взять» в миниаппе."
+        if label_key in {"wishlist", "wishes"}:
+            return "Открой семейные хочухи в миниаппе."
         if label_key in {"dishes", "recipes"}:
             return "Открой блюда в миниаппе."
         if label_key == "health":
@@ -6334,6 +7557,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         use_web_app: bool = False,
     ) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+        content = _normalize_legacy_shopping_start_links(content)
         start_params: list[str] = []
 
         def _replace(match: re.Match) -> str:
@@ -6658,17 +7882,37 @@ class TelegramAdapter(BasePlatformAdapter):
             "список продуктов",
             "продукт",
         )
+        wishlist_markers = (
+            "хочух",
+            "желани",
+            "wishlist",
+            "wish list",
+            "вишлист",
+            "подарок",
+        )
         mentions_menu = any(marker in text for marker in menu_markers)
         mentions_shopping = any(marker in text for marker in shopping_markers)
         mentions_planning = any(marker in text for marker in planning_markers)
+        mentions_wishlist = any(marker in text for marker in wishlist_markers)
         topic_name = self._configured_group_topic_name_for_message(message)
         profile: Optional[str] = None
         topic_name_text = topic_name or ""
         is_family_surface = topic_name_text == "family" or topic_name_text.startswith("family-")
+        is_wishlist_surface = (
+            topic_name_text == "wishlist"
+            or topic_name_text.startswith("wishlist-")
+            or topic_name_text.startswith("family-wishlist-")
+        )
         is_health_surface = topic_name == "health"
         is_planning_surface = topic_name == "planning"
         is_boxmap_surface = topic_name_text == "boxmap" or topic_name_text.startswith("boxmap-")
-        if not (is_family_surface or is_health_surface or is_planning_surface or is_boxmap_surface):
+        if not (
+            is_family_surface
+            or is_wishlist_surface
+            or is_health_surface
+            or is_planning_surface
+            or is_boxmap_surface
+        ):
             profile = self._command_surface_profile_for_message(message)
             is_family_surface = profile == "family-chat"
             is_planning_surface = profile in {"telegram_planning", "planning"}
@@ -6713,6 +7957,7 @@ class TelegramAdapter(BasePlatformAdapter):
         has_data_intent = wants_miniapp or wants_open or wants_data_action or wants_data_read
         has_app_surface = (
             is_family_surface
+            or is_wishlist_surface
             or is_health_surface
             or is_planning_surface
             or is_boxmap_surface
@@ -6724,6 +7969,7 @@ class TelegramAdapter(BasePlatformAdapter):
             or mentions_health
             or mentions_boxmap
             or mentions_social
+            or mentions_wishlist
         )
         if engineering_request and not wants_data_action:
             return None
@@ -6732,6 +7978,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if is_family_surface and mentions_menu:
             return "menu"
+        if mentions_wishlist or is_wishlist_surface:
+            return "wishlist"
         if mentions_shopping:
             return "shopping"
         if is_family_surface and wants_miniapp:
@@ -7104,12 +8352,20 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
+        if await self._handle_pairing_profile_name_reply(msg):
+            return
         await self._ensure_forum_commands(update.message)
-        miniapp_start_param = (
-            self._miniapp_start_param_for_request(msg)
-            if self._miniapp_request_is_direct_open(msg)
-            else None
-        )
+        # A reply such as "where is the link/button?" carries the BoxMap
+        # surface in the quoted bot message, not necessarily in the new text.
+        # Keep that deterministic shortcut out of the agent lane as intended.
+        if self._is_boxmap_miniapp_request(msg):
+            miniapp_start_param = "boxmap"
+        else:
+            miniapp_start_param = (
+                self._miniapp_start_param_for_request(msg)
+                if self._miniapp_request_is_direct_open(msg)
+                else None
+            )
         if miniapp_start_param:
             if miniapp_start_param == "boxmap":
                 sent = await self._send_boxmap_miniapp_shortcut(msg)
@@ -7121,6 +8377,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._attach_replied_image(msg, event)
+        self._attach_pairing_card_reply_context(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         if self._is_group_chat(msg) and self._message_mentions_bot(msg):
             event._await_forward_followup = True  # type: ignore[attr-defined]
@@ -7148,6 +8405,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._attach_replied_image(msg, event)
+        self._attach_pairing_card_reply_context(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
@@ -7206,8 +8464,14 @@ class TelegramAdapter(BasePlatformAdapter):
         self._apply_topic_recovery(event)
         session_key = build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            group_sessions_per_user=(
+                self.config.extra.get("group_sessions_per_user", True)
+                or event.source.participant_isolation
+            ),
+            thread_sessions_per_user=(
+                self.config.extra.get("thread_sessions_per_user", False)
+                or event.source.participant_isolation
+            ),
         )
         # Shared observed-group sessions intentionally clear source.user_id.
         # Recover the sender from Telegram's raw message so different people in
@@ -7307,6 +8571,11 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            # Replies to access cards carry an authoritative target-chat
+            # binding. Preserve it if Telegram batches the reply with another
+            # short message from the same owner DM.
+            if getattr(event, "channel_context", None):
+                existing.channel_context = event.channel_context
             # Merge any media that might be attached
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)

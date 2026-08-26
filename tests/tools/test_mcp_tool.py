@@ -502,6 +502,41 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_multiple_mcp_images_become_separate_media_tags(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        text_block = SimpleNamespace(text="participant charts")
+        image_blocks = [SimpleNamespace(data="one"), SimpleNamespace(data="two")]
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[text_block, *image_blocks],
+                isError=False,
+                structuredContent=None,
+            )
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "render", 120)
+            with (
+                self._patch_mcp_loop(),
+                patch(
+                    "tools.mcp_tool._cache_mcp_image_block",
+                    side_effect=["MEDIA:/tmp/alexander.png", "MEDIA:/tmp/tatyana.png"],
+                ),
+            ):
+                result = json.loads(handler({}))
+        finally:
+            _servers.pop("test_srv", None)
+
+        assert result["result"].splitlines() == [
+            "participant charts",
+            "MEDIA:/tmp/alexander.png",
+            "MEDIA:/tmp/tatyana.png",
+        ]
+
     def test_mcp_error_result(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
@@ -4251,6 +4286,565 @@ def test_planning_action_origin_forces_family_group_source(monkeypatch):
         "title": "Сделать игровое поле",
         "category": "Mario Odyssey",
     }
+
+
+def test_wishlist_action_origin_binds_topic_member_and_source_message(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    monkeypatch.delenv("PLANNING_TELEGRAM_GROUP_CHAT_IDS", raising=False)
+    monkeypatch.delenv("WISHLIST_TOPIC_MEMBERS_JSON", raising=False)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        chat_name="Семейный чат",
+        thread_id="7",
+        message_id="4242",
+        requester_user_id="555666777",
+        user_name="Natalia",
+    )
+    try:
+        args = {
+            "telegramUserId": "wrong-user",
+            "telegramChatId": "wrong-chat",
+            "sourceThreadId": "9",
+            "sourceMessageId": "wrong-message",
+            "telegramThreadId": "9",
+            "telegramMessageId": "wrong-message",
+            "beneficiaryKey": "artem",
+            "beneficiaryName": "Wrong",
+            "items": [{"title": "Фотоаппарат"}],
+        }
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            "add-wishlist-items",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args == {
+        "telegramUserId": "555666777",
+        "telegramChatId": "-1003966683704",
+        "telegramChatTitle": "Семейный чат",
+        "chatType": "supergroup",
+        "scope": "shared",
+        "actorName": "Natalia",
+        "sourceThreadId": "7",
+        "sourceMessageId": "4242",
+        "beneficiaryKey": "natali",
+        "beneficiaryName": "Натали",
+        "items": [{"title": "Фотоаппарат"}],
+    }
+
+
+def test_wishlist_origin_cannot_smuggle_family_metadata_from_another_chat():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1000000000000",
+        thread_id="7",
+        message_id="4242",
+        requester_user_id="555666777",
+        user_name="Natalia",
+    )
+    try:
+        args = {
+            "telegramChatId": "-1003966683704",
+            "sourceThreadId": "7",
+            "sourceMessageId": "4242",
+            "beneficiaryKey": "natali",
+            "items": [{"title": "Фотоаппарат"}],
+        }
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            "add-wishlist-items",
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args == {
+        "telegramUserId": "555666777",
+        "actorName": "Natalia",
+        "scope": "personal",
+        "items": [{"title": "Фотоаппарат"}],
+    }
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "list-shopping-items",
+        "categorize-shopping-items",
+        "compose-shopping-items",
+        "dissolve-shopping-composite",
+        "move-shopping-items",
+    ],
+)
+def test_shopping_action_origin_forces_family_group_source(monkeypatch, tool_name):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+
+    monkeypatch.delenv("PLANNING_TELEGRAM_GROUP_CHAT_IDS", raising=False)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003966683704",
+        chat_name="Семейный чат",
+        user_id="179555559",
+        user_name="Mikhail",
+    )
+    try:
+        args = {
+            "telegramUserId": "wrong-user",
+            "scope": "personal",
+            "telegramChatId": "wrong-chat",
+        }
+        _enrich_planning_action_args_from_origin(
+            "health-actions",
+            tool_name,
+            args,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert args == {
+        "telegramUserId": "179555559",
+        "scope": "shared",
+        "telegramChatId": "-1003966683704",
+        "telegramChatTitle": "Семейный чат",
+        "chatType": "supergroup",
+        "actorName": "Mikhail",
+    }
+
+
+def test_health_actions_bind_to_verified_telegram_requester():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        user_id="",
+        requester_user_id="222333444",
+        profile_name="hudeem-tripio",
+    )
+    try:
+        args = {"telegramUserId": "179555559", "date": "2026-08-18"}
+        result = _bind_health_actions_to_telegram_requester("health-actions", args)
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert args["telegramUserId"] == "222333444"
+
+
+def test_health_actions_bind_nutrition_write_to_durable_job():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="222333444",
+        profile_name="hudeem-tripio",
+        job_id="gw_meal_123",
+    )
+    try:
+        args = {
+            "telegramUserId": "wrong-user",
+            "sourceMealKey": "Перекус 1",
+            "sourceActionId": "model-authored-value",
+        }
+        result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            args,
+            tool_name="record-nutrition-meal",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert args["telegramUserId"] == "222333444"
+    assert args["sourceActionId"] == "gateway-job:gw_meal_123:meal:перекус-1"
+
+
+def test_health_actions_block_mutation_while_voice_confirmation_is_required():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="222333444",
+        profile_name="hudeem-tripio",
+        health_voice_confirmation_required="true",
+        job_id="gw_ambiguous_voice_123",
+    )
+    try:
+        args = {"telegramUserId": "wrong-user", "sourceMealKey": "ужин"}
+        result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            args,
+            tool_name="record-nutrition-meal",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "voice transcript contains a high-impact ambiguity" in result
+    assert args["telegramUserId"] == "wrong-user"
+    assert "sourceActionId" not in args
+
+
+def test_health_actions_bind_weight_write_to_durable_job():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="222333444",
+        profile_name="hudeem-tripio",
+        job_id="gw_weight_123",
+    )
+    try:
+        args = {
+            "telegramUserId": "wrong-user",
+            "measuredOn": "2026-08-22",
+            "weightKg": 87.95,
+            "sourceActionId": "model-authored-value",
+        }
+        result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            args,
+            tool_name="record-body-weight",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert args["telegramUserId"] == "222333444"
+    assert args["sourceActionId"] == "gateway-job:gw_weight_123:body-weight"
+
+
+@pytest.mark.parametrize(
+    "group_tool_name",
+    ["get-group-nutrition-statistics", "render-group-nutrition-chart"],
+)
+def test_health_actions_group_read_injects_only_current_chat_roster(tmp_path, monkeypatch, group_tool_name):
+    import json
+    import sqlite3
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    database_path = tmp_path / "gateway_jobs.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            """CREATE TABLE gateway_inbox_events (
+                   platform text NOT NULL,
+                   source_json text NOT NULL,
+                   created_at real NOT NULL
+               )"""
+        )
+        sources = [
+            ({"chat_id": "-5526305849", "profile_name": "hudeem-tripio", "user_id": "222333444", "user_name": "Татьяна"}, 3),
+            ({"chat_id": "-5526305849", "profile_name": "hudeem-tripio", "user_id": "333444555", "user_name": "Александр"}, 2),
+            ({"chat_id": "-9999999999", "profile_name": "hudeem-tripio", "user_id": "444555666", "user_name": "Чужой чат"}, 1),
+            ({"chat_id": "-5526305849", "profile_name": "another-profile", "user_id": "555666777", "user_name": "Чужой профиль"}, 1),
+        ]
+        database.executemany(
+            "INSERT INTO gateway_inbox_events(platform, source_json, created_at) VALUES ('telegram', ?, ?)",
+            [(json.dumps(source, ensure_ascii=False), created_at) for source, created_at in sources],
+        )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "telegram:\n  allow_admin_from:\n    - '111222333'\n",
+        encoding="utf-8",
+    )
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="111222333",
+        user_name="Михаил",
+        profile_name="hudeem-tripio",
+        memory_scope="hudeem-tripio-user-111222333",
+    )
+    try:
+        args = {
+            "dateFrom": "2026-08-16",
+            "dateTo": "2026-08-22",
+            "telegramUserId": "444555666",
+            "participants": [{"telegramUserId": "444555666", "name": "Чужой чат"}],
+        }
+        result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            args,
+            tool_name=group_tool_name,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert "telegramUserId" not in args
+    assert [(item["telegramUserId"], item["name"]) for item in args["participants"]] == [
+        ("222333444", "Татьяна"),
+        ("333444555", "Александр"),
+    ]
+
+
+def test_health_actions_admin_summary_is_forced_to_group_png(tmp_path, monkeypatch):
+    import sqlite3
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import (
+        _bind_health_actions_to_telegram_requester,
+        _effective_health_actions_tool_name,
+        _prepare_health_group_chart_args,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "telegram:\n  allow_admin_from:\n    - '111222333'\n",
+        encoding="utf-8",
+    )
+    database_path = tmp_path / "gateway_jobs.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            """CREATE TABLE gateway_inbox_events (
+                   platform text NOT NULL,
+                   source_json text NOT NULL,
+                   created_at real NOT NULL
+               )"""
+        )
+        database.executemany(
+            "INSERT INTO gateway_inbox_events(platform, source_json, created_at) VALUES ('telegram', ?, ?)",
+            [
+                (json.dumps({"chat_id": "-5526305849", "profile_name": "hudeem-tripio", "user_id": "222333444", "user_name": "Татьяна"}, ensure_ascii=False), 2),
+                (json.dumps({"chat_id": "-5526305849", "profile_name": "hudeem-tripio", "user_id": "333444555", "user_name": "Александр"}, ensure_ascii=False), 1),
+            ],
+        )
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="111222333",
+        user_name="Михаил",
+        profile_name="hudeem-tripio",
+        user_request="@TripiooBot сводка за сегодня",
+        memory_scope="hudeem-tripio-user-111222333",
+    )
+    try:
+        effective_name = _effective_health_actions_tool_name(
+            "health-actions",
+            "get-nutrition-statistics",
+        )
+        args = {
+            "telegramUserId": "111222333",
+            "dateFrom": "2026-08-23",
+            "dateTo": "2026-08-23",
+        }
+        _prepare_health_group_chart_args(effective_name, args)
+        result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            args,
+            tool_name=effective_name,
+        )
+        personal_args = {"telegramUserId": "111222333"}
+        personal_result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            personal_args,
+            tool_name="list-nutrition-journal",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert effective_name == "render-group-nutrition-chart"
+    assert args["dateFrom"] == "2026-08-17"
+    assert args["dateTo"] == "2026-08-23"
+    assert result is None
+    assert "telegramUserId" not in args
+    assert [participant["name"] for participant in args["participants"]] == [
+        "Татьяна",
+        "Александр",
+    ]
+    assert "Personal journal" in personal_result
+
+
+def test_health_actions_personal_summary_stays_personal_for_member():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _effective_health_actions_tool_name
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="222333444",
+        profile_name="hudeem-tripio",
+        user_request="Покажи мою сводку за сегодня",
+    )
+    try:
+        effective_name = _effective_health_actions_tool_name(
+            "health-actions",
+            "get-nutrition-statistics",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert effective_name == "get-nutrition-statistics"
+
+
+def test_health_actions_group_report_requires_nutrition_specialist_skill():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="111222333",
+        profile_name="hudeem-tripio",
+        memory_scope="hudeem-tripio",
+        user_request="сводка за сегодня",
+    )
+    try:
+        result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            {"dateTo": "2026-08-23"},
+            tool_name="render-group-nutrition-chart",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "must be generated through the verified nutrition specialist skill" in result
+
+
+def test_health_actions_handler_calls_group_renderer_for_admin_summary(tmp_path, monkeypatch):
+    import sqlite3
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _make_tool_handler, _servers
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "telegram:\n  allow_admin_from:\n    - '111222333'\n",
+        encoding="utf-8",
+    )
+    with sqlite3.connect(tmp_path / "gateway_jobs.sqlite3") as database:
+        database.execute(
+            """CREATE TABLE gateway_inbox_events (
+                   platform text NOT NULL,
+                   source_json text NOT NULL,
+                   created_at real NOT NULL
+               )"""
+        )
+        database.execute(
+            "INSERT INTO gateway_inbox_events(platform, source_json, created_at) VALUES ('telegram', ?, 1)",
+            (json.dumps({"chat_id": "-5526305849", "profile_name": "hudeem-tripio", "user_id": "222333444", "user_name": "Татьяна"}, ensure_ascii=False),),
+        )
+
+    mock_session = MagicMock()
+    mock_session.call_tool = AsyncMock(return_value=_make_call_result("PNG ready"))
+    mock_server = _make_mock_server("health-actions", session=mock_session)
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        requester_user_id="111222333",
+        user_name="Михаил",
+        profile_name="hudeem-tripio",
+        user_request="сводка за сегодня",
+        memory_scope="hudeem-tripio-user-111222333",
+    )
+    try:
+        with patch.dict(_servers, {"health-actions": mock_server}, clear=False):
+            handler = _make_tool_handler(
+                "health-actions",
+                "get-nutrition-statistics",
+                120,
+            )
+            def run_coro(coro_or_factory, timeout=30):
+                coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+                return asyncio.run(coro)
+
+            with patch("tools.mcp_tool._run_on_mcp_loop", side_effect=run_coro):
+                result = handler(
+                    {"telegramUserId": "111222333", "dateTo": "2026-08-23"}
+                )
+    finally:
+        clear_session_vars(tokens)
+
+    assert json.loads(result)["result"] == "PNG ready"
+    call_args = mock_session.call_tool.await_args
+    assert call_args.args[0] == "render-group-nutrition-chart"
+    assert call_args.kwargs["arguments"]["dateFrom"] == "2026-08-17"
+    assert call_args.kwargs["arguments"]["participants"] == [
+        {"telegramUserId": "222333444", "name": "Татьяна"}
+    ]
+
+
+def test_health_actions_group_read_fails_closed_outside_group():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="111222333",
+        requester_user_id="111222333",
+        profile_name="hudeem-tripio",
+        memory_scope="hudeem-tripio-user-111222333",
+    )
+    try:
+        args = {"dateFrom": "2026-08-16", "dateTo": "2026-08-22"}
+        result = _bind_health_actions_to_telegram_requester(
+            "health-actions",
+            args,
+            tool_name="get-group-nutrition-statistics",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "only from inside" in result
+    assert "participants" not in args
+
+
+def test_health_actions_public_profile_fails_closed_without_requester():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-5526305849",
+        profile_name="hudeem-tripio",
+    )
+    try:
+        args = {"telegramUserId": "179555559"}
+        result = _bind_health_actions_to_telegram_requester("health-actions", args)
+    finally:
+        clear_session_vars(tokens)
+
+    assert "could not be verified" in result
+    assert args["telegramUserId"] == "179555559"
+
+
+def test_health_actions_other_profiles_keep_existing_identity_behavior():
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _bind_health_actions_to_telegram_requester
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1003735932411",
+        requester_user_id="222333444",
+        profile_name="personal",
+    )
+    try:
+        args = {"telegramUserId": "179555559"}
+        result = _bind_health_actions_to_telegram_requester("health-actions", args)
+    finally:
+        clear_session_vars(tokens)
+
+    assert result is None
+    assert args["telegramUserId"] == "179555559"
 
 
 def test_planning_action_topic_overrides_generic_model_category(monkeypatch):

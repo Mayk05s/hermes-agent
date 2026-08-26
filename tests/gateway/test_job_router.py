@@ -195,3 +195,71 @@ async def test_fallback_does_not_merge_other_users_by_wording_alone(monkeypatch)
 
     assert decision.action == "new_job"
     assert decision.job_id is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_router_cannot_attach_across_verified_participants(monkeypatch):
+    monkeypatch.setattr(
+        "agent.auxiliary_client.async_call_llm",
+        AsyncMock(
+            return_value=_llm_response(
+                '{"action":"attach","job_id":"gw_tatyana","confidence":0.99,'
+                '"reason":"looks like a correction"}'
+            )
+        ),
+    )
+
+    decision = await decide_job_route(
+        message="Да сразу полкило, чего уж там",
+        active_jobs=[
+            {
+                "job_id": "gw_tatyana",
+                "request_text": "Перекус — 200 г дыни",
+                "status": "running",
+                "source_json": json.dumps(
+                    {"user_id": "5482704149", "user_name": "Татьяна"}
+                ),
+            }
+        ],
+        sender_user_id="179555559",
+        sender_user_name="Mikhail",
+    )
+
+    assert decision.action == "new_job"
+    assert decision.job_id is None
+    assert decision.parent_job_id == "gw_tatyana"
+    assert "different" in decision.reason or "across" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_semantic_router_keeps_same_participant_meal_correction_attached(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent.auxiliary_client.async_call_llm",
+        AsyncMock(
+            return_value=_llm_response(
+                '{"action":"attach","job_id":"gw_tatyana","confidence":0.99,'
+                '"reason":"same meal quantity correction"}'
+            )
+        ),
+    )
+
+    decision = await decide_job_route(
+        message="Ещё +100",
+        active_jobs=[
+            {
+                "job_id": "gw_tatyana",
+                "request_text": "Перекус — 200 г дыни",
+                "status": "running",
+                "source_json": json.dumps(
+                    {"user_id": "5482704149", "user_name": "Татьяна"}
+                ),
+            }
+        ],
+        sender_user_id="5482704149",
+        sender_user_name="Татьяна",
+    )
+
+    assert decision.action == "attach"
+    assert decision.job_id == "gw_tatyana"

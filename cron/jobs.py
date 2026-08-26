@@ -995,13 +995,51 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
-def advance_next_run(job_id: str) -> bool:
-    """Preemptively advance next_run_at for a recurring job before execution.
+def mark_job_slot_retry(
+    job_id: str,
+    error: str,
+    *,
+    delivery: bool = False,
+) -> bool:
+    """Record a retryable slot error without consuming the schedule slot.
 
-    Call this BEFORE run_job() so that if the process crashes mid-execution,
-    the job won't re-fire on the next gateway restart.  This converts the
-    scheduler from at-least-once to at-most-once for recurring jobs — missing
-    one run is far better than firing dozens of times in a crash loop.
+    The job's ``next_run_at`` and repeat counter intentionally remain unchanged.
+    The scheduler's durable delivery ledger owns the prepared payload, so the
+    next tick can resume this exact occurrence.  With ``delivery=True`` it
+    retries the persisted payload instead of running the agent or script again.
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            if delivery:
+                job["last_delivery_error"] = str(error)
+                job["state"] = "delivery_retry"
+            else:
+                job["last_status"] = "error"
+                job["last_error"] = str(error)
+                job["state"] = "retry"
+            save_jobs(jobs)
+            return True
+
+    logger.warning("mark_job_slot_retry: job_id %s not found", job_id)
+    return False
+
+
+def mark_job_delivery_retry(job_id: str, delivery_error: str) -> bool:
+    """Record a known delivery failure while retaining the current slot."""
+    return mark_job_slot_retry(job_id, delivery_error, delivery=True)
+
+
+def advance_next_run(job_id: str) -> bool:
+    """Legacy helper to preemptively advance a recurring job.
+
+    The scheduler no longer calls this before execution: doing so loses a
+    delivery on a known transport failure.  ``cron.scheduler.tick`` now keeps
+    the current schedule slot until its durable delivery outbox reaches a
+    terminal state.  The function remains for API/backward compatibility with
+    external callers that explicitly want the old at-most-once pre-advance.
 
     One-shot jobs are left unchanged so they can still retry on restart.
 
@@ -1098,6 +1136,26 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
             if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
+                retry_state = str(job.get("state") or "") in {
+                    "retry",
+                    "delivery_retry",
+                }
+                stale_policy = str(
+                    job.get("stale_slot_policy")
+                    or ("resume" if retry_state else "fast-forward")
+                ).strip().lower()
+                if retry_state and stale_policy == "resume":
+                    # A retryable durable slot owns an immutable cached payload.
+                    # Do not orphan it merely because the gateway was down past
+                    # the ordinary catch-up grace window.
+                    due.append(job)
+                    continue
+                if retry_state and stale_policy == "expire":
+                    # Let the scheduler terminally fail receipts and delete the
+                    # corresponding ledger slot before advancing the schedule.
+                    job["_stale_slot_expired"] = True
+                    due.append(job)
+                    continue
                 # Job is past its catch-up grace window — this is a stale missed run.
                 # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())

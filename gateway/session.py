@@ -98,6 +98,10 @@ class SessionSource:
     # execution session remains topic-local so sibling topics can run in
     # parallel without racing on one mutable transcript.
     topic_isolation: bool = True
+    # Chat-level override used by sensitive multi-user chats.  It isolates the
+    # execution session by stable participant identity even when the gateway's
+    # global group/thread policy is shared.
+    participant_isolation: bool = False
     
     @property
     def description(self) -> str:
@@ -148,6 +152,7 @@ class SessionSource:
         if self.memory_scope:
             d["memory_scope"] = self.memory_scope
         d["topic_isolation"] = self.topic_isolation
+        d["participant_isolation"] = self.participant_isolation
         return d
 
     @classmethod
@@ -170,6 +175,7 @@ class SessionSource:
             scope_name=data.get("scope_name"),
             memory_scope=data.get("memory_scope"),
             topic_isolation=data.get("topic_isolation", True) is not False,
+            participant_isolation=data.get("participant_isolation", False) is True,
         )
     
 
@@ -665,6 +671,8 @@ def is_shared_multi_user_session(
     """
     if source.chat_type == "dm":
         return False
+    if source.participant_isolation:
+        return False
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
@@ -735,8 +743,8 @@ def build_session_key(
     # In threads, default to shared sessions (all participants see the same
     # conversation).  Per-user isolation only applies when explicitly enabled
     # via thread_sessions_per_user, or when there is no thread (regular group).
-    isolate_user = group_sessions_per_user
-    if source.thread_id and not thread_sessions_per_user:
+    isolate_user = group_sessions_per_user or source.participant_isolation
+    if source.thread_id and not (thread_sessions_per_user or source.participant_isolation):
         isolate_user = False
 
     if isolate_user and participant_id:

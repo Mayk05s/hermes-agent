@@ -186,7 +186,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.delivery_ledger import DeliveryLedger, stable_slot_key
+from cron.jobs import (
+    advance_next_run,  # Backward-compatible import; durable slots supersede pre-advance.
+    get_due_jobs,
+    mark_job_delivery_retry,
+    mark_job_run,
+    mark_job_slot_retry,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -207,6 +215,11 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+def _get_delivery_ledger() -> DeliveryLedger:
+    """Resolve the profile-aware cron delivery ledger at call time."""
+    return DeliveryLedger(_get_hermes_home() / "cron")
 
 
 @contextmanager
@@ -666,7 +679,16 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    slot_key: Optional[str] = None,
+    delivery_targets: Optional[List[dict]] = None,
+    ledger: Optional[DeliveryLedger] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -677,7 +699,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
-    targets = _resolve_delivery_targets(job)
+    targets = (
+        [dict(target) for target in delivery_targets]
+        if delivery_targets is not None
+        else _resolve_delivery_targets(job)
+    )
     if not targets:
         if job.get("deliver", "local") != "local":
             msg = f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
@@ -711,6 +737,38 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
 
+        # Claim each concrete destination independently.  This prevents a
+        # retry of target B from duplicating target A after a partial
+        # multi-platform delivery.  A target left in `sending` by a process
+        # crash is deliberately treated as uncertain and not sent again.
+        if slot_key and ledger:
+            target_state = ledger.begin_target(slot_key, target)
+            if target_state == "delivered":
+                logger.info(
+                    "Job '%s': slot %s already delivered to %s:%s; skipping",
+                    job["id"],
+                    slot_key[:12],
+                    platform_name,
+                    chat_id,
+                )
+                continue
+            if target_state == "uncertain":
+                logger.warning(
+                    "Job '%s': prior delivery outcome for slot %s to %s:%s "
+                    "is uncertain; suppressing duplicate",
+                    job["id"],
+                    slot_key[:12],
+                    platform_name,
+                    chat_id,
+                )
+                continue
+
+        def _record_target_failure(message: str) -> None:
+            if slot_key and ledger:
+                ledger.finish_target(
+                    slot_key, target, success=False, error=message
+                )
+
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")
@@ -734,6 +792,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"unknown platform '{platform_name}'"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            _record_target_failure(msg)
             continue
 
         pconfig = config.platforms.get(platform)
@@ -741,6 +800,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            _record_target_failure(msg)
             continue
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
@@ -811,6 +871,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
             except Exception as e:
+                if slot_key and ledger:
+                    # The adapter may have handed the message to the remote
+                    # platform before the local timeout/exception. Falling
+                    # back here could immediately duplicate it.
+                    message = f"live adapter send raised {type(e).__name__}: {e}"
+                    ledger.mark_target_uncertain(slot_key, target, message)
+                    logger.warning(
+                        "Job '%s': live adapter outcome for %s:%s is uncertain "
+                        "(%s); suppressing standalone fallback",
+                        job["id"], platform_name, chat_id, e,
+                    )
+                    continue
                 logger.warning(
                     "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
                     job["id"], platform_name, chat_id, e,
@@ -832,17 +904,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
-                logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
+                if slot_key and ledger:
+                    # Exceptions/timeouts do not prove whether the remote API
+                    # accepted the message. Fail closed; only an explicit
+                    # error response below is safe to retry.
+                    ledger.mark_target_uncertain(slot_key, target, msg)
+                    logger.warning(
+                        "Job '%s': %s; duplicate suppressed because outcome is uncertain",
+                        job["id"], msg,
+                    )
+                else:
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    _record_target_failure(msg)
                 continue
 
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
+                _record_target_failure(msg)
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+
+        if slot_key and ledger:
+            ledger.finish_target(slot_key, target, success=True)
 
     if delivery_errors:
         return "; ".join(delivery_errors)
@@ -887,7 +974,12 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str,
+    *,
+    input_text: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -967,6 +1059,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     run_env = os.environ.copy()
     run_env["HERMES_HOME"] = str(_get_hermes_home())
+    if extra_env:
+        run_env.update({str(key): str(value) for key, value in extra_env.items()})
     try:
         from hermes_constants import get_subprocess_home
 
@@ -980,6 +1074,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
             argv,
+            input=input_text,
             capture_output=True,
             text=True,
             timeout=script_timeout,
@@ -1038,6 +1133,80 @@ def _parse_wake_gate(script_output: str) -> bool:
     if not isinstance(gate, dict):
         return True
     return gate.get("wakeAgent", True) is not False
+
+
+def _parse_delivery_envelope(job: dict, response: str) -> tuple[str, list[dict]]:
+    """Extract an opt-in script delivery envelope after job execution.
+
+    The envelope is trusted only when the job itself configures a receipt
+    script. Its user-facing message is separated from receipt metadata before
+    either value enters the durable outbox, so internal participant keys are
+    never delivered to chat.
+    """
+    if not str(job.get("delivery_receipt_script") or "").strip():
+        return response, []
+    response_text = str(response or "").strip()
+    if response_text.upper() == SILENT_MARKER:
+        return response_text, []
+    try:
+        payload = json.loads(response_text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("delivery receipt job returned invalid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("schemaVersion") != 1:
+        raise ValueError("delivery receipt job returned an unsupported envelope")
+    message = str(payload.get("message") or "").strip()
+    receipts = payload.get("receipts")
+    if not message or not isinstance(receipts, list) or not receipts or len(receipts) > 100:
+        raise ValueError("delivery receipt envelope requires message and receipts")
+    normalized: list[dict] = []
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            raise ValueError("delivery receipt entries must be objects")
+        serialized = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+        if len(serialized.encode("utf-8")) > 16_000:
+            raise ValueError("delivery receipt entry is too large")
+        normalized.append(json.loads(serialized))
+    return message, normalized
+
+
+def _run_delivery_receipt_hook(
+    job: dict,
+    receipts: list[dict],
+    state: str,
+    *,
+    note: Optional[str] = None,
+) -> tuple[bool, Optional[str], bool]:
+    """Persist queued/delivered/failed state for a durable delivery slot.
+
+    Returns ``(ok, error, already_delivered)``. A callback failure is
+    retryable and must leave the slot in the ledger. ``already_delivered`` is
+    a fail-closed signal from the authoritative receipt store: the cached chat
+    payload must not be sent again.
+    """
+    script_path = str(job.get("delivery_receipt_script") or "").strip()
+    if not receipts or not script_path:
+        return True, None, False
+    payload = {
+        "schemaVersion": 1,
+        "state": state,
+        "receipts": receipts,
+        "note": str(note or "")[:500],
+    }
+    with _job_profile_context(job.get("id", "?"), job.get("profile")):
+        ok, output = _run_job_script(
+            script_path,
+            input_text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            extra_env={"HERMES_CRON_DELIVERY_RECEIPT_MODE": "1"},
+        )
+    if not ok:
+        return False, output or "delivery receipt callback failed", False
+    try:
+        result = json.loads(output or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False, "delivery receipt callback returned invalid JSON", False
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return False, "delivery receipt callback did not confirm success", False
+    return True, None, result.get("alreadyDelivered") is True
 
 
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
@@ -1400,13 +1569,21 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             return True, silent_doc, SILENT_MARKER, None
 
+        audit_output = output
+        if str(job.get("delivery_receipt_script") or "").strip():
+            try:
+                audit_output, _ = _parse_delivery_envelope(job, output)
+            except ValueError:
+                # The durable tick path will fail closed before delivery; do
+                # not persist raw receipt metadata in the human audit file.
+                audit_output = "[invalid delivery envelope]"
         doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
             f"**Run Time:** {now_iso}\n"
             f"**Mode:** no_agent (script)\n\n"
             f"---\n\n"
-            f"{output}\n"
+            f"{audit_output}\n"
         )
         return True, doc, output, None
 
@@ -2015,11 +2192,6 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        for job in due_jobs:
-            advance_next_run(job["id"])
-
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
@@ -2049,54 +2221,254 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            scheduled_for = str(job.get("next_run_at") or "").strip()
+            slot_key: Optional[str] = None
+            ledger: Optional[DeliveryLedger] = None
+
+            # Every real due job has next_run_at.  Keep a legacy path for
+            # hand-built callers/tests that invoke tick() with an incomplete
+            # record; production scheduled deliveries always use the ledger.
+            if scheduled_for:
+                try:
+                    slot_key = stable_slot_key(job["id"], scheduled_for)
+                    ledger = _get_delivery_ledger()
+                except Exception as exc:
+                    message = f"failed to initialize durable delivery slot: {exc}"
+                    logger.error("Job '%s': %s", job["id"], message)
+                    mark_job_slot_retry(job["id"], message)
+                    return False
+
             try:
-                success, output, final_response, error = run_job(job)
+                slot = ledger.get_slot(slot_key) if ledger and slot_key else None
 
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above). Failed jobs deliver a compact
-                # diagnostic to their origin so they cannot fail silently.
-                if success:
-                    deliver_content = final_response
-                else:
-                    job_label = job.get("name", job["id"])
-                    deliver_content = (
-                        f"⚠️ Запланированная задача «{job_label}» не выполнена. "
-                        f"Job ID: {job['id']}. Причина: {error}"
+                if slot and slot.get("state") == "completed":
+                    # Delivery was committed before the job store advanced.
+                    # Finish that small restart window without sending again.
+                    mark_job_run(
+                        job["id"],
+                        bool(slot["success"]),
+                        slot.get("error"),
+                        delivery_error=slot.get("completion_note"),
                     )
-                # Treat whitespace-only final responses the same as empty
-                # responses: do not deliver a blank message, and let the
-                # empty-response guard below mark the run as a soft failure.
-                should_deliver = bool(deliver_content.strip())
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
+                    ledger.delete_slot(slot_key)
+                    return True
+
+                if job.get("_stale_slot_expired"):
+                    stale_note = "stale scheduled slot expired without late delivery"
+                    stale_receipts = list(slot.get("receipts") or []) if slot else []
+                    if stale_receipts:
+                        receipt_ok, receipt_error, _ = _run_delivery_receipt_hook(
+                            job,
+                            stale_receipts,
+                            "failed",
+                            note="stale_slot",
+                        )
+                        if not receipt_ok:
+                            mark_job_delivery_retry(
+                                job["id"],
+                                receipt_error or "stale receipt callback failed",
+                            )
+                            return True
+                    if ledger and slot_key and slot:
+                        ledger.mark_slot_completed(slot_key, stale_note)
+                    mark_job_run(
+                        job["id"],
+                        False,
+                        stale_note,
+                        delivery_error=stale_note,
+                    )
+                    if ledger and slot_key and slot:
+                        ledger.delete_slot(slot_key)
+                    return True
+
+                if slot:
+                    # Restart/retry path: the agent result and destinations are
+                    # immutable for the slot.  Retry only the cached delivery.
+                    success = bool(slot["success"])
+                    error = slot.get("error")
+                    deliver_content = str(slot.get("delivery_content") or "")
+                    should_deliver = bool(slot.get("should_deliver"))
+                    delivery_targets = list(slot.get("targets") or [])
+                    delivery_receipts = list(slot.get("receipts") or [])
+                else:
+                    success, output, final_response, error = run_job(job)
+
+                    output_file = save_job_output(job["id"], output)
+                    if verbose:
+                        logger.info("Output saved to: %s", output_file)
+
+                    # Deliver the final response to the origin/target chat.
+                    # If the agent responded with [SILENT], skip delivery (but
+                    # output is already saved above). Failed jobs deliver a compact
+                    # diagnostic to their origin so they cannot fail silently.
+                    delivery_receipts: list[dict] = []
+                    if success:
+                        try:
+                            deliver_content, delivery_receipts = (
+                                _parse_delivery_envelope(job, final_response)
+                            )
+                        except ValueError as exc:
+                            success = False
+                            error = str(exc)
+                            deliver_content = ""
+                    else:
+                        job_label = job.get("name", job["id"])
+                        deliver_content = (
+                            f"⚠️ Запланированная задача «{job_label}» не выполнена. "
+                            f"Job ID: {job['id']}. Причина: {error}"
+                        )
+                    # Treat whitespace-only final responses the same as empty
+                    # responses: do not deliver a blank message, and let the
+                    # empty-response guard below mark the run as a soft failure.
+                    should_deliver = bool(deliver_content.strip())
+                    if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                        should_deliver = False
+
+                    # Treat empty final_response as a soft failure so last_status
+                    # is not "ok" — the agent ran but produced nothing useful.
+                    # (issue #8585)
+                    if success and not final_response.strip():
+                        success = False
+                        error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+                    delivery_targets = (
+                        _resolve_delivery_targets(job) if should_deliver else []
+                    )
+                    if ledger and slot_key:
+                        slot = ledger.prepare_slot(
+                            slot_key=slot_key,
+                            job_id=job["id"],
+                            scheduled_for=scheduled_for,
+                            success=success,
+                            error=error,
+                            delivery_content=deliver_content,
+                            should_deliver=should_deliver,
+                            targets=delivery_targets,
+                            receipts=delivery_receipts,
+                        )
+                        # In the unlikely event another recovery path prepared
+                        # the slot first, use its immutable payload.
+                        success = bool(slot["success"])
+                        error = slot.get("error")
+                        deliver_content = str(slot.get("delivery_content") or "")
+                        should_deliver = bool(slot.get("should_deliver"))
+                        delivery_targets = list(slot.get("targets") or [])
+                        delivery_receipts = list(slot.get("receipts") or [])
+
+                # If a non-local target could not be resolved at preparation
+                # time, allow a later config repair to populate it. Once a
+                # concrete target exists, per-target ledger keys keep retries
+                # stable and deduplicated.
+                if (
+                    should_deliver
+                    and not delivery_targets
+                    and _normalize_deliver_value(job.get("deliver", "local")) != "local"
+                ):
+                    delivery_targets = _resolve_delivery_targets(job)
 
                 delivery_error = None
+                receipt_already_delivered = False
+                if should_deliver and delivery_receipts:
+                    receipt_ok, receipt_error, receipt_already_delivered = (
+                        _run_delivery_receipt_hook(
+                            job,
+                            delivery_receipts,
+                            "queued",
+                        )
+                    )
+                    if not receipt_ok:
+                        message = receipt_error or "delivery receipt queue callback failed"
+                        mark_job_delivery_retry(job["id"], message)
+                        return True
+                    if receipt_already_delivered:
+                        should_deliver = False
+
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                            slot_key=slot_key,
+                            delivery_targets=delivery_targets,
+                            ledger=ledger,
+                        )
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response.strip():
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+                if delivery_error and ledger and slot_key:
+                    if delivery_receipts:
+                        receipt_ok, receipt_error, _ = _run_delivery_receipt_hook(
+                            job,
+                            delivery_receipts,
+                            "failed",
+                            note=delivery_error,
+                        )
+                        if not receipt_ok:
+                            delivery_error = (
+                                f"{delivery_error}; receipt callback: {receipt_error}"
+                            )
+                    # A positively observed failure is safe to retry. Keep the
+                    # schedule on the same slot; the next tick reuses the
+                    # persisted payload and retries failed targets only.
+                    mark_job_delivery_retry(job["id"], delivery_error)
+                    return True
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                completion_note = (
+                    "authoritative receipt already delivered; duplicate suppressed"
+                    if receipt_already_delivered
+                    else None
+                )
+                if ledger and slot_key:
+                    uncertain_notes = ledger.uncertain_target_notes(slot_key)
+                    if uncertain_notes:
+                        completion_note = "; ".join(uncertain_notes)
+
+                if delivery_receipts:
+                    receipt_state = (
+                        "failed"
+                        if completion_note or receipt_already_delivered
+                        else "delivered"
+                    )
+                    receipt_ok, receipt_error, _ = _run_delivery_receipt_hook(
+                        job,
+                        delivery_receipts,
+                        receipt_state,
+                        note=completion_note,
+                    )
+                    if not receipt_ok:
+                        message = receipt_error or "delivery receipt completion callback failed"
+                        mark_job_delivery_retry(job["id"], message)
+                        return True
+
+                if ledger and slot_key:
+                    # Commit the delivery outcome before advancing jobs.json.
+                    # A restart between these two writes sees `completed` and
+                    # advances the job without re-delivery.
+                    ledger.mark_slot_completed(slot_key, completion_note)
+
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=(completion_note or delivery_error),
+                )
+                if ledger and slot_key:
+                    ledger.delete_slot(slot_key)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                if ledger and slot_key:
+                    # No schedule advancement on infrastructure errors. If a
+                    # send had already started, the target ledger suppresses a
+                    # duplicate on the recovery tick.
+                    mark_job_slot_retry(job["id"], str(e))
+                else:
+                    mark_job_run(job["id"], False, str(e))
                 return False
 
         # Partition due jobs: jobs with a per-job workdir and/or profile touch

@@ -68,6 +68,29 @@ def _candidate_payload(candidates: Iterable[dict[str, Any]]) -> list[dict[str, A
     return result
 
 
+def _candidate_requester_id(
+    candidates: Iterable[dict[str, Any]], job_id: Optional[str]
+) -> str:
+    resolved_job_id = str(job_id or "")
+    for candidate in candidates:
+        if str(candidate.get("job_id") or "") != resolved_job_id:
+            continue
+        requester = candidate.get("requester") or {}
+        return str(requester.get("user_id") or "")
+    return ""
+
+
+def _is_known_other_sender(
+    candidates: Iterable[dict[str, Any]], job_id: Optional[str], sender_user_id: str
+) -> bool:
+    candidate_user_id = _candidate_requester_id(candidates, job_id)
+    return bool(
+        sender_user_id
+        and candidate_user_id
+        and sender_user_id != candidate_user_id
+    )
+
+
 def _extract_json_object(content: str) -> dict[str, Any]:
     text = str(content or "").strip()
     if text.startswith("```"):
@@ -195,6 +218,13 @@ async def decide_job_route(
         "user_name": str(sender_user_name or ""),
     }
     if replied_job_id and replied_job_id in candidate_ids:
+        if _is_known_other_sender(candidates, replied_job_id, sender["user_id"]):
+            return JobRouteDecision(
+                "new_job",
+                confidence=1.0,
+                reason="reply came from a different verified participant",
+                parent_job_id=replied_job_id,
+            )
         return JobRouteDecision(
             "attach",
             replied_job_id,
@@ -223,7 +253,7 @@ async def decide_job_route(
         return JobRouteDecision("new_job", confidence=1.0, reason="no active jobs")
 
     try:
-        return await _classify_with_llm(
+        decision = await _classify_with_llm(
             str(message or ""),
             candidates,
             recent,
@@ -231,6 +261,16 @@ async def decide_job_route(
             message_type=str(message_type or "text"),
             media_count=max(0, int(media_count or 0)),
         )
+        if decision.action == "attach" and _is_known_other_sender(
+            candidates, decision.job_id, sender["user_id"]
+        ):
+            return JobRouteDecision(
+                "new_job",
+                confidence=decision.confidence,
+                reason="semantic attach rejected across verified participants",
+                parent_job_id=decision.job_id,
+            )
+        return decision
     except Exception as exc:
         logger.warning("Semantic job routing failed; applying conservative fallback: %s", exc)
 

@@ -142,6 +142,41 @@ class _ComponentFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
+class _ProfileFilter(logging.Filter):
+    """Keep routed-profile records out of every other profile's files."""
+
+    def __init__(self, profile_name: str) -> None:
+        super().__init__()
+        self._profile_name = profile_name or "default"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from gateway.session_context import get_session_env
+            current = str(get_session_env("HERMES_SESSION_PROFILE_NAME", "") or "").strip()
+        except Exception:
+            current = ""
+        if current:
+            return current == self._profile_name
+        return self._profile_name == "default" or self._profile_name == _active_log_profile()
+
+
+def _profile_for_home(home: Path) -> str:
+    """Return a real Hermes profile name, or empty for arbitrary test homes."""
+    if home.parent.name == "profiles":
+        return home.name
+    if home.name == ".hermes":
+        return "default"
+    return ""
+
+
+def _active_log_profile() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return str(get_active_profile_name() or "default")
+    except Exception:
+        return "default"
+
+
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
@@ -208,6 +243,7 @@ def setup_logging(
     """
     global _logging_initialized
     home = hermes_home or get_hermes_home()
+    profile_name = _profile_for_home(home)
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -232,6 +268,7 @@ def setup_logging(
         max_bytes=max_bytes,
         backup_count=backups,
         formatter=RedactingFormatter(_LOG_FORMAT),
+        profile_name=profile_name,
     )
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
@@ -242,6 +279,7 @@ def setup_logging(
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
         formatter=RedactingFormatter(_LOG_FORMAT),
+        profile_name=profile_name,
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
@@ -253,6 +291,7 @@ def setup_logging(
             max_bytes=5 * 1024 * 1024,
             backup_count=3,
             formatter=RedactingFormatter(_LOG_FORMAT),
+        profile_name=profile_name,
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 
@@ -265,6 +304,7 @@ def setup_logging(
             max_bytes=10 * 1024 * 1024,
             backup_count=5,
             formatter=RedactingFormatter(_LOG_FORMAT),
+        profile_name=profile_name,
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
         )
 
@@ -447,6 +487,7 @@ def _add_rotating_handler(
     backup_count: int,
     formatter: logging.Formatter,
     log_filter: Optional[logging.Filter] = None,
+    profile_name: str = "",
 ) -> None:
     """Add a ``RotatingFileHandler`` to *logger*, skipping if one already
     exists for the same resolved file path (idempotent).
@@ -472,6 +513,8 @@ def _add_rotating_handler(
     )
     handler.setLevel(level)
     handler.setFormatter(formatter)
+    if profile_name:
+        handler.addFilter(_ProfileFilter(profile_name))
     if log_filter is not None:
         handler.addFilter(log_filter)
     logger.addHandler(handler)

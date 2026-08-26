@@ -64,6 +64,7 @@ def _make_runner(platform: Platform, config: GatewayConfig):
     adapter = SimpleNamespace(
         send=AsyncMock(),
         send_chat_pairing_request=AsyncMock(return_value=1),
+        send_dm_pairing_request=AsyncMock(return_value=1),
     )
     runner.adapters = {platform: adapter}
     runner.pairing_store = MagicMock()
@@ -451,6 +452,57 @@ def test_telegram_group_pairing_request_detects_attributed_bot_start(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_approved_telegram_group_start_reopens_existing_setup_request(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")}),
+    )
+    runner.pairing_store.is_chat_approved.return_value = True
+    runner.pairing_store.generate_chat_request.return_value = "retry-entry"
+    runner.pairing_store.get_pending_entry.return_value = {
+        "subject_type": "chat",
+        "owner_notified_at": 123.0,
+    }
+    event = MessageEvent(
+        text="/start",
+        message_id="5765",
+        raw_message=SimpleNamespace(
+            text="/start",
+            caption=None,
+            from_user=SimpleNamespace(id=179555559, full_name="Mikhail"),
+        ),
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="179555559",
+            chat_id="-5526305849",
+            chat_name="Худеем с Трипио",
+            user_name="Mikhail",
+            chat_type="group",
+        ),
+    )
+
+    result = await runner._handle_group_pairing_request(
+        event,
+        allow_reconfigure=True,
+    )
+
+    assert result is None
+    runner.pairing_store.generate_chat_request.assert_called_once_with(
+        "telegram",
+        "-5526305849",
+        "Худеем с Трипио",
+        chat_type="group",
+        thread_id="",
+        requester_user_id="179555559",
+        requester_user_name="Mikhail",
+    )
+    adapter.send_chat_pairing_request.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    assert "уже отправлен" in adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_telegram_group_mention_creates_chat_pairing_request(monkeypatch):
     _clear_auth_env(monkeypatch)
     monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1001878443972")
@@ -690,6 +742,95 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
     )
     adapter.send.assert_awaited_once()
     assert "ABC12DEF" in adapter.send.await_args.args[1]
+    adapter.send_dm_pairing_request.assert_awaited_once_with(
+        user_id="15551234567@s.whatsapp.net",
+        user_name="tester",
+        code="ABC12DEF",
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_dm_pairing_notifies_configured_admin(monkeypatch):
+    from gateway.platforms.telegram import TelegramAdapter
+
+    _clear_auth_env(monkeypatch)
+    config = PlatformConfig(
+        enabled=True,
+        token="test-token",
+        extra={"allow_admin_from": ["179555559"]},
+    )
+    adapter = TelegramAdapter(config)
+    adapter._bot = SimpleNamespace(send_message=AsyncMock())
+
+    delivered = await adapter.send_dm_pairing_request(
+        user_id="5103932194",
+        user_name="Akito",
+        code="TESTCODE",
+    )
+
+    assert delivered == 1
+    sent = adapter._bot.send_message.await_args.kwargs
+    assert sent["chat_id"] == 179555559
+    assert "Akito" in sent["text"]
+    assert "5103932194" in sent["text"]
+    assert "TESTCODE" in sent["text"]
+    assert "не одобрен автоматически" in sent["text"]
+
+
+@pytest.mark.asyncio
+async def test_group_pairing_is_profile_owned_but_notified_by_router_adapter(
+    monkeypatch, tmp_path
+):
+    """One Telegram poller must not force routed pairing into default home."""
+    from gateway.pairing import PairingStore
+    from gateway.profile_routing import normalize_profile_routes_config
+    from gateway.run import GatewayRunner
+
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "hudeem-tripio"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr("gateway.run.get_default_hermes_root", lambda: root)
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.pairing_store = PairingStore(hermes_home=root)
+    runner._profile_pairing_stores = {"default": runner.pairing_store}
+    runner._profile_route_config = lambda: normalize_profile_routes_config({
+        "routes": [{
+            "platform": "telegram",
+            "chat_id": "-5526305849",
+            "profile": "hudeem-tripio",
+        }]
+    })
+    adapter = SimpleNamespace(
+        send=AsyncMock(),
+        send_chat_pairing_request=AsyncMock(return_value=1),
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    event = MessageEvent(
+        text="/start",
+        message_id="m-profile-pairing",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="5103932194",
+            chat_id="-5526305849",
+            user_name="Akito",
+            chat_name="Худеем с Трипио",
+            chat_type="group",
+        ),
+    )
+
+    await runner._handle_group_pairing_request(event, allow_reconfigure=True)
+
+    assert runner.pairing_store.list_pending("telegram") == []
+    profile_store = PairingStore(hermes_home=profile_home)
+    pending = profile_store.list_pending("telegram")
+    assert len(pending) == 1
+    assert pending[0]["chat_id"] == "-5526305849"
+    assert pending[0]["requester_user_id"] == "5103932194"
+    adapter.send_chat_pairing_request.assert_awaited_once()
+    assert profile_store.get_pending_entry(
+        "telegram", pending[0]["entry_id"]
+    )["owner_notified_at"] > 0
 
 
 @pytest.mark.asyncio

@@ -20,13 +20,16 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 
 ACTIVE_STATUSES = frozenset({"pending", "running", "resume_pending"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 ATTACHABLE_STATUSES = frozenset({"pending", "running", "resume_pending"})
+TRUSTED_GROUP_CONTEXT_WINDOW_SECONDS = 24 * 60 * 60
 
 
 class DurableJobStore:
@@ -143,6 +146,32 @@ class DurableJobStore:
 
                 CREATE INDEX IF NOT EXISTS idx_gateway_delivery_message
                     ON gateway_job_delivery_messages(message_id, job_id);
+
+                -- Deliberately contains no request/result/source/chat/user data.
+                -- This is the sole cross-profile technical incident boundary.
+                CREATE TABLE IF NOT EXISTS gateway_profile_incidents (
+                    incident_id TEXT PRIMARY KEY,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    source_job_id TEXT NOT NULL,
+                    source_profile TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    component TEXT NOT NULL,
+                    incident_status TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    delivery_status TEXT NOT NULL DEFAULT 'pending',
+                    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    first_attempt_at REAL,
+                    delivered_at REAL,
+                    next_attempt_at REAL,
+                    last_delivery_code TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_profile_incidents_delivery
+                    ON gateway_profile_incidents(delivery_status, next_attempt_at, created_at);
+                CREATE INDEX IF NOT EXISTS idx_profile_incidents_job
+                    ON gateway_profile_incidents(source_job_id, created_at);
                 """
             )
             # Online migration for registries created before semantic job
@@ -159,6 +188,7 @@ class DurableJobStore:
                 "result_input_version": "INTEGER",
                 "routing_summary": "TEXT",
                 "delivery_message_id": "TEXT",
+                "source_profile": "TEXT NOT NULL DEFAULT ''",
             }
             for column, definition in migrations.items():
                 if column not in existing_columns:
@@ -172,6 +202,13 @@ class DurableJobStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_gateway_jobs_thread "
                 "ON gateway_jobs(thread_key, status, updated_at)"
+            )
+            # Safe additive backfill. Unknown legacy rows remain unowned and
+            # therefore cannot be inspected through profile-scoped capabilities.
+            conn.execute(
+                "UPDATE gateway_jobs SET source_profile = "
+                "COALESCE(json_extract(source_json, '$.profile_name'), '') "
+                "WHERE source_profile = '' AND json_valid(source_json)"
             )
             inbox_columns = {
                 str(row[1])
@@ -219,6 +256,14 @@ class DurableJobStore:
             return value if isinstance(value, dict) else {}
         except (TypeError, ValueError, json.JSONDecodeError):
             return {}
+
+    @staticmethod
+    def _profile_from_source_json(source_json: str) -> str:
+        try:
+            value = json.loads(source_json or "{}")
+            return str(value.get("profile_name") or "") if isinstance(value, dict) else ""
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
 
     @staticmethod
     def make_dedupe_key(
@@ -340,6 +385,279 @@ class DurableJobStore:
                     (str(event_id),),
                 ).fetchone()
             )
+
+    def trusted_group_request_history(
+        self,
+        *,
+        job_id: str,
+        window_seconds: float = TRUSTED_GROUP_CONTEXT_WINDOW_SECONDS,
+        limit: int = 80,
+        max_chars: int = 60_000,
+    ) -> list[Dict[str, Any]]:
+        """Return earlier requests from the same trusted Telegram group topic.
+
+        Durable jobs deliberately execute in private branch sessions.  Without
+        this bridge, a new addressed turn can see passive transcript rows but
+        not earlier messages that were themselves routed through another job
+        (including ``response_mode=all`` turns and model-silent group turns).
+
+        The boundary is derived only from gateway-attributed metadata: platform,
+        chat, topic, and profile.  Participant identity is intentionally *not*
+        part of the filter because the main group bot must understand the shared
+        chat.  Personal specialists continue to use
+        :meth:`trusted_participant_request_context`, which remains user-scoped.
+        Every returned row is marked ``observed`` so it provides context without
+        becoming a pending request in the new job.
+        """
+        resolved_job_id = str(job_id or "").strip()
+        if not resolved_job_id:
+            return []
+
+        with self._lock, self._connect() as conn:
+            current = conn.execute(
+                """
+                SELECT job_id, platform, source_json, source_profile, created_at
+                  FROM gateway_jobs
+                 WHERE job_id = ?
+                """,
+                (resolved_job_id,),
+            ).fetchone()
+            if current is None:
+                return []
+
+            current_source = self.source_dict(dict(current))
+            platform = str(current["platform"] or "").strip().lower()
+            chat_id = str(current_source.get("chat_id") or "").strip()
+            chat_type = str(current_source.get("chat_type") or "").strip().lower()
+            thread_id = str(current_source.get("thread_id") or "").strip()
+            profile_name = str(
+                current_source.get("profile_name")
+                or current["source_profile"]
+                or ""
+            ).strip()
+            if (
+                platform != "telegram"
+                or chat_type not in {"group", "forum", "channel"}
+                or not chat_id
+                or not profile_name
+            ):
+                return []
+
+            first_input = conn.execute(
+                """
+                SELECT MIN(inbox.created_at) AS created_at
+                  FROM gateway_job_inputs AS input
+                  JOIN gateway_inbox_events AS inbox
+                    ON inbox.event_id = input.event_id
+                 WHERE input.job_id = ?
+                """,
+                (resolved_job_id,),
+            ).fetchone()
+            context_cutoff = (
+                float(first_input["created_at"])
+                if first_input is not None and first_input["created_at"] is not None
+                else float(current["created_at"])
+            )
+            context_start = context_cutoff - max(0.0, float(window_seconds))
+
+            rows = conn.execute(
+                """
+                SELECT event_id, request_text, request_message_id, message_type,
+                       media_json, source_json, created_at
+                  FROM gateway_inbox_events AS inbox
+                 WHERE inbox.platform = ?
+                   AND json_valid(inbox.source_json)
+                   AND COALESCE(json_extract(inbox.source_json, '$.chat_id'), '') = ?
+                   AND COALESCE(json_extract(inbox.source_json, '$.thread_id'), '') = ?
+                   AND COALESCE(json_extract(inbox.source_json, '$.profile_name'), '') = ?
+                   AND inbox.created_at < ?
+                   AND inbox.created_at >= ?
+                   AND inbox.event_id NOT IN (
+                       SELECT event_id
+                         FROM gateway_job_inputs
+                        WHERE job_id = ?
+                   )
+                 ORDER BY inbox.created_at DESC
+                 LIMIT ?
+                """,
+                (
+                    platform,
+                    chat_id,
+                    thread_id,
+                    profile_name,
+                    context_cutoff,
+                    context_start,
+                    resolved_job_id,
+                    max(1, min(int(limit), 200)),
+                ),
+            ).fetchall()
+
+        history: list[Dict[str, Any]] = []
+        for row in reversed(rows):
+            text = str(row["request_text"] or "").strip()
+            source = self.source_dict(dict(row))
+            user_id = str(source.get("user_id") or "").strip()
+            sender = str(source.get("user_name") or user_id).strip()
+            if user_id:
+                attribution = f"[{sender}|{user_id}]"
+                if not text.startswith(attribution):
+                    text = f"{attribution}\n{text}" if text else attribution
+
+            try:
+                media = json.loads(str(row["media_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                media = []
+            media_lines: list[str] = []
+            if isinstance(media, list):
+                for item in media:
+                    if not isinstance(item, dict):
+                        continue
+                    path = str(item.get("path") or "").strip()
+                    media_type = str(item.get("type") or "").strip().lower()
+                    if not path:
+                        continue
+                    if media_type.startswith("image/"):
+                        marker = f"[User sent an image: {path}]"
+                    elif media_type.startswith("audio/"):
+                        marker = f"[User sent audio: {path}]"
+                    elif media_type.startswith("video/"):
+                        marker = f"[User sent video: {path}]"
+                    else:
+                        marker = f"[User sent a file: {path}]"
+                    if marker not in text and marker not in media_lines:
+                        media_lines.append(marker)
+            if media_lines:
+                text = "\n".join(part for part in (text, *media_lines) if part)
+            if not text:
+                continue
+
+            entry: Dict[str, Any] = {
+                "role": "user",
+                "content": text,
+                "timestamp": datetime.fromtimestamp(
+                    float(row["created_at"]), tz=timezone.utc
+                ).isoformat(),
+                "observed": True,
+            }
+            if row["request_message_id"] is not None:
+                entry["message_id"] = str(row["request_message_id"])
+            history.append(entry)
+
+        selected: list[Dict[str, Any]] = []
+        used_chars = 0
+        char_limit = max(1, int(max_chars))
+        for entry in reversed(history):
+            size = len(str(entry.get("content") or ""))
+            if selected and used_chars + size > char_limit:
+                break
+            selected.append(entry)
+            used_chars += size
+        selected.reverse()
+        return selected
+
+    def trusted_participant_request_context(
+        self,
+        *,
+        job_id: str,
+        platform: str,
+        chat_id: str,
+        user_id: str,
+        profile_name: str,
+        window_seconds: float = 2 * 60 * 60,
+        limit: int = 8,
+        max_chars: int = 12_000,
+    ) -> str:
+        """Return recent inputs from exactly one gateway-attributed participant.
+
+        A group transcript is shared and therefore cannot safely be passed to a
+        personal specialist. The durable inbox has trusted sender attribution,
+        so filtering it by platform/chat/profile/user provides enough context
+        for short follow-ups while preserving the participant boundary.
+        """
+        resolved_job_id = str(job_id or "").strip()
+        resolved_platform = str(platform or "").strip().lower()
+        resolved_chat_id = str(chat_id or "").strip()
+        resolved_user_id = str(user_id or "").strip()
+        resolved_profile = str(profile_name or "").strip()
+        if not all(
+            (
+                resolved_job_id,
+                resolved_platform,
+                resolved_chat_id,
+                resolved_user_id,
+                resolved_profile,
+            )
+        ):
+            return ""
+
+        with self._lock, self._connect() as conn:
+            current = conn.execute(
+                "SELECT created_at FROM gateway_jobs WHERE job_id = ?",
+                (resolved_job_id,),
+            ).fetchone()
+            if current is None:
+                return ""
+            current_created_at = float(current["created_at"])
+            rows = conn.execute(
+                """
+                SELECT request_text, media_json, created_at
+                  FROM gateway_inbox_events
+                 WHERE platform = ?
+                   AND json_valid(source_json)
+                   AND COALESCE(json_extract(source_json, '$.chat_id'), '') = ?
+                   AND COALESCE(json_extract(source_json, '$.user_id'), '') = ?
+                   AND COALESCE(json_extract(source_json, '$.profile_name'), '') = ?
+                   AND created_at <= ?
+                   AND created_at >= ?
+                 ORDER BY created_at DESC
+                 LIMIT ?
+                """,
+                (
+                    resolved_platform,
+                    resolved_chat_id,
+                    resolved_user_id,
+                    resolved_profile,
+                    current_created_at,
+                    current_created_at - max(0.0, float(window_seconds)),
+                    max(1, min(int(limit), 20)),
+                ),
+            ).fetchall()
+
+        entries: list[str] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for row in reversed(rows):
+            request_text = str(row["request_text"] or "").strip()
+            created_at_msk = datetime.fromtimestamp(
+                float(row["created_at"]),
+                tz=timezone.utc,
+            ).astimezone(ZoneInfo("Europe/Moscow"))
+            image_paths: list[str] = []
+            try:
+                media = json.loads(str(row["media_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                media = []
+            if isinstance(media, list):
+                for item in media:
+                    if not isinstance(item, dict):
+                        continue
+                    media_type = str(item.get("type") or "").lower()
+                    path = str(item.get("path") or "").strip()
+                    if media_type.startswith("image/") and path:
+                        image_paths.append(path)
+            signature = (request_text, tuple(image_paths))
+            if signature in seen or (not request_text and not image_paths):
+                continue
+            seen.add(signature)
+            parts = [f"[{created_at_msk:%Y-%m-%d %H:%M:%S} MSK]"]
+            if request_text:
+                parts.append(request_text)
+            parts.extend(f"[Image attached at: {path}]" for path in image_paths)
+            entries.append("\n".join(parts))
+
+        context = "\n\n--- next message from the same participant ---\n\n".join(entries)
+        if len(context) > max_chars:
+            context = context[-max_chars:]
+        return context
 
     def enrich_inbox_event(
         self,
@@ -481,8 +799,8 @@ class DurableJobStore:
                     job_id, dedupe_key, session_key, platform, source_json,
                     request_text, request_message_id, status, created_at,
                     updated_at, thread_key, branch_id, parent_job_id,
-                    input_version, routing_summary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, 1, ?)
+                    input_version, routing_summary, source_profile
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     job_id,
@@ -498,6 +816,7 @@ class DurableJobStore:
                     resolved_branch,
                     parent_job_id,
                     str(routing_summary or inbox["request_text"] or "")[:1000],
+                    self._profile_from_source_json(str(inbox["source_json"] or "")),
                 ),
             )
             conn.execute(
@@ -755,8 +1074,8 @@ class DurableJobStore:
                         job_id, dedupe_key, session_key, platform, source_json,
                         request_text, request_message_id, status, created_at,
                         updated_at, thread_key, branch_id, input_version,
-                        routing_summary
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 1, ?)
+                        routing_summary, source_profile
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 1, ?, ?)
                     """,
                     (
                         job_id,
@@ -771,6 +1090,7 @@ class DurableJobStore:
                         session_key,
                         job_id,
                         str(request_text or "")[:1000],
+                        self._profile_from_source_json(source_json),
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -1109,6 +1429,139 @@ class DurableJobStore:
                  ORDER BY created_at ASC
                 """,
                 (session_key, *tuple(sorted(ACTIVE_STATUSES))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def register_profile_incident(
+        self,
+        *,
+        source_job_id: str,
+        source_profile: str,
+        category: str,
+        component: str,
+        incident_status: str,
+        code: str,
+        origin: str,
+    ) -> tuple[Dict[str, Any], bool]:
+        """Idempotently persist an already-sanitized incident for an owned job."""
+        now = time.time()
+        dedupe = "|".join(
+            (source_job_id, source_profile, category, component, incident_status, code, origin)
+        )
+        incident_id = f"inc_{uuid.uuid4().hex}"
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute(
+                "SELECT source_profile FROM gateway_jobs WHERE job_id = ?",
+                (source_job_id,),
+            ).fetchone()
+            if job is None:
+                raise KeyError("unknown_gateway_job")
+            if not source_profile or str(job["source_profile"] or "") != source_profile:
+                raise PermissionError("gateway_job_profile_mismatch")
+            created = True
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO gateway_profile_incidents(
+                        incident_id, dedupe_key, source_job_id, source_profile,
+                        category, component, incident_status, code, origin,
+                        delivery_status, created_at, updated_at, next_attempt_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        incident_id, dedupe, source_job_id, source_profile,
+                        category, component, incident_status, code, origin,
+                        now, now, now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                created = False
+            row = conn.execute(
+                "SELECT * FROM gateway_profile_incidents WHERE dedupe_key = ?",
+                (dedupe,),
+            ).fetchone()
+        result = self._row(row)
+        if result is None:
+            raise RuntimeError("incident_insert_failed")
+        return result, created
+
+    def claim_profile_incident_delivery(self, incident_id: str) -> Optional[Dict[str, Any]]:
+        """Claim pending/failed or stale in-flight delivery for retry."""
+        now = time.time()
+        stale = now - 300.0
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE gateway_profile_incidents
+                   SET delivery_status = 'delivering',
+                       delivery_attempts = delivery_attempts + 1,
+                       first_attempt_at = COALESCE(first_attempt_at, ?), updated_at = ?
+                 WHERE incident_id = ? AND delivered_at IS NULL
+                   AND (delivery_status IN ('pending', 'failed')
+                        OR (delivery_status = 'delivering' AND updated_at < ?))
+                   AND COALESCE(next_attempt_at, 0) <= ?
+                """,
+                (now, now, incident_id, stale, now),
+            )
+            if cur.rowcount != 1:
+                return None
+            return self._row(conn.execute(
+                "SELECT * FROM gateway_profile_incidents WHERE incident_id = ?",
+                (incident_id,),
+            ).fetchone())
+
+    def finish_profile_incident_delivery(
+        self, incident_id: str, *, success: bool, delivery_code: str
+    ) -> bool:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE gateway_profile_incidents
+                   SET delivery_status = ?, delivered_at = CASE WHEN ? THEN ? ELSE NULL END,
+                       next_attempt_at = CASE WHEN ? THEN NULL
+                           ELSE ? + MIN(3600, 30 * (1 << MIN(delivery_attempts, 7))) END,
+                       last_delivery_code = ?, updated_at = ?
+                 WHERE incident_id = ? AND delivery_status = 'delivering'
+                """,
+                (
+                    "delivered" if success else "failed", 1 if success else 0, now,
+                    1 if success else 0, now, delivery_code, now, incident_id,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def retryable_profile_incidents(self, *, limit: int = 20) -> list[Dict[str, Any]]:
+        now = time.time()
+        stale = now - 300.0
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM gateway_profile_incidents
+                 WHERE delivered_at IS NULL
+                   AND (delivery_status IN ('pending', 'failed')
+                        OR (delivery_status = 'delivering' AND updated_at < ?))
+                   AND COALESCE(next_attempt_at, 0) <= ?
+                 ORDER BY created_at ASC LIMIT ?
+                """,
+                (stale, now, max(1, min(int(limit), 100))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def profile_incidents_for_job(self, source_job_id: str) -> list[Dict[str, Any]]:
+        """Safe lifecycle projection: never selects the gateway job payload."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT incident_id, source_job_id, source_profile, category,
+                       component, incident_status, code, origin, delivery_status,
+                       delivery_attempts, created_at, updated_at, first_attempt_at,
+                       delivered_at, next_attempt_at, last_delivery_code
+                  FROM gateway_profile_incidents
+                 WHERE source_job_id = ? ORDER BY created_at ASC
+                """,
+                (source_job_id,),
             ).fetchall()
             return [dict(row) for row in rows]
 

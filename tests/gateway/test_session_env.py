@@ -50,6 +50,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_JOB_ID", raising=False)
 
     tokens = runner._set_session_env(context, job_id="gw_context_test")
 
@@ -201,6 +202,70 @@ def test_set_session_env_includes_verbatim_user_request_for_tool_provenance():
     assert get_session_env("HERMES_SESSION_USER_REQUEST") == ""
 
 
+def test_set_session_env_includes_only_same_participant_recent_context(tmp_path):
+    from gateway.durable_jobs import DurableJobStore
+
+    runner = object.__new__(GatewayRunner)
+    runner._durable_job_store = DurableJobStore(tmp_path / "jobs.sqlite3")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-5526305849",
+        chat_type="group",
+        user_id="222333444",
+        profile_name="hudeem-tripio",
+    )
+    first, _ = runner._durable_job_store.ingest_event(
+        thread_key="telegram:-5526305849",
+        platform="telegram",
+        source=source,
+        request_text="Овощи 300 г и курица 100 г",
+        message_id="1",
+    )
+    first_job, _ = runner._durable_job_store.create_job_for_event(first["event_id"])
+    other_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-5526305849",
+        chat_type="group",
+        user_id="999888777",
+        profile_name="hudeem-tripio",
+    )
+    other, _ = runner._durable_job_store.ingest_event(
+        thread_key="telegram:-5526305849",
+        platform="telegram",
+        source=other_source,
+        request_text="Мой чужой ужин",
+        message_id="2",
+    )
+    runner._durable_job_store.create_job_for_event(other["event_id"])
+    current, _ = runner._durable_job_store.ingest_event(
+        thread_key="telegram:-5526305849",
+        platform="telegram",
+        source=source,
+        request_text="сейчас",
+        message_id="3",
+    )
+    current_job, _ = runner._durable_job_store.create_job_for_event(
+        current["event_id"]
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    tokens = runner._set_session_env(
+        context,
+        user_request_text="сейчас",
+        job_id=current_job["job_id"],
+    )
+    try:
+        trusted = get_session_env("HERMES_SESSION_PARTICIPANT_REQUEST_CONTEXT")
+    finally:
+        runner._clear_session_env(tokens)
+
+    assert first_job["job_id"]
+    assert " MSK]" in trusted
+    assert "Овощи 300 г и курица 100 г" in trusted
+    assert "сейчас" in trusted
+    assert "Мой чужой ужин" not in trusted
+
+
 def test_shared_group_session_keeps_per_turn_requester_identity():
     runner = object.__new__(GatewayRunner)
     source = SessionSource(
@@ -225,6 +290,24 @@ def test_shared_group_session_keeps_per_turn_requester_identity():
 
     runner._clear_session_env(tokens)
     assert get_session_env("HERMES_SESSION_REQUESTER_USER_ID") == ""
+
+
+def test_override_session_env_restores_parent_memory_scope():
+    from gateway.session_context import override_session_env
+
+    tokens = set_session_vars(memory_scope="shared-chat")
+    try:
+        with override_session_env(
+            "HERMES_SESSION_MEMORY_SCOPE",
+            "hudeem-tripio-user-222333444",
+        ):
+            assert (
+                get_session_env("HERMES_SESSION_MEMORY_SCOPE")
+                == "hudeem-tripio-user-222333444"
+            )
+        assert get_session_env("HERMES_SESSION_MEMORY_SCOPE") == "shared-chat"
+    finally:
+        clear_session_vars(tokens)
 
 
 # ---------------------------------------------------------------------------

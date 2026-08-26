@@ -23,7 +23,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     _thread_metadata_for_source,
 )
-from gateway.session import build_session_key
+from gateway.session import SessionSource, build_session_key
 
 
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
@@ -115,11 +115,24 @@ _fake_telegram_request.HTTPXRequest = object
 @pytest.fixture(autouse=True)
 def _inject_fake_telegram(monkeypatch):
     """Inject fake telegram modules so the adapter can import from them."""
+    monkeypatch.delenv("HERMES_MINIAPP_WEBAPP_URL", raising=False)
+    monkeypatch.delenv("MINIAPP_WEBAPP_URL", raising=False)
     monkeypatch.setitem(sys.modules, "telegram", _fake_telegram)
     monkeypatch.setitem(sys.modules, "telegram.error", _fake_telegram_error)
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+    # The adapter may already be cached because another collected gateway test
+    # imported gateway.run before this fixture. Keep its module-level aliases
+    # deterministic as well as sys.modules.
+    from gateway.platforms import telegram as telegram_mod
+
+    monkeypatch.setattr(telegram_mod, "TELEGRAM_AVAILABLE", True)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardButton", _FakeInlineKeyboardButton)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardMarkup", _FakeInlineKeyboardMarkup)
+    monkeypatch.setattr(telegram_mod, "WebAppInfo", _FakeWebAppInfo)
+    monkeypatch.setattr(telegram_mod, "ParseMode", _fake_telegram_constants.ParseMode)
+    monkeypatch.setattr(telegram_mod, "ChatType", _fake_telegram_constants.ChatType)
 
 
 def _make_adapter():
@@ -514,6 +527,7 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
     from gateway import run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true")
     GatewayRunner = gateway_run.GatewayRunner
 
     class BusyAdapter:
@@ -532,7 +546,7 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
         def get_activity_summary(self):
             return {}
 
-    source = SimpleNamespace(
+    source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="12345",
         chat_type="dm",
@@ -558,6 +572,11 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
     runner._draining = False
     runner._busy_input_mode = "interrupt"
     runner._is_user_authorized = lambda _source: True
+
+    async def no_existing_durable_route(*_args, **_kwargs):
+        return None, False
+
+    runner._ensure_durable_job_route = no_existing_durable_route
 
     assert await runner._handle_active_session_busy_message(event, session_key) is True
 
@@ -1085,6 +1104,7 @@ async def test_slash_confirm_forum_callback_followup_keeps_existing_thread_behav
     adapter = _make_adapter()
     adapter._slash_confirm_state = {"confirm-1": "session-1"}
     adapter._is_callback_user_authorized = lambda *args, **kwargs: True
+    adapter._is_callback_operator = lambda *args, **kwargs: True
     call_log = []
 
     async def mock_send_message(**kwargs):
@@ -1250,6 +1270,36 @@ async def test_send_converts_menu_miniapp_link_to_button():
     assert button.text == "Открыть меню"
     web_app = button.kwargs.get("web_app")
     assert web_app.url == "https://miniapp.mayk05.pro/?startapp=menu"
+
+
+@pytest.mark.asyncio
+async def test_send_converts_wishlist_miniapp_link_to_button(monkeypatch):
+    from gateway.platforms import telegram as telegram_mod
+
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardButton", _FakeInlineKeyboardButton)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardMarkup", _FakeInlineKeyboardMarkup)
+    monkeypatch.setattr(telegram_mod, "WebAppInfo", _FakeWebAppInfo)
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+
+    result = await adapter.send(
+        chat_id="123",
+        content="https://t.me/TripiooBot?startapp=wishlist",
+    )
+
+    assert result.success is True
+    assert call_log[0]["text"].replace("\\.", ".") == "Открой семейные хочухи в миниаппе."
+    button = call_log[0]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Открыть хочухи"
+    web_app = button.kwargs.get("web_app")
+    assert web_app.url.startswith("https://miniapp.mayk05.pro/")
+    assert "startapp=wishlist" in web_app.url
 
 
 @pytest.mark.asyncio
@@ -1424,7 +1474,10 @@ def test_miniapp_data_actions_map_to_app_sections_without_saying_miniapp():
             },
             {
                 "chat_id": -1003966683704,
-                "topics": [{"name": "family-menu", "thread_id": 1636}],
+                "topics": [
+                    {"name": "family-menu", "thread_id": 1636},
+                    {"name": "wishlist-natalia", "thread_id": 7},
+                ],
             },
         ],
     }
@@ -1439,6 +1492,8 @@ def test_miniapp_data_actions_map_to_app_sections_without_saying_miniapp():
         (-1003735932411, 321, "Съел борщ", "nutrition"),
         (-1003966683704, 1636, "Добавь борщ на ужин", "menu"),
         (-1003966683704, 1636, "Добавь молоко в покупки", "shopping"),
+        (-1003966683704, 7, "Добавь это", "wishlist"),
+        (-1003966683704, 359, "Открой наши хочухи", "wishlist"),
     ]
 
     for chat_id, thread_id, text, expected in cases:
@@ -1606,6 +1661,7 @@ async def test_send_never_infers_buttons_from_response_wording():
         ("mcp_health_actions_create_planning_task", "planning"),
         ("mcp_health_actions_add_shopping_items", "shopping"),
         ("mcp_health_actions_replace_menu_entries", "menu"),
+        ("mcp_health_actions_add_wishlist_items", "wishlist"),
     ],
 )
 def test_mutating_miniapp_mcp_tools_map_to_changed_app(tool_name, expected_param):
@@ -1638,6 +1694,7 @@ def test_reads_and_non_miniapp_tools_do_not_map_to_buttons(tool_name):
         ("planning", "Открыть планирование"),
         ("menu", "Открыть меню"),
         ("shopping", "Открыть списки"),
+        ("wishlist", "Открыть хочухи"),
         ("shopping_buy_0JLQsNC-0YHRgtC-0Lk", "Открыть списки"),
         ("shopping_take_0JLQsNC-0YHRgtC-0Lk", "Открыть списки"),
         ("boxmap", "Открыть сценарии"),
@@ -1664,6 +1721,50 @@ def test_shopping_mutation_contract_preserves_case_sensitive_list_target():
 
     assert recorded == start_param
     assert adapter._miniapp_button_label(recorded) == "Открыть списки"
+
+
+def test_percent_encoded_shopping_link_is_repaired_before_send(monkeypatch):
+    from gateway.platforms import telegram as telegram_mod
+
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardButton", _FakeInlineKeyboardButton)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardMarkup", _FakeInlineKeyboardMarkup)
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(username="TripiooBot")
+
+    cleaned, keyboard = adapter._extract_miniapp_buttons_from_content(
+        "Список готов.\n"
+        "https://t.me/TripiooBot?startapp="
+        "shopping_buy_%D0%9E%D1%81%D0%BD%D0%BE%D0%B2%D0%BD%D0%BE%D0%B9",
+    )
+
+    assert cleaned == "Список готов."
+    assert keyboard is not None
+    button = keyboard.inline_keyboard[0][0]
+    assert button.kwargs.get("url") == (
+        "https://t.me/TripiooBot?startapp="
+        "shopping_buy_0J7RgdC90L7QstC90L7QuQ"
+    )
+
+
+def test_nutrition_write_contract_opens_per_user_history():
+    adapter = _make_adapter()
+
+    recorded = adapter.record_miniapp_tool_completion(
+        "-100123",
+        None,
+        "mcp_health_actions_record_nutrition_meal",
+        result={
+            "structuredContent": {
+                "_miniapp": {
+                    "changed": True,
+                    "start_param": "nutrition_history",
+                }
+            }
+        },
+    )
+
+    assert recorded == "nutrition_history"
+    assert adapter._miniapp_button_label(recorded) == "Открыть историю питания"
 
 
 @pytest.mark.asyncio

@@ -296,14 +296,15 @@ async def test_slash_command_denied_in_group_even_for_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_telegram_group_start_is_silent_not_private_chat_denial(monkeypatch):
-    """Telegram /start in an approved group is an onboarding ping, not a command."""
+async def test_telegram_group_start_reopens_onboarding_not_private_chat_denial(monkeypatch):
+    """Telegram /start in an approved group reopens setup, not command dispatch."""
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
     monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
     runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
     runner.session_store.get_or_create_session.side_effect = AssertionError(
         "group /start should not enter session dispatch"
     )
+    runner._handle_group_pairing_request = AsyncMock(return_value=None)
 
     src = _make_source(
         platform=Platform.TELEGRAM,
@@ -314,18 +315,22 @@ async def test_telegram_group_start_is_silent_not_private_chat_denial(monkeypatc
     result = await runner._handle_message(_make_event("/start", src))
 
     assert result is None
-    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+    runner._handle_group_pairing_request.assert_awaited_once()
+    assert runner._handle_group_pairing_request.await_args.kwargs == {
+        "allow_reconfigure": True,
+    }
 
 
 @pytest.mark.asyncio
-async def test_telegram_attributed_group_start_is_silent(monkeypatch):
-    """Mention-style group onboarding pings can arrive after sender attribution."""
+async def test_telegram_attributed_group_start_reopens_onboarding(monkeypatch):
+    """Mention-style group onboarding pings can reopen setup after attribution."""
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
     monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
     runner = _make_runner(platform_extra={}, platform=Platform.TELEGRAM)
     runner.session_store.get_or_create_session.side_effect = AssertionError(
         "attributed group /start should not enter session dispatch"
     )
+    runner._handle_group_pairing_request = AsyncMock(return_value=None)
 
     src = _make_source(
         platform=Platform.TELEGRAM,
@@ -338,7 +343,10 @@ async def test_telegram_attributed_group_start_is_silent(monkeypatch):
     )
 
     assert result is None
-    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+    runner._handle_group_pairing_request.assert_awaited_once()
+    assert runner._handle_group_pairing_request.await_args.kwargs == {
+        "allow_reconfigure": True,
+    }
 
 
 @pytest.mark.asyncio

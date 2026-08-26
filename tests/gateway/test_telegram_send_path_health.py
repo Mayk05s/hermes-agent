@@ -65,6 +65,84 @@ async def test_send_short_circuits_when_path_degraded():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["[[silent]]", "*(silent)*"])
+async def test_send_consumes_silence_controls_fail_closed(content):
+    """Direct/streaming bypasses can never publish a control as text."""
+    adapter = _make_adapter()
+
+    result = await adapter.send("123", content)
+
+    assert result.success is True
+    assert result.message_id is None
+    assert result.raw_response["control_response"] == "silent"
+    assert result.raw_response["delivered"] is False
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_converts_reaction_control_to_native_reaction():
+    adapter = _make_adapter()
+    adapter._bot.set_message_reaction = AsyncMock(return_value=True)
+
+    result = await adapter.send("123", "[[reaction:👍]]", reply_to="456")
+
+    assert result.success is True
+    assert result.message_id is None
+    assert result.raw_response["control_response"] == "reaction"
+    assert result.raw_response["reaction_sent"] is True
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="👍",
+    )
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_strips_inline_reaction_control_before_text_delivery():
+    adapter = _make_adapter()
+    adapter._bot.set_message_reaction = AsyncMock(return_value=True)
+
+    result = await adapter.send(
+        "123",
+        "[[reaction:👍]]\nГотово",
+        reply_to="456",
+    )
+
+    assert result.success is True
+    adapter._bot.set_message_reaction.assert_awaited_once()
+    adapter._bot.send_message.assert_awaited_once()
+    sent_text = adapter._bot.send_message.await_args.kwargs["text"]
+    assert "reaction" not in sent_text
+    assert "Готово" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_degraded_send_drops_control_bearing_text_before_fallback():
+    """A caller must not retry the original raw marker through HTTP fallback."""
+    adapter = _make_adapter()
+    adapter._send_path_degraded = True
+
+    result = await adapter.send("123", "[[reaction:👍]]\nГотово", reply_to="456")
+
+    assert result.success is True
+    assert result.raw_response["control_response"] == "reaction"
+    assert result.raw_response["delivered"] is False
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_preserves_control_marker_mentioned_in_prose():
+    adapter = _make_adapter()
+    text = "Use `[[silent]]` in the protocol documentation."
+
+    result = await adapter.send("123", text)
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_storm_sets_and_heartbeat_clears_flag(monkeypatch):
     """_handle_polling_network_error sets the flag; a successful heartbeat
     probe in _verify_polling_after_reconnect clears it."""

@@ -75,9 +75,13 @@ class _AuthRunner:
 
 
 class _PairingRunner:
-    def __init__(self, resolution=None):
+    def __init__(self, resolution=None, view=None):
         self.config = None
         self.resolve = MagicMock(return_value=resolution)
+        self.configure = MagicMock(return_value=view)
+        self.create_profile = MagicMock(return_value=view)
+        self.restart_pairing = MagicMock(return_value=view)
+        self.card_context = MagicMock(return_value="[target chat context]")
 
     async def _handle_message(self, event):
         return None
@@ -88,6 +92,18 @@ class _PairingRunner:
             action=action,
             approval_scope=approval_scope,
         )
+
+    def _configure_chat_pairing_request(self, entry_id, **kwargs):
+        return self.configure(entry_id, **kwargs)
+
+    def _create_chat_pairing_profile(self, entry_id, **kwargs):
+        return self.create_profile(entry_id, **kwargs)
+
+    def _restart_chat_pairing_request(self, chat_id, **kwargs):
+        return self.restart_pairing(chat_id, **kwargs)
+
+    def _telegram_pairing_card_context(self, chat_id):
+        return self.card_context(chat_id)
 
 
 # ===========================================================================
@@ -320,10 +336,58 @@ class TestTelegramChatPairingPrompt:
             for row in first["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert callbacks == ["pa:t:abc123", "pa:c:abc123", "pa:x:abc123"]
+        assert callbacks == ["pa:s:abc123", "pa:x:abc123"]
+        assert "выберите профиль" in first["text"]
 
 
 class TestTelegramChatPairingCallback:
+    @staticmethod
+    def _record_keyboards(monkeypatch):
+        class RecordingButton:
+            def __init__(self, text, callback_data=None, **kwargs):
+                self.text = text
+                self.callback_data = callback_data
+                self.kwargs = kwargs
+
+        class RecordingMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.InlineKeyboardButton",
+            RecordingButton,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.InlineKeyboardMarkup",
+            RecordingMarkup,
+        )
+
+    @staticmethod
+    def _view(profile: str = ""):
+        return {
+            "request_entry_id": "abc123",
+            "request": {
+                "subject_type": "chat",
+                "chat_id": "-100555",
+                "chat_name": "Research Group",
+                "thread_id": "35",
+                "setup": {
+                    "approval_scope": "chat",
+                    "profile": profile,
+                    "settings": {},
+                },
+            },
+            "setup": {
+                "approval_scope": "chat",
+                "profile": profile,
+                "settings": {},
+            },
+            "profiles": [
+                {"name": "default", "token": "defaulttoken"},
+                {"name": "personal", "token": "personaltoken"},
+            ],
+        }
+
     @staticmethod
     def _query(data: str, user_id: int = 111):
         query = AsyncMock()
@@ -341,23 +405,179 @@ class TestTelegramChatPairingCallback:
         return query
 
     @pytest.mark.asyncio
-    async def test_owner_approves_whole_chat(self, monkeypatch):
+    async def test_setup_opens_profile_selection_instead_of_approving(self, monkeypatch):
+        self._record_keyboards(monkeypatch)
         adapter = _make_adapter()
-        runner = _PairingRunner(resolution={"status": "approved"})
+        runner = _PairingRunner(view=self._view())
         adapter._message_handler = runner._handle_message
-        query = self._query("pa:c:abc123")
+        query = self._query("pa:s:abc123")
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        runner.configure.assert_called_once_with("abc123")
+        runner.resolve.assert_not_called()
+        assert "Шаг 1 из 2" in query.edit_message_text.await_args.kwargs["text"]
+        callbacks = [
+            button.callback_data
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        assert "pa:n:abc123" in callbacks
+
+    @pytest.mark.asyncio
+    async def test_create_new_opens_profile_type_choice(self, monkeypatch):
+        self._record_keyboards(monkeypatch)
+        adapter = _make_adapter()
+        runner = _PairingRunner(view=self._view())
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:n:abc123")
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        text = query.edit_message_text.await_args.kwargs["text"]
+        assert "Создать новый профиль" in text
+        callbacks = [
+            button.callback_data
+            for row in query.edit_message_text.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            for button in row
+        ]
+        assert "pa:f:abc123:fresh" in callbacks
+        assert "pa:f:abc123:clone" in callbacks
+
+    @pytest.mark.asyncio
+    async def test_profile_type_choice_requests_name_with_force_reply(self, monkeypatch):
+        adapter = _make_adapter()
+        runner = _PairingRunner(view=self._view())
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:f:abc123:clone")
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        adapter._bot.send_message.assert_awaited_once()
+        prompt = adapter._bot.send_message.await_args.kwargs
+        assert "Создание профиля для Telegram-чата" in prompt["text"]
+        assert "Режим: <code>clone_default</code>" in prompt["text"]
+        assert prompt["reply_markup"] is not None
+        assert "ответьте" in query.edit_message_text.await_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_profile_name_reply_creates_and_selects_profile(self, monkeypatch):
+        adapter = _make_adapter()
+        view = self._view(profile="tripio-health")
+        runner = _PairingRunner(view=view)
+        adapter._message_handler = runner._handle_message
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+        message = SimpleNamespace(
+            text="Tripio-Health",
+            message_id=91,
+            chat=SimpleNamespace(id=111, type="private"),
+            from_user=SimpleNamespace(id=111, first_name="Mikhail"),
+            reply_to_message=SimpleNamespace(
+                text=(
+                    "➕ Создание профиля для Telegram-чата\n\n"
+                    "Запрос: abc123abc123abcd\n"
+                    "Режим: fresh"
+                ),
+                caption=None,
+            ),
+        )
+
+        handled = await adapter._handle_pairing_profile_name_reply(message)
+
+        assert handled is True
+        runner.create_profile.assert_called_once_with(
+            "abc123abc123abcd",
+            profile_name="Tripio-Health",
+            clone_from_default=False,
+        )
+        response = adapter._bot.send_message.await_args.kwargs
+        assert "Профиль <code>tripio-health</code> создан" in response["text"]
+        assert "Шаг 2 из 2" in response["text"]
+
+    @pytest.mark.asyncio
+    async def test_profile_selection_opens_settings(self, monkeypatch):
+        adapter = _make_adapter()
+        runner = _PairingRunner(view=self._view(profile="personal"))
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:p:abc123:personaltoken")
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        runner.configure.assert_called_once_with(
+            "abc123",
+            profile_token="personaltoken",
+        )
+        assert "Шаг 2 из 2" in query.edit_message_text.await_args.kwargs["text"]
+        assert "personal" in query.edit_message_text.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_final_confirmation_approves_selected_profile(self, monkeypatch):
+        adapter = _make_adapter()
+        resolution = {
+            "status": "approved",
+            "profile": "personal",
+            "settings": {"response_mode": "mentions"},
+            "request": self._view(profile="personal")["request"],
+        }
+        runner = _PairingRunner(resolution=resolution, view=self._view(profile="personal"))
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:a:abc123")
         update = MagicMock(callback_query=query)
         monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
 
         await adapter._handle_callback_query(update, MagicMock())
 
         runner.resolve.assert_called_once_with(
-            "abc123",
-            action="approve",
-            approval_scope="chat",
+            "abc123", action="approve", approval_scope="chat"
         )
-        assert "одобрен" in query.answer.await_args.kwargs["text"].lower()
-        query.edit_message_text.assert_awaited_once()
+        assert "Доступ настроен" in query.edit_message_text.await_args.kwargs["text"]
+        assert "personal" in query.edit_message_text.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_reject_card_offers_owner_retry(self, monkeypatch):
+        self._record_keyboards(monkeypatch)
+        adapter = _make_adapter()
+        resolution = {
+            "status": "rejected",
+            "request": self._view()["request"],
+        }
+        runner = _PairingRunner(resolution=resolution)
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:x:abc123")
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+        assert markup.inline_keyboard[0][0].callback_data == "pa:u:-100555:35"
+        assert "Начать заново" in markup.inline_keyboard[0][0].text
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_reopens_profile_step(self, monkeypatch):
+        adapter = _make_adapter()
+        runner = _PairingRunner(view=self._view())
+        adapter._message_handler = runner._handle_message
+        query = self._query("pa:u:-100555:35")
+        update = MagicMock(callback_query=query)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        runner.restart_pairing.assert_called_once_with("-100555", thread_id="35")
+        assert "Шаг 1 из 2" in query.edit_message_text.await_args.kwargs["text"]
 
     @pytest.mark.asyncio
     async def test_non_owner_cannot_reject_request(self, monkeypatch):
@@ -373,6 +593,28 @@ class TestTelegramChatPairingCallback:
         runner.resolve.assert_not_called()
         assert "только владелец" in query.answer.await_args.kwargs["text"].lower()
         query.edit_message_text.assert_not_awaited()
+
+    def test_reply_to_access_card_attaches_exact_target_context(self):
+        adapter = _make_adapter()
+        runner = _PairingRunner()
+        adapter._message_handler = runner._handle_message
+        message = SimpleNamespace(
+            reply_to_message=SimpleNamespace(
+                text=(
+                    "🔐 Запрос доступа к новому чату\n\n"
+                    "Чат: Research Group\n"
+                    "ID: -100555\n"
+                    "Тип: group"
+                ),
+                caption=None,
+            )
+        )
+        event = SimpleNamespace(channel_context=None)
+
+        adapter._attach_pairing_card_reply_context(message, event)
+
+        runner.card_context.assert_called_once_with("-100555")
+        assert event.channel_context == "[target chat context]"
 # _handle_callback_query — approval button clicks
 # ===========================================================================
 

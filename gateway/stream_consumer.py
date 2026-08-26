@@ -22,11 +22,14 @@ import queue
 import re
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
+from gateway.platforms.base import extract_agent_reaction_control
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+from gateway.platforms.base import parse_agent_control_response
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -168,6 +171,10 @@ class GatewayStreamConsumer:
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
         self._think_buffer = ""
+        # Streaming sees raw model deltas before BasePlatformAdapter's normal
+        # final-response control parser.  Remember controls already applied so
+        # repeated edit frames do not set the same Telegram reaction again.
+        self._applied_agent_controls: set[tuple[str, str]] = set()
 
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
@@ -693,12 +700,110 @@ class GatewayStreamConsumer:
         # Strip trailing whitespace/newlines but preserve leading content
         return cleaned.rstrip()
 
+    @staticmethod
+    def _looks_like_partial_agent_control(text: str) -> bool:
+        """True while a streamed line is still forming a reserved marker.
+
+        Without this holdback, a small first delta such as ``[[sil`` can be
+        posted before the model completes it as ``[[silent]]``.  Match only a
+        whole response or trailing line, so prose and code that merely mention
+        the marker remain visible.
+        """
+        candidate = str(text or "").strip()
+        if not candidate:
+            return False
+        if candidate == "[[":
+            return True
+        if not candidate.startswith(("[[", "[")):
+            return False
+
+        opening_len = 2 if candidate.startswith("[[") else 1
+        body = candidate[opening_len:].strip().casefold()
+        if not body:
+            return opening_len == 2
+        # A closing bracket followed by anything else is ordinary prose, not
+        # a control frame. Completed valid markers are handled by the parser.
+        if "]" in body and not body.endswith("]"):
+            return False
+        body = body.rstrip("]").strip()
+        compact = re.sub(r"[\s_-]+", "", body)
+        if not compact:
+            return opening_len == 2
+        if ":" in compact:
+            name, payload = compact.split(":", 1)
+            return name in {"react", "reaction"} and len(payload) <= 32
+        names = ("silent", "silence", "noresponse", "noreply", "react", "reaction")
+        return any(name.startswith(compact) for name in names)
+
+    @classmethod
+    def _strip_partial_agent_control_tail(cls, text: str) -> tuple[str, bool]:
+        """Hold back an incomplete control marker at start or after newline."""
+        raw = str(text or "")
+        if cls._looks_like_partial_agent_control(raw):
+            return "", True
+        newline = raw.rfind("\n")
+        if newline >= 0 and cls._looks_like_partial_agent_control(raw[newline + 1:]):
+            return raw[:newline].rstrip(), True
+        return raw, False
+
+    async def _normalize_agent_controls_for_display(self, text: str) -> tuple[str, bool]:
+        """Consume model control markers before any streaming transport call.
+
+        Returns ``(visible_text, control_only)``.  Telegram gets the same native
+        reaction behavior as the non-streaming final-response path; other
+        adapters quietly consume controls via their base implementation.
+        """
+        raw = str(text or "")
+        cursor = self.cfg.cursor or ""
+        has_cursor = bool(cursor and raw.endswith(cursor))
+        candidate = raw[:-len(cursor)] if has_cursor else raw
+
+        reaction, remaining, _bare = extract_agent_reaction_control(candidate)
+        control = reaction or parse_agent_control_response(
+            candidate,
+            include_legacy_silence=True,
+        )
+        if control is not None:
+            signature = (str(control.action), str(control.emoji or ""))
+            if signature not in self._applied_agent_controls:
+                handler = getattr(self.adapter, "handle_agent_control_response", None)
+                if callable(handler):
+                    event = SimpleNamespace(
+                        source=SimpleNamespace(chat_id=self.chat_id),
+                        message_id=self._initial_reply_to_id,
+                    )
+                    try:
+                        await handler(event, control)
+                    except Exception:
+                        logger.warning(
+                            "Stream control response failed closed (%s, chat=%s)",
+                            control.action,
+                            self.chat_id,
+                            exc_info=True,
+                        )
+                self._applied_agent_controls.add(signature)
+
+            visible = remaining if reaction is not None else ""
+            if visible and has_cursor:
+                visible += cursor
+            return visible, not bool(visible.strip())
+
+        visible, held_back = self._strip_partial_agent_control_tail(candidate)
+        if held_back:
+            if visible and has_cursor:
+                visible += cursor
+            return visible, not bool(visible.strip())
+        return raw, False
+
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
         Returns the message_id so callers can thread subsequent chunks.
         """
         text = self._clean_for_display(text)
+        text, control_only = await self._normalize_agent_controls_for_display(text)
+        if control_only:
+            return reply_to_id
         if not text.strip():
             return reply_to_id
         try:
@@ -765,6 +870,13 @@ class GatewayStreamConsumer:
         Retries each chunk once on flood-control failures with a short delay.
         """
         final_text = self._clean_for_display(text)
+        final_text, control_only = await self._normalize_agent_controls_for_display(final_text)
+        if control_only:
+            self._already_sent = True
+            self._final_response_sent = True
+            self._final_content_delivered = True
+            self._fallback_final_send = False
+            return
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
         if not continuation.strip():
@@ -999,6 +1111,9 @@ class GatewayStreamConsumer:
         if visible and tail.startswith(visible):
             tail = tail[len(visible):].lstrip()
         tail = self._clean_for_display(tail)
+        tail, control_only = await self._normalize_agent_controls_for_display(tail)
+        if control_only:
+            return
         if not tail.strip():
             return
         try:
@@ -1035,6 +1150,9 @@ class GatewayStreamConsumer:
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
         text = self._clean_for_display(text)
+        text, control_only = await self._normalize_agent_controls_for_display(text)
+        if control_only:
+            return True
         if not text.strip():
             return False
         try:
@@ -1158,6 +1276,11 @@ class GatewayStreamConsumer:
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
         text = self._clean_for_display(text)
+        text, control_only = await self._normalize_agent_controls_for_display(text)
+        if control_only:
+            # A successfully consumed silent/reaction control is the complete
+            # turn result even though no ordinary message bubble was created.
+            return True
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text

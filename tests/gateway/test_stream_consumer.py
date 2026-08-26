@@ -84,6 +84,133 @@ class TestCleanForDisplay:
         # But "media:" is lowercase so won't match either
         assert result == text
 
+    @pytest.mark.parametrize(
+        "value",
+        ["[[", "[[s", "[[silent", "[[reaction:", "[[reaction:👍", "[react:👍"],
+    )
+    def test_partial_agent_control_is_held_back(self, value):
+        assert GatewayStreamConsumer._looks_like_partial_agent_control(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        ["[shopping item]", "Use [[silent]] in documentation", "ordinary text"],
+    )
+    def test_normal_text_is_not_control_prefix(self, value):
+        assert GatewayStreamConsumer._looks_like_partial_agent_control(value) is False
+
+
+class TestStreamingAgentControls:
+    @staticmethod
+    def _consumer(cursor="▉"):
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = False
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="m1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="m1")
+        )
+        adapter.handle_agent_control_response = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id=None)
+        )
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="123",
+            config=StreamConsumerConfig(cursor=cursor),
+            initial_reply_to_id="456",
+        )
+        return consumer, adapter
+
+    @pytest.mark.asyncio
+    async def test_full_stream_holds_partial_then_consumes_silent_marker(self):
+        consumer, adapter = self._consumer()
+        consumer.cfg.edit_interval = 0
+        consumer.cfg.buffer_threshold = 1
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("[[si")
+        await asyncio.sleep(0.01)
+        consumer.on_delta("lent]]")
+        consumer.finish()
+        await task
+
+        assert consumer.final_response_sent is True
+        assert consumer.final_content_delivered is True
+        adapter.send.assert_not_awaited()
+        adapter.edit_message.assert_not_awaited()
+        assert adapter.handle_agent_control_response.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_silent_marker_never_reaches_stream_send(self):
+        consumer, adapter = self._consumer()
+
+        result = await consumer._send_or_edit(
+            "[[silent]]",
+            finalize=True,
+            is_turn_final=True,
+        )
+
+        assert result is True
+        adapter.send.assert_not_awaited()
+        adapter.edit_message.assert_not_awaited()
+        control = adapter.handle_agent_control_response.await_args.args[1]
+        assert control.action == "silent"
+
+    @pytest.mark.asyncio
+    async def test_partial_silent_marker_never_reaches_stream_send(self):
+        consumer, adapter = self._consumer()
+
+        result = await consumer._send_or_edit("[[sil▉")
+
+        assert result is True
+        adapter.send.assert_not_awaited()
+        adapter.handle_agent_control_response.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reaction_marker_is_native_and_only_text_is_streamed(self):
+        consumer, adapter = self._consumer(cursor="")
+
+        result = await consumer._send_or_edit(
+            "[[reaction:👍]]\nГотово",
+            finalize=True,
+            is_turn_final=True,
+        )
+
+        assert result is True
+        control = adapter.handle_agent_control_response.await_args.args[1]
+        assert control.action == "reaction"
+        assert control.emoji == "👍"
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["content"] == "Готово"
+
+    @pytest.mark.asyncio
+    async def test_reaction_suffix_is_removed_before_stream_edit(self):
+        consumer, adapter = self._consumer(cursor="")
+        consumer._message_id = "m1"
+
+        result = await consumer._send_or_edit(
+            "Готово\n[[reaction:👍]]",
+            finalize=True,
+            is_turn_final=True,
+        )
+
+        assert result is True
+        control = adapter.handle_agent_control_response.await_args.args[1]
+        assert control.action == "reaction"
+        assert adapter.edit_message.await_args.kwargs["content"] == "Готово"
+
+    @pytest.mark.asyncio
+    async def test_marker_mentioned_in_prose_remains_visible(self):
+        consumer, adapter = self._consumer(cursor="")
+        text = "Use `[[silent]]` in the protocol documentation."
+
+        result = await consumer._send_or_edit(text)
+
+        assert result is True
+        adapter.handle_agent_control_response.assert_not_awaited()
+        assert adapter.send.await_args.kwargs["content"] == text
+
 
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 
@@ -1907,4 +2034,3 @@ class TestUtf16OverflowDetection:
         # auto-attr mock. Verified indirectly by all the other tests in
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
-

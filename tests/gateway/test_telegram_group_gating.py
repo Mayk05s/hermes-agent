@@ -235,6 +235,50 @@ def test_observed_group_context_does_not_require_chat_allowlists(monkeypatch):
     assert adapter._should_observe_unmentioned_group_message(_group_message("side chatter")) is True
 
 
+def test_participant_isolated_chat_disables_passive_context_and_routes_sender(monkeypatch):
+    import dataclasses
+
+    class Runner:
+        def _source_with_profile_scope(self, source):
+            return dataclasses.replace(
+                source,
+                profile_name="hudeem-tripio",
+                scope_name=f"hudeem-tripio-user-{source.user_id}",
+                memory_scope=f"hudeem-tripio-user-{source.user_id}",
+                participant_isolation=True,
+            )
+
+        async def _handle_message(self, event):
+            return None
+
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    adapter._message_handler = Runner()._handle_message
+
+    settings = {
+        "participant_isolation": "on",
+        "observe_unmentioned": "off",
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_telegram_chat_setting_for_chat",
+        lambda _chat_id, key: settings.get(key, "default"),
+    )
+
+    message = _group_message("@hermes_bot hello", from_user_id=222)
+    event = adapter._build_message_event(message, MessageType.TEXT, update_id=1008)
+    routed = adapter._apply_telegram_group_observe_attribution(event)
+
+    assert adapter._should_observe_unmentioned_group_message(_group_message("side chatter")) is False
+    assert routed.source.user_id == "222"
+    assert routed.source.participant_isolation is True
+    assert routed.source.scope_name == "hudeem-tripio-user-222"
+
+
 def test_allowed_topics_still_limit_observed_group_context(monkeypatch):
     monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
     adapter = _make_adapter(
@@ -341,7 +385,8 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
 
     assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
     assert "[Observed Telegram group context - context only, not requests]" in api_message
-    assert "[Current addressed message - answer only this" in api_message
+    assert "[Current addressed message - answer this message" in api_message
+    assert "resolve references and the ongoing conversation" in api_message
     assert "Acha que dá fazer estoque?" in api_message
     assert "Tem lote e vencimento" in api_message
     assert api_message.endswith("[Bob|222]\ncambio")
@@ -1779,6 +1824,15 @@ def test_boxmap_miniapp_scenario_request_sends_button_without_agent():
 
 def test_boxmap_link_complaint_reply_sends_scenario_button_without_agent():
     async def _run():
+        class _Button:
+            def __init__(self, text, **kwargs):
+                self.text = text
+                self.kwargs = kwargs
+
+        class _Markup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
         adapter = _make_adapter(require_mention=False)
         adapter._command_surface_profile_for_message = Mock(return_value="boxmap")
         adapter._ensure_forum_commands = AsyncMock()
@@ -1792,7 +1846,11 @@ def test_boxmap_link_complaint_reply_sends_scenario_button_without_agent():
             effective_message=None,
         )
 
-        await adapter._handle_text_message(update, SimpleNamespace())
+        with (
+            patch("gateway.platforms.telegram.InlineKeyboardButton", _Button),
+            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _Markup),
+        ):
+            await adapter._handle_text_message(update, SimpleNamespace())
 
         adapter._enqueue_text_event.assert_not_called()
         adapter._bot.send_message.assert_awaited_once()

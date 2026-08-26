@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ import re
 import ssl
 import time
 from email.utils import formatdate
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_to_bytes, urlencode, urlsplit, urlunsplit
 
 from agent.redact import redact_sensitive_text
 
@@ -78,6 +79,11 @@ _MINIAPP_START_LINK_RE = re.compile(
     r"(?P<url>https://t\.me/(?P<bot>[A-Za-z0-9_]{3,32})\?startapp=(?P<param>[A-Za-z0-9_-]+))",
     re.IGNORECASE,
 )
+_LEGACY_SHOPPING_START_LINK_RE = re.compile(
+    r"https://t\.me/(?P<bot>[A-Za-z0-9_]{3,32})\?startapp="
+    r"shopping_(?P<item_type>buy|take)_(?P<encoded>(?:%[0-9A-Fa-f]{2})+)",
+    re.IGNORECASE,
+)
 _SUPPORTED_INLINE_MINIAPP_PARAMS: tuple[str, ...] = (
     "health",
     "fitness",
@@ -130,6 +136,51 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _canonical_target(target: str) -> str:
+    """Canonical form used by the active profile's outbound allowlist."""
+    platform, separator, recipient = str(target or "").strip().partition(":")
+    platform = platform.strip().lower()
+    if not separator:
+        return platform
+    return f"{platform}:{recipient.strip()}"
+
+
+def _configured_allowed_targets() -> set[str] | None:
+    """Read ``messaging.allowed_targets`` from the active profile config.
+
+    Absence preserves the historical policy. Invalid/unreadable policy fails
+    closed, because a profile restriction must never silently disappear.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception as exc:
+        logger.warning(
+            "Could not load outbound messaging policy: %s",
+            _sanitize_error_text(exc),
+        )
+        return set()
+    messaging = config.get("messaging")
+    if not isinstance(messaging, dict) or "allowed_targets" not in messaging:
+        return None
+    raw = messaging.get("allowed_targets")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list):
+        return set()
+    return {
+        canonical
+        for item in raw
+        if (canonical := _canonical_target(str(item)))
+    }
+
+
+def _target_allowed(target: str) -> bool:
+    allowed = _configured_allowed_targets()
+    return allowed is None or _canonical_target(target) in allowed
 
 
 def _same_telegram_chat_delivery_error(
@@ -282,6 +333,26 @@ def _miniapp_label_key(start_param: str) -> str | None:
     return None
 
 
+def _normalize_legacy_shopping_start_links(content: str) -> str:
+    """Convert percent-encoded shopping targets to Mini App base64url."""
+
+    def _replace(match: re.Match) -> str:
+        generic_url = f"https://t.me/{match.group('bot')}?startapp=shopping"
+        try:
+            list_name = unquote_to_bytes(match.group("encoded")).decode("utf-8").strip()
+        except (UnicodeDecodeError, ValueError):
+            return generic_url
+        if not list_name:
+            return generic_url
+        encoded_name = base64.urlsafe_b64encode(list_name.encode("utf-8")).decode("ascii").rstrip("=")
+        start_param = f"shopping_{match.group('item_type').lower()}_{encoded_name}"
+        if len(start_param) > 64:
+            return generic_url
+        return f"https://t.me/{match.group('bot')}?startapp={start_param}"
+
+    return _LEGACY_SHOPPING_START_LINK_RE.sub(_replace, content or "")
+
+
 def _miniapp_shortcut_text(start_param: str) -> str:
     label_key = _miniapp_label_key(start_param) or ""
     if label_key == "planning" or label_key in {"todo", "tasks"}:
@@ -369,6 +440,7 @@ def _extract_telegram_miniapp_button_spec(
     bot_username: str | None = None,
     use_web_app: bool = False,
 ) -> tuple[str, list[list[dict[str, str]]]]:
+    content = _normalize_legacy_shopping_start_links(content)
     buttons: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     allowed_bots = _miniapp_allowed_bot_usernames(bot_username)
@@ -513,6 +585,10 @@ def send_message_tool(args, **kw):
 
 def _handle_list():
     """Return formatted list of available messaging targets."""
+    allowed = _configured_allowed_targets()
+    if allowed is not None:
+        # A restricted profile must not see the gateway-wide directory.
+        return json.dumps({"targets": sorted(allowed)})
     try:
         from gateway.channel_directory import format_directory_for_display
         return json.dumps({"targets": format_directory_for_display()})
@@ -526,6 +602,8 @@ def _handle_send(args):
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+    if not _target_allowed(target):
+        return json.dumps(_error("Outbound target is not allowed by this profile"))
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()

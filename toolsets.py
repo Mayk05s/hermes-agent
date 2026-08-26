@@ -56,6 +56,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # Gateway-native incident boundary (runtime job/profile attributed).
+    "report_gateway_incident", "lookup_gateway_incident",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
     # External Google Workspace agent provider (dev/staging only, gated)

@@ -36,6 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
@@ -82,6 +83,21 @@ _SESSION_TOPIC_ISOLATION: ContextVar = ContextVar("HERMES_SESSION_TOPIC_ISOLATIO
 # use this as provenance for actions that must only happen on an explicit
 # request (for example, sending a message outside the originating chat).
 _SESSION_USER_REQUEST: ContextVar = ContextVar("HERMES_SESSION_USER_REQUEST", default=_UNSET)
+# Recent requests captured by the gateway from the same verified participant in
+# the same chat. This is intentionally separate from the shared transcript and
+# model-authored delegation context, so an isolated specialist can understand a
+# short follow-up without seeing another participant's messages.
+_SESSION_PARTICIPANT_REQUEST_CONTEXT: ContextVar = ContextVar(
+    "HERMES_SESSION_PARTICIPANT_REQUEST_CONTEXT",
+    default=_UNSET,
+)
+# Trusted per-turn gate set by the gateway when Telegram speech-to-text contains
+# a high-impact ambiguity. Health mutating tools fail closed until the user
+# confirms or corrects the interpretation in a later message.
+_SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED: ContextVar = ContextVar(
+    "HERMES_SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED",
+    default=_UNSET,
+)
 # Stable execution identity for the current durable gateway job. This is
 # runtime metadata, not prompt text, so tools can checkpoint against it without
 # teaching the model to manufacture or reinterpret IDs.
@@ -111,6 +127,8 @@ _VAR_MAP = {
     "HERMES_SESSION_MEMORY_SCOPE": _SESSION_MEMORY_SCOPE,
     "HERMES_SESSION_TOPIC_ISOLATION": _SESSION_TOPIC_ISOLATION,
     "HERMES_SESSION_USER_REQUEST": _SESSION_USER_REQUEST,
+    "HERMES_SESSION_PARTICIPANT_REQUEST_CONTEXT": _SESSION_PARTICIPANT_REQUEST_CONTEXT,
+    "HERMES_SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED": _SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED,
     "HERMES_JOB_ID": _JOB_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
@@ -133,6 +151,24 @@ def set_current_session_id(session_id: str) -> None:
     _SESSION_ID.set(session_id)
 
 
+@contextmanager
+def override_session_env(name: str, value: str):
+    """Temporarily override one trusted session ContextVar.
+
+    Delegated specialists run in worker threads.  This narrow helper lets the
+    runtime replace only their memory scope while preserving the parent turn's
+    verified Telegram requester and all other routing metadata.
+    """
+    var = _VAR_MAP.get(name)
+    if var is None:
+        raise KeyError(f"Unknown session variable: {name}")
+    token = var.set(str(value or ""))
+    try:
+        yield
+    finally:
+        var.reset(token)
+
+
 def set_session_vars(
     platform: str = "",
     chat_id: str = "",
@@ -150,6 +186,8 @@ def set_session_vars(
     memory_scope: str = "",
     topic_isolation: str = "",
     user_request: str = "",
+    participant_request_context: str = "",
+    health_voice_confirmation_required: str = "",
     job_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
@@ -177,6 +215,10 @@ def set_session_vars(
         _SESSION_MEMORY_SCOPE.set(memory_scope),
         _SESSION_TOPIC_ISOLATION.set(topic_isolation),
         _SESSION_USER_REQUEST.set(user_request),
+        _SESSION_PARTICIPANT_REQUEST_CONTEXT.set(participant_request_context),
+        _SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED.set(
+            health_voice_confirmation_required
+        ),
         _JOB_ID.set(job_id),
     ]
     return tokens
@@ -210,6 +252,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MEMORY_SCOPE,
         _SESSION_TOPIC_ISOLATION,
         _SESSION_USER_REQUEST,
+        _SESSION_PARTICIPANT_REQUEST_CONTEXT,
+        _SESSION_HEALTH_VOICE_CONFIRMATION_REQUIRED,
         _JOB_ID,
     ):
         var.set("")

@@ -4,7 +4,8 @@ import json
 import os
 import sys
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -590,6 +591,122 @@ class TestCodeExpiry:
 
 
 class TestChatPairing:
+    def test_runner_owner_retry_recreates_pending_draft_without_cooldown(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.list_approved.return_value = [{
+            "chat_id": "-100123",
+            "chat_name": "Research Group",
+            "chat_type": "group",
+            "thread_id": "",
+            "requester_user_id": "111",
+            "requester_user_name": "Alice",
+        }]
+        runner.pairing_store.generate_chat_request.return_value = "new-entry"
+        runner._configure_chat_pairing_request = MagicMock(return_value={"request_entry_id": "new-entry"})
+
+        view = runner._restart_chat_pairing_request("-100123")
+
+        assert view == {"request_entry_id": "new-entry"}
+        runner.pairing_store.generate_chat_request.assert_called_once_with(
+            "telegram",
+            "-100123",
+            "Research Group",
+            chat_type="group",
+            thread_id="",
+            requester_user_id="111",
+            requester_user_name="Alice",
+            bypass_rate_limit=True,
+        )
+
+    def test_runner_creates_and_selects_new_profile_for_pending_chat(self, tmp_path):
+        from gateway.run import GatewayRunner
+        from hermes_cli import profiles as profiles_mod
+
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            entry_id = store.generate_chat_request(
+                "telegram",
+                "-100123",
+                "Research Group",
+            )
+            runner = GatewayRunner.__new__(GatewayRunner)
+            runner.pairing_store = store
+
+            with (
+                patch.object(
+                    profiles_mod,
+                    "normalize_profile_name",
+                    side_effect=lambda value: str(value).strip().lower(),
+                ),
+                patch.object(profiles_mod, "validate_profile_name"),
+                patch.object(profiles_mod, "profile_exists", return_value=False),
+                patch.object(
+                    profiles_mod,
+                    "create_profile",
+                    return_value=tmp_path / "profiles" / "tripio-health",
+                ) as create_profile,
+                patch.object(profiles_mod, "seed_profile_skills") as seed_skills,
+                patch.object(profiles_mod, "check_alias_collision", return_value=None),
+                patch.object(profiles_mod, "create_wrapper_script") as create_wrapper,
+                patch.object(
+                    profiles_mod,
+                    "list_profiles",
+                    return_value=[
+                        SimpleNamespace(name="default"),
+                        SimpleNamespace(name="tripio-health"),
+                    ],
+                ),
+            ):
+                view = runner._create_chat_pairing_profile(
+                    entry_id,
+                    profile_name="Tripio-Health",
+                    clone_from_default=False,
+                )
+
+            assert view["setup"]["profile"] == "tripio-health"
+            create_profile.assert_called_once_with(
+                name="tripio-health",
+                clone_from=None,
+                clone_config=False,
+                no_skills=False,
+            )
+            seed_skills.assert_called_once()
+            create_wrapper.assert_called_once_with("tripio-health")
+            assert (
+                store.get_pending_entry("telegram", entry_id)["setup"]["profile"]
+                == "tripio-health"
+            )
+
+    def test_chat_request_setup_persists_profile_scope_and_settings(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            entry_id = store.generate_chat_request(
+                "telegram",
+                "-100123",
+                "Research Forum",
+                thread_id="35",
+            )
+
+            updated = store.update_chat_request_setup(
+                "telegram",
+                entry_id,
+                approval_scope="topic",
+                profile="personal",
+                settings_patch={
+                    "response_mode": "mentions",
+                    "audio_trigger": "off",
+                },
+            )
+
+            assert updated["setup"]["approval_scope"] == "topic"
+            assert updated["setup"]["profile"] == "personal"
+            assert updated["setup"]["settings"]["response_mode"] == "mentions"
+            assert updated["setup"]["settings"]["audio_trigger"] == "off"
+            assert store.get_pending_entry("telegram", entry_id)["setup"] == updated["setup"]
+
     def test_generate_chat_request_and_approve_entry(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()
@@ -640,6 +757,28 @@ class TestChatPairing:
             assert store.reject_entry("telegram", entry_id) is False
             assert store.is_chat_approved("telegram", "-100123") is False
             assert store.list_pending("telegram") == []
+
+    def test_owner_retry_can_bypass_chat_request_cooldown(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            first = store.generate_chat_request("telegram", "-100123", "Research Group")
+            assert first
+            assert store.reject_entry("telegram", first) is True
+
+            assert store.generate_chat_request(
+                "telegram",
+                "-100123",
+                "Research Group",
+            ) is None
+            retried = store.generate_chat_request(
+                "telegram",
+                "-100123",
+                "Research Group",
+                bypass_rate_limit=True,
+            )
+
+            assert retried
+            assert retried != first
 
 
 class TestRevoke:

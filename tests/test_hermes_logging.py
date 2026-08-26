@@ -227,6 +227,28 @@ class TestSetupLogging:
         ]
         assert agent_handlers[0].level == logging.WARNING
 
+    def test_profile_specific_handlers_do_not_cross_write(self, tmp_path):
+        from gateway.session_context import override_session_env
+
+        personal = tmp_path / "profiles" / "personal"
+        hudeem = tmp_path / "profiles" / "hudeem-tripio"
+        hermes_logging.setup_logging(hermes_home=personal)
+        hermes_logging.setup_logging(hermes_home=hudeem)
+        logger = logging.getLogger("test.profile.isolation")
+        with override_session_env("HERMES_SESSION_PROFILE_NAME", "personal"):
+            logger.info("PERSONAL_ONLY_RECORD")
+        with override_session_env("HERMES_SESSION_PROFILE_NAME", "hudeem-tripio"):
+            logger.info("HUDEEM_ONLY_RECORD")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        personal_text = (personal / "logs" / "agent.log").read_text()
+        hudeem_text = (hudeem / "logs" / "agent.log").read_text()
+        assert "PERSONAL_ONLY_RECORD" in personal_text
+        assert "PERSONAL_ONLY_RECORD" not in hudeem_text
+        assert "HUDEEM_ONLY_RECORD" in hudeem_text
+        assert "HUDEEM_ONLY_RECORD" not in personal_text
+
     def test_record_factory_installed(self, hermes_home):
         """The custom record factory injects session_tag on all records."""
         hermes_logging.setup_logging(hermes_home=hermes_home)

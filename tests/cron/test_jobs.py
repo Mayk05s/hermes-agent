@@ -715,6 +715,31 @@ class TestGetDueJobs:
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert next_dt > _hermes_now()
 
+    def test_stale_delivery_retry_resumes_cached_slot_by_default(self, tmp_cron_dir):
+        job = create_job(prompt="Retry cached payload", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["state"] = "delivery_retry"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+
+        assert [item["id"] for item in due] == [job["id"]]
+        assert due[0].get("_stale_slot_expired") is not True
+
+    def test_stale_delivery_retry_can_expire_without_late_send(self, tmp_cron_dir):
+        job = create_job(prompt="Expire coaching payload", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["state"] = "delivery_retry"
+        jobs[0]["stale_slot_policy"] = "expire"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+
+        assert [item["id"] for item in due] == [job["id"]]
+        assert due[0]["_stale_slot_expired"] is True
+
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")
         due = get_due_jobs()
