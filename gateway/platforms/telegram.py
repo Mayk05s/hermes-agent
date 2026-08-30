@@ -388,8 +388,8 @@ _MINIAPP_BUTTON_LABELS: dict[str, str] = {
     "recipes": "Открыть блюда",
     "shopping": "Открыть списки",
     "groceries": "Открыть списки",
-    "shopping_buy": "Открыть списки",
-    "shopping_take": "Открыть списки",
+    "shopping_buy": "Открыть список",
+    "shopping_take": "Открыть список",
     "wishlist": "Открыть хочухи",
     "wishes": "Открыть хочухи",
     "social": "Открыть публикации",
@@ -7627,7 +7627,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         _depth: int = 0,
     ) -> tuple[bool, list[str]]:
-        """Read the fail-closed Mini App mutation marker from a tool result."""
+        """Read the fail-closed Mini App action marker from a tool result."""
         if _depth > 5 or result is None:
             return False, []
 
@@ -7660,7 +7660,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         marker = result.get("_miniapp")
         if isinstance(marker, dict):
-            changed = marker.get("changed") is True
+            should_attach = (
+                marker.get("changed") is True
+                or marker.get("open") is True
+            )
             raw_params = marker.get("start_params")
             if raw_params is None:
                 raw_params = [marker.get("start_param")]
@@ -7672,7 +7675,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     for param in raw_params
                     if str(param or "").strip()
                 ]
-                if changed
+                if should_attach
                 else []
             )
             return True, list(dict.fromkeys(params))
@@ -7708,7 +7711,7 @@ class TelegramAdapter(BasePlatformAdapter):
         is_error: bool = False,
         result: Any = None,
     ) -> Optional[str]:
-        """Queue a button only for a successful Mini App MCP mutation."""
+        """Queue a button only for an explicit successful Mini App MCP action."""
         if is_error:
             return None
 

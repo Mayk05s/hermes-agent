@@ -1695,8 +1695,8 @@ def test_reads_and_non_miniapp_tools_do_not_map_to_buttons(tool_name):
         ("menu", "Открыть меню"),
         ("shopping", "Открыть списки"),
         ("wishlist", "Открыть хочухи"),
-        ("shopping_buy_0JLQsNC-0YHRgtC-0Lk", "Открыть списки"),
-        ("shopping_take_0JLQsNC-0YHRgtC-0Lk", "Открыть списки"),
+        ("shopping_buy_0JLQsNC-0YHRgtC-0Lk", "Открыть список"),
+        ("shopping_take_0JLQsNC-0YHRgtC-0Lk", "Открыть список"),
         ("boxmap", "Открыть сценарии"),
         ("social", "Открыть публикации"),
     ],
@@ -1720,7 +1720,48 @@ def test_shopping_mutation_contract_preserves_case_sensitive_list_target():
     )
 
     assert recorded == start_param
-    assert adapter._miniapp_button_label(recorded) == "Открыть списки"
+    assert adapter._miniapp_button_label(recorded) == "Открыть список"
+
+
+@pytest.mark.asyncio
+async def test_shopping_read_open_contract_attaches_exact_list_button():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=100)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message, username="TripiooBot")
+    adapter.begin_miniapp_turn("-1003966683704", "576")
+    recorded = adapter.record_miniapp_tool_completion(
+        "-1003966683704",
+        "576",
+        "mcp_health_actions_list_shopping_items",
+        result={
+            "structuredContent": {
+                "_miniapp": {
+                    "changed": False,
+                    "open": True,
+                    "start_param": "shopping_buy_i151",
+                }
+            }
+        },
+    )
+
+    result = await adapter.send(
+        chat_id="-1003966683704",
+        content="Последний список — «Продукты».",
+        metadata={"thread_id": "576", "hermes_turn_final": True},
+    )
+
+    assert recorded == "shopping_buy_i151"
+    assert result.success is True
+    button = call_log[0]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Открыть список"
+    assert button.kwargs["url"] == (
+        "https://t.me/TripiooBot?startapp=shopping_buy_i151"
+    )
 
 
 def test_percent_encoded_shopping_link_is_repaired_before_send(monkeypatch):

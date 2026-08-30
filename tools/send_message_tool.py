@@ -119,8 +119,8 @@ _MINIAPP_BUTTON_LABELS: dict[str, str] = {
     "tasks": "Открыть задачи",
     "shopping": "Открыть списки",
     "groceries": "Открыть списки",
-    "shopping_buy": "Открыть списки",
-    "shopping_take": "Открыть списки",
+    "shopping_buy": "Открыть список",
+    "shopping_take": "Открыть список",
 }
 _MINIAPP_WEBAPP_BASE_URL = "https://miniapp.mayk05.pro/"
 
