@@ -1,32 +1,40 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
+  ArrowDown,
+  ArrowUp,
   Brain,
   ChevronDown,
   Cpu,
   DollarSign,
   Eye,
+  KeyRound,
+  Plus,
   RefreshCw,
   Settings2,
   Star,
+  Trash2,
   Wrench,
   X,
   Zap,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
+  AuxiliaryFallbackEntry,
   AuxiliaryModelsResponse,
   AuxiliaryTaskAssignment,
+  ModelPricingInfo,
   ModelsAnalyticsModelEntry,
   ModelsAnalyticsResponse,
 } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import { timeAgo, cn, themedBody } from "@/lib/utils";
 import { formatTokenCount } from "@/lib/format";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Stats } from "@nous-research/ui/ui/components/stats";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
 import { Badge } from "@nous-research/ui/ui/components/badge";
-import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
@@ -44,11 +52,15 @@ const AUX_TASKS: readonly { key: string; label: string; hint: string }[] = [
   { key: "vision", label: "Vision", hint: "Image analysis" },
   { key: "web_extract", label: "Web Extract", hint: "Page summarization" },
   { key: "compression", label: "Compression", hint: "Context compaction" },
-  { key: "session_search", label: "Session Search", hint: "Recall queries" },
   { key: "skills_hub", label: "Skills Hub", hint: "Skill search" },
   { key: "approval", label: "Approval", hint: "Smart auto-approve" },
   { key: "mcp", label: "MCP", hint: "MCP tool routing" },
   { key: "title_generation", label: "Title Gen", hint: "Session titles" },
+  { key: "triage_specifier", label: "Triage Specifier", hint: "Kanban spec fleshing" },
+  { key: "kanban_decomposer", label: "Kanban Decomposer", hint: "Task decomposition" },
+  { key: "profile_describer", label: "Profile Describer", hint: "Auto profile descriptions" },
+  { key: "mempalace_extractor", label: "MemPalace Extractor", hint: "Graph memory extraction" },
+  { key: "mempalace_validator", label: "MemPalace Validator", hint: "Graph validation and cleanup" },
   { key: "curator", label: "Curator", hint: "Skill-usage review" },
 ] as const;
 
@@ -123,7 +135,7 @@ function TokenBar({
       </div>
 
       {/* Legend */}
-      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-text-secondary">
         {segments.map((s, i) => (
           <span key={i} className="flex items-center gap-1">
             <span className={`inline-block h-1.5 w-1.5 rounded-full ${s.dotColor}`} />
@@ -150,22 +162,22 @@ function CapabilityBadges({
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {capabilities.supports_tools && (
-        <span className="inline-flex items-center gap-1 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+        <span className="inline-flex items-center gap-1 bg-emerald-500/10 px-1.5 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
           <Wrench className="h-2.5 w-2.5" /> Tools
         </span>
       )}
       {capabilities.supports_vision && (
-        <span className="inline-flex items-center gap-1 bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
+        <span className="inline-flex items-center gap-1 bg-blue-500/10 px-1.5 py-0.5 text-xs font-medium text-blue-600 dark:text-blue-400">
           <Eye className="h-2.5 w-2.5" /> Vision
         </span>
       )}
       {capabilities.supports_reasoning && (
-        <span className="inline-flex items-center gap-1 bg-purple-500/10 px-1.5 py-0.5 text-[10px] font-medium text-purple-600 dark:text-purple-400">
+        <span className="inline-flex items-center gap-1 bg-purple-500/10 px-1.5 py-0.5 text-xs font-medium text-purple-600 dark:text-purple-400">
           <Brain className="h-2.5 w-2.5" /> Reasoning
         </span>
       )}
       {capabilities.model_family && (
-        <span className="inline-flex items-center bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+        <span className="inline-flex items-center bg-muted px-1.5 py-0.5 text-xs font-medium text-text-secondary">
           {capabilities.model_family}
         </span>
       )}
@@ -235,7 +247,7 @@ function UseAsMenu({
         outlined
         onClick={() => setOpen((v) => !v)}
         disabled={busy}
-        className="text-[10px] h-6 px-2"
+        className="h-6 px-2 text-xs uppercase"
         prefix={busy ? <Spinner /> : null}
       >
         Use as <ChevronDown className="h-3 w-3" />
@@ -246,20 +258,20 @@ function UseAsMenu({
             type="button"
             onClick={() => assign("main", "")}
             disabled={busy}
-            className="flex w-full items-center justify-between px-3 py-2 text-xs hover:bg-muted/50 disabled:opacity-40"
+            className="flex w-full items-center justify-between px-3 py-2 text-xs uppercase hover:bg-muted/50 disabled:opacity-40"
           >
             <span className="flex items-center gap-2">
               <Star className="h-3 w-3" />
               Main model
             </span>
             {isMain && (
-              <span className="text-[9px] uppercase tracking-wider text-primary/80">
+              <span className="text-display text-xs tracking-wider text-primary">
                 current
               </span>
             )}
           </button>
 
-          <div className="border-t border-border/50 px-3 py-1.5 text-[9px] uppercase tracking-wider text-muted-foreground">
+          <div className="border-t border-border/50 px-3 py-1.5 text-display text-xs tracking-wider text-text-tertiary">
             Auxiliary task
           </div>
 
@@ -267,7 +279,7 @@ function UseAsMenu({
             type="button"
             onClick={() => assign("auxiliary", "")}
             disabled={busy}
-            className="flex w-full items-center justify-between px-3 py-1.5 text-xs hover:bg-muted/50 disabled:opacity-40"
+            className="flex w-full items-center justify-between px-3 py-1.5 text-xs uppercase hover:bg-muted/50 disabled:opacity-40"
           >
             <span>All auxiliary tasks</span>
           </button>
@@ -278,11 +290,11 @@ function UseAsMenu({
               type="button"
               onClick={() => assign("auxiliary", t.key)}
               disabled={busy}
-              className="flex w-full items-center justify-between px-3 py-1.5 text-xs hover:bg-muted/50 disabled:opacity-40"
+              className="flex w-full items-center justify-between px-3 py-1.5 text-xs uppercase hover:bg-muted/50 disabled:opacity-40"
             >
               <span>{t.label}</span>
               {mainAuxTask === t.key && (
-                <span className="text-[9px] uppercase tracking-wider text-primary/80">
+                <span className="text-display text-xs tracking-wider text-primary">
                   current
                 </span>
               )}
@@ -290,7 +302,7 @@ function UseAsMenu({
           ))}
 
           {error && (
-            <div className="px-3 py-2 text-[10px] text-destructive border-t border-border/50">
+            <div className="px-3 py-2 text-xs text-destructive border-t border-border/50">
               {error}
             </div>
           )}
@@ -343,36 +355,36 @@ function ModelCard({
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <span className="text-muted-foreground/50 text-xs font-mono">
+              <span className="text-text-tertiary text-xs font-mono">
                 #{rank}
               </span>
               <CardTitle className="text-sm font-mono-ui truncate">
                 {shortModelName(entry.model)}
               </CardTitle>
               {isMain && (
-                <span className="inline-flex items-center gap-0.5 bg-primary/15 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-primary">
+                <span className="inline-flex items-center gap-0.5 bg-primary/15 px-1.5 py-0.5 text-display text-xs font-medium tracking-wider text-primary">
                   <Star className="h-2.5 w-2.5" /> main
                 </span>
               )}
               {mainAuxTask && (
-                <span className="inline-flex items-center bg-purple-500/10 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-purple-600 dark:text-purple-400">
+                <span className="inline-flex items-center bg-purple-500/10 px-1.5 py-0.5 text-display text-xs font-medium tracking-wider text-purple-600 dark:text-purple-400">
                   aux · {mainAuxTask}
                 </span>
               )}
             </div>
             <div className="flex items-center gap-2 mt-1">
               {provider && (
-                <Badge tone="secondary" className="text-[9px]">
+                <Badge tone="secondary" className="text-xs">
                   {provider}
                 </Badge>
               )}
               {caps.context_window && caps.context_window > 0 && (
-                <span className="text-[10px] text-muted-foreground">
+                <span className="text-xs text-text-secondary">
                   {formatTokenCount(caps.context_window)} ctx
                 </span>
               )}
               {caps.max_output_tokens && caps.max_output_tokens > 0 && (
-                <span className="text-[10px] text-muted-foreground">
+                <span className="text-xs text-text-secondary">
                   {formatTokenCount(caps.max_output_tokens)} out
                 </span>
               )}
@@ -384,7 +396,7 @@ function ModelCard({
                 <div className="text-xs font-mono font-semibold">
                   {formatTokens(totalTokens)}
                 </div>
-                <div className="text-[10px] text-muted-foreground">
+                <div className="text-xs text-text-tertiary">
                   {t.models.tokens}
                 </div>
               </div>
@@ -394,7 +406,7 @@ function ModelCard({
                   <div className="text-xs font-mono font-semibold">
                     {entry.sessions}
                   </div>
-                  <div className="text-[10px] text-muted-foreground">
+                  <div className="text-xs text-text-tertiary">
                     {t.models.sessions}
                   </div>
                 </div>
@@ -423,7 +435,7 @@ function ModelCard({
             <div className="grid grid-cols-3 gap-2 text-xs">
               <div className="text-center">
                 <div className="font-mono font-semibold">{entry.sessions}</div>
-                <div className="text-[10px] text-muted-foreground">
+                <div className="text-xs text-text-tertiary">
                   {t.models.sessions}
                 </div>
               </div>
@@ -431,7 +443,7 @@ function ModelCard({
                 <div className="font-mono font-semibold">
                   {formatTokens(entry.avg_tokens_per_session)}
                 </div>
-                <div className="text-[10px] text-muted-foreground">
+                <div className="text-xs text-text-tertiary">
                   {t.models.avgPerSession}
                 </div>
               </div>
@@ -439,7 +451,7 @@ function ModelCard({
                 <div className="font-mono font-semibold">
                   {entry.api_calls > 0 ? formatTokens(entry.api_calls) : "—"}
                 </div>
-                <div className="text-[10px] text-muted-foreground">
+                <div className="text-xs text-text-tertiary">
                   {t.models.apiCalls}
                 </div>
               </div>
@@ -447,7 +459,7 @@ function ModelCard({
           </>
         )}
 
-        <div className="flex items-center justify-between text-[10px] text-muted-foreground border-t border-border/30 pt-2">
+        <div className="flex items-center justify-between text-xs text-text-secondary border-t border-border/30 pt-2">
           <div className="flex items-center gap-3">
             {showTokens && entry.estimated_cost > 0 && (
               <span className="flex items-center gap-0.5">
@@ -479,7 +491,30 @@ function ModelCard({
 
 type PickerTarget =
   | { kind: "main" }
-  | { kind: "aux"; task: string };
+  | { kind: "aux"; task: string }
+  | { kind: "fallback"; task: string };
+
+function pricingLabel(pricing?: ModelPricingInfo): string {
+  if (!pricing) return "price unknown";
+  if (pricing.label) return pricing.label;
+  if (pricing.included) return "included";
+  if (pricing.free) return "free";
+  if (pricing.input || pricing.output) {
+    return `${pricing.input || "?"} in / ${pricing.output || "?"} out`;
+  }
+  return "price unknown";
+}
+
+function modelRouteLabel(entry: {
+  provider?: string;
+  model?: string;
+  pricing?: ModelPricingInfo;
+}): string {
+  const provider = entry.provider || "auto";
+  const model = entry.model || (provider === "auto" ? "main model" : "(provider default)");
+  const price = pricingLabel(entry.pricing);
+  return price ? `${provider} · ${model} · ${price}` : `${provider} · ${model}`;
+}
 
 function AuxiliaryTasksModal({
   aux,
@@ -494,6 +529,8 @@ function AuxiliaryTasksModal({
 }) {
   const [picker, setPicker] = useState<PickerTarget | null>(null);
   const [resetBusy, setResetBusy] = useState(false);
+  const [chainBusy, setChainBusy] = useState<string | null>(null);
+  const [chainError, setChainError] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const modalRef = useModalBehavior({ open: true, onClose });
 
@@ -513,6 +550,46 @@ function AuxiliaryTasksModal({
     }
   };
 
+  const saveFallbackChain = async (
+    task: string,
+    fallbackChain: AuxiliaryFallbackEntry[],
+  ) => {
+    setChainBusy(task);
+    setChainError(null);
+    try {
+      await api.setAuxiliaryFallbackChain({
+        task,
+        fallback_chain: fallbackChain,
+      });
+      onSaved();
+    } catch (e) {
+      setChainError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChainBusy(null);
+    }
+  };
+
+  const moveFallback = (
+    task: string,
+    chain: AuxiliaryFallbackEntry[],
+    index: number,
+    direction: -1 | 1,
+  ) => {
+    const target = index + direction;
+    if (target < 0 || target >= chain.length) return;
+    const next = [...chain];
+    [next[index], next[target]] = [next[target], next[index]];
+    void saveFallbackChain(task, next);
+  };
+
+  const removeFallback = (
+    task: string,
+    chain: AuxiliaryFallbackEntry[],
+    index: number,
+  ) => {
+    void saveFallbackChain(task, chain.filter((_, i) => i !== index));
+  };
+
   return (
     <div
       ref={modalRef}
@@ -522,7 +599,7 @@ function AuxiliaryTasksModal({
       aria-modal="true"
       aria-labelledby="aux-modal-title"
     >
-      <div className="relative w-full max-w-2xl max-h-[80vh] border border-border bg-card shadow-2xl flex flex-col">
+      <div className={cn(themedBody, "relative w-full max-w-2xl max-h-[80vh] border border-border bg-card shadow-2xl flex flex-col")}>
         <Button
           ghost
           size="icon"
@@ -537,7 +614,7 @@ function AuxiliaryTasksModal({
           <div className="flex items-center justify-between gap-3 pr-8">
             <h2
               id="aux-modal-title"
-              className="font-display text-base tracking-wider uppercase"
+              className="font-mondwest text-display text-base tracking-wider"
             >
               Auxiliary Tasks
             </h2>
@@ -546,13 +623,13 @@ function AuxiliaryTasksModal({
               outlined
               onClick={() => setConfirmReset(true)}
               disabled={resetBusy}
-              className="text-[10px] h-6"
+              className="h-6 text-xs uppercase"
               prefix={resetBusy ? <Spinner /> : null}
             >
               Reset all to auto
             </Button>
           </div>
-          <p className="text-[10px] text-muted-foreground/80 mt-2">
+          <p className="text-xs text-text-secondary mt-2">
             Auxiliary tasks handle side-jobs like vision, session search, and
             compression. <span className="font-mono">auto</span> means
             &quot;use the main model&quot;. Override per-task when you want a
@@ -560,59 +637,151 @@ function AuxiliaryTasksModal({
           </p>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-5 space-y-1">
+        <div className="flex-1 overflow-y-auto p-5 space-y-2">
+          {chainError && (
+            <div className="border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {chainError}
+            </div>
+          )}
           {AUX_TASKS.map((t) => {
             const cur = aux?.tasks.find((a) => a.task === t.key);
             const isAuto =
               !cur || cur.provider === "auto" || !cur.provider;
+            const fallbackChain = cur?.fallback_chain ?? [];
+            const busy = chainBusy === t.key;
             return (
               <div
                 key={t.key}
-                className="flex items-center justify-between gap-3 px-3 py-2 border border-border/30 bg-card/50 hover:bg-muted/20 transition-colors"
+                className="border border-border/30 bg-card/50 px-3 py-2 transition-colors hover:bg-muted/20"
               >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2">
-                    <span className="text-xs font-medium">{t.label}</span>
-                    <span className="text-[10px] text-muted-foreground/60">
-                      {t.hint}
-                    </span>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-xs font-medium">{t.label}</span>
+                      <span className="text-xs text-text-tertiary">
+                        {t.hint}
+                      </span>
+                    </div>
+                    <div className="text-xs font-mono text-text-secondary truncate">
+                      {isAuto
+                        ? "auto (use main model)"
+                        : modelRouteLabel(cur ?? {})}
+                    </div>
                   </div>
-                  <div className="text-[10px] font-mono text-muted-foreground truncate">
-                    {isAuto
-                      ? "auto (use main model)"
-                      : `${cur?.provider} · ${cur?.model || "(provider default)"}`}
-                  </div>
+                  <Button
+                    size="sm"
+                    outlined
+                    onClick={() => setPicker({ kind: "aux", task: t.key })}
+                    className="h-6 shrink-0 text-xs uppercase"
+                  >
+                    Change
+                  </Button>
                 </div>
-                <Button
-                  size="sm"
-                  outlined
-                  onClick={() => setPicker({ kind: "aux", task: t.key })}
-                  className="text-[10px] h-6"
-                >
-                  Change
-                </Button>
+                <div className="mt-2 border-t border-border/30 pt-2">
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <span className="text-display text-xs font-medium tracking-wider text-text-tertiary">
+                      Fallback order
+                    </span>
+                    <Button
+                      size="sm"
+                      outlined
+                      onClick={() => setPicker({ kind: "fallback", task: t.key })}
+                      disabled={busy}
+                      className="h-6 text-xs uppercase"
+                      prefix={busy ? <Spinner /> : <Plus className="h-3 w-3" />}
+                    >
+                      Add
+                    </Button>
+                  </div>
+                  {fallbackChain.length === 0 ? (
+                    <div className="text-xs text-text-tertiary">
+                      no fallback models
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      {fallbackChain.map((entry, index) => (
+                        <div
+                          key={`${entry.provider}:${entry.model}:${index}`}
+                          className="flex min-w-0 items-center gap-2 border border-border/20 bg-background/30 px-2 py-1"
+                        >
+                          <span className="shrink-0 text-xs text-text-tertiary">
+                            {index + 1}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate text-xs font-mono text-text-secondary">
+                            {modelRouteLabel(entry)}
+                          </span>
+                          <Button
+                            ghost
+                            size="icon"
+                            title="Move fallback up"
+                            aria-label="Move fallback up"
+                            disabled={busy || index === 0}
+                            onClick={() => moveFallback(t.key, fallbackChain, index, -1)}
+                            className="h-6 w-6 shrink-0"
+                          >
+                            <ArrowUp className="h-3 w-3" />
+                          </Button>
+                          <Button
+                            ghost
+                            size="icon"
+                            title="Move fallback down"
+                            aria-label="Move fallback down"
+                            disabled={busy || index === fallbackChain.length - 1}
+                            onClick={() => moveFallback(t.key, fallbackChain, index, 1)}
+                            className="h-6 w-6 shrink-0"
+                          >
+                            <ArrowDown className="h-3 w-3" />
+                          </Button>
+                          <Button
+                            ghost
+                            size="icon"
+                            title="Remove fallback"
+                            aria-label="Remove fallback"
+                            disabled={busy}
+                            onClick={() => removeFallback(t.key, fallbackChain, index)}
+                            className="h-6 w-6 shrink-0 text-destructive"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             );
           })}
         </div>
 
-        {picker && picker.kind === "aux" && (
+        {picker && (picker.kind === "aux" || picker.kind === "fallback") && (
           <ModelPickerDialog
             key={`picker-${refreshKey}`}
             loader={api.getModelOptions}
             alwaysGlobal
-            title={`Set Auxiliary: ${
+            title={`${picker.kind === "fallback" ? "Add Fallback" : "Set Auxiliary"}: ${
               AUX_TASKS.find((t) => t.key === picker.task)?.label ??
               picker.task
             }`}
             onApply={async ({ provider, model }) => {
-              await api.setModelAssignment({
-                scope: "auxiliary",
-                task: picker.task,
-                provider,
-                model,
-              });
-              onSaved();
+              if (picker.kind === "fallback") {
+                const cur = aux?.tasks.find((a) => a.task === picker.task);
+                await api.setAuxiliaryFallbackChain({
+                  task: picker.task,
+                  fallback_chain: [
+                    ...(cur?.fallback_chain ?? []),
+                    { provider, model, base_url: "" },
+                  ],
+                });
+                onSaved();
+              } else {
+                await api.setModelAssignment({
+                  scope: "auxiliary",
+                  task: picker.task,
+                  provider,
+                  model,
+                });
+                onSaved();
+              }
             }}
             onClose={() => setPicker(null)}
           />
@@ -673,9 +842,16 @@ function ModelSettingsPanel({
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
           <Settings2 className="h-4 w-4 shrink-0 text-muted-foreground" />
           <CardTitle className="text-sm">Model Settings</CardTitle>
-          <span className="max-w-full min-w-0 text-[10px] text-muted-foreground [overflow-wrap:anywhere]">
+          <span className="max-w-full min-w-0 text-xs text-text-secondary [overflow-wrap:anywhere]">
             applies to new sessions
           </span>
+          <Link
+            to="/env#section-providers"
+            className="ml-auto inline-flex shrink-0 items-center gap-1 border border-border/60 px-2 py-1 text-xs text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
+          >
+            <KeyRound className="h-3 w-3" />
+            Available providers
+          </Link>
         </div>
       </CardHeader>
 
@@ -685,20 +861,18 @@ function ModelSettingsPanel({
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 mb-0.5">
               <Star className="h-3 w-3 text-primary" />
-              <span className="text-xs font-medium uppercase tracking-wider">
+              <span className="text-display text-xs font-medium tracking-wider">
                 Main model
               </span>
             </div>
-            <div className="text-xs font-mono text-muted-foreground truncate">
-              {mainProv || "(unset)"}
-              {mainProv && mainModel && " · "}
-              {mainModel || "(unset)"}
+            <div className="text-xs font-mono text-text-secondary truncate">
+              {modelRouteLabel(aux?.main ?? { provider: mainProv, model: mainModel })}
             </div>
           </div>
           <Button
             size="sm"
             onClick={() => setPicker({ kind: "main" })}
-            className="shrink-0 self-start text-xs sm:self-center"
+            className="shrink-0 self-start text-xs uppercase sm:self-center"
           >
             Change
           </Button>
@@ -708,12 +882,12 @@ function ModelSettingsPanel({
         <div className="flex min-w-0 flex-col gap-2 bg-muted/20 border border-border/50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 mb-0.5">
-              <Cpu className="h-3 w-3 text-muted-foreground" />
-              <span className="text-xs font-medium uppercase tracking-wider">
+              <Cpu className="h-3 w-3 text-text-tertiary" />
+              <span className="text-display text-xs font-medium tracking-wider">
                 Auxiliary tasks
               </span>
             </div>
-            <div className="text-xs font-mono text-muted-foreground truncate">
+            <div className="text-xs font-mono text-text-secondary truncate">
               {auxOverrideCount > 0
                 ? `${auxOverrideCount} override${auxOverrideCount > 1 ? "s" : ""} · ${AUX_TASKS.length - auxOverrideCount} auto`
                 : `${AUX_TASKS.length} tasks · all auto`}
@@ -723,7 +897,7 @@ function ModelSettingsPanel({
             size="sm"
             outlined
             onClick={() => setAuxModalOpen(true)}
-            className="shrink-0 self-start text-xs sm:self-center"
+            className="shrink-0 self-start text-xs uppercase sm:self-center"
           >
             Configure
           </Button>
@@ -819,11 +993,21 @@ export default function ModelsPage() {
     const periodLabel =
       PERIODS.find((p) => p.days === days)?.label ?? `${days}d`;
     setAfterTitle(
-      <span className="flex items-center gap-2">
-        {loading && <Spinner className="shrink-0 text-base text-primary" />}
-        <Badge tone="secondary" className="text-[10px]">
+      <span className="flex items-center gap-1.5">
+        <Badge tone="secondary" className="text-xs">
           {periodLabel}
         </Badge>
+        <Button
+          type="button"
+          ghost
+          size="icon"
+          className="text-muted-foreground hover:text-foreground"
+          onClick={load}
+          disabled={loading}
+          aria-label={t.common.refresh}
+        >
+          {loading ? <Spinner /> : <RefreshCw />}
+        </Button>
       </span>,
     );
     setEnd(
@@ -836,21 +1020,12 @@ export default function ModelsPage() {
               size="sm"
               outlined={days !== p.days}
               onClick={() => setDays(p.days)}
+              className="uppercase"
             >
               {p.label}
             </Button>
           ))}
         </div>
-        <Button
-          type="button"
-          size="sm"
-          outlined
-          onClick={load}
-          disabled={loading}
-          prefix={loading ? <Spinner /> : <RefreshCw />}
-        >
-          {t.common.refresh}
-        </Button>
       </div>,
     );
     return () => {
@@ -924,7 +1099,7 @@ export default function ModelsPage() {
               />
               </div>
               {!showTokens && (
-                <p className="mt-4 text-[10px] text-muted-foreground/70 leading-relaxed">
+                <p className="mt-4 text-xs text-text-tertiary leading-relaxed">
                   Token & cost analytics are hidden because the local counts
                   exclude auxiliary calls (compression, vision, web extract,
                   …) and provider retries, so they diverge from your provider
@@ -975,7 +1150,7 @@ export default function ModelsPage() {
                 <div className="flex flex-col items-center text-muted-foreground">
                   <Cpu className="h-8 w-8 mb-3 opacity-40" />
                   <p className="text-sm font-medium">{t.models.noModelsData}</p>
-                  <p className="text-xs mt-1 text-muted-foreground/60">
+                  <p className="text-xs mt-1 text-text-tertiary">
                     {t.models.startSession}
                   </p>
                 </div>

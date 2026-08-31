@@ -355,6 +355,10 @@ class TelegramAdapter(BasePlatformAdapter):
     _TEXT_BATCH_FAST_DELAY_S = 0.18
     _TEXT_BATCH_SHORT_LEN = 1024
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
+    # A direct group mention is sometimes an instruction for the very next
+    # Telegram forward. Hold only that narrow class of messages a little
+    # longer; ordinary text keeps the adaptive 180/240ms fast path.
+    _FORWARD_FOLLOWUP_DELAY_S = 0.8
 
     @staticmethod
     def _env_float_clamped(
@@ -4565,7 +4569,52 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
         sender = event.source.user_name or user_id
-        return f"[{sender}|{user_id}]\n{event.text or ''}"
+        body = event.text or ""
+        media_urls = getattr(event, "media_urls", None) or []
+        media_types = getattr(event, "media_types", None) or []
+        if media_urls:
+            parts = [body] if body else []
+            for i, path in enumerate(media_urls):
+                mtype = media_types[i] if i < len(media_types) else ""
+                if mtype.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO:
+                    parts.append(f"[User sent an image: {path}]")
+                elif mtype.startswith("audio/"):
+                    parts.append(f"[User sent audio: {path}]")
+                elif mtype.startswith("video/"):
+                    parts.append(f"[User sent video: {path}]")
+                else:
+                    parts.append(f"[User sent a file: {path}]")
+            body = "\n".join(part for part in parts if part)
+        return f"[{sender}|{user_id}]\n{body}"
+
+    def _observe_unmentioned_group_event(self, event: MessageEvent) -> None:
+        """Append a pre-built skipped group event, preserving cached media paths."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            shared_source = self._telegram_group_observe_shared_source(event.source)
+            session_entry = store.get_or_create_session(shared_source)
+            entry = {
+                "role": "user",
+                "content": self._telegram_group_observe_attributed_text(event),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if event.message_id:
+                entry["message_id"] = str(event.message_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+            adapter_name = getattr(self, "name", "telegram")
+            logger.info(
+                "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s media=%d",
+                adapter_name,
+                getattr(event.source, "chat_id", "unknown"),
+                event.source.user_id or "unknown",
+                len(getattr(event, "media_urls", None) or []),
+            )
+        except Exception as exc:
+            adapter_name = getattr(self, "name", "telegram")
+            logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
 
     def _telegram_group_observe_channel_prompt(self) -> str:
         username = getattr(getattr(self, "_bot", None), "username", None) or "unknown"
@@ -4607,24 +4656,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         try:
             event = self._build_message_event(message, msg_type, update_id=update_id)
-            shared_source = self._telegram_group_observe_shared_source(event.source)
-            session_entry = store.get_or_create_session(shared_source)
-            entry = {
-                "role": "user",
-                "content": self._telegram_group_observe_attributed_text(event),
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                "observed": True,
-            }
-            if event.message_id:
-                entry["message_id"] = str(event.message_id)
-            store.append_to_transcript(session_entry.session_id, entry)
-            adapter_name = getattr(self, "name", "telegram")
-            logger.info(
-                "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s",
-                adapter_name,
-                getattr(getattr(message, "chat", None), "id", "unknown"),
-                event.source.user_id or "unknown",
-            )
+            self._observe_unmentioned_group_event(event)
         except Exception as exc:
             adapter_name = getattr(self, "name", "telegram")
             logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
@@ -4753,6 +4785,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg):
+            # Telegram sends "instruction, then forward" as two independent
+            # updates. A forwarded text does not itself mention the bot, but it
+            # belongs to a still-pending direct instruction when sender, chat
+            # and topic all match.
+            if self._is_forwarded_message(msg):
+                forwarded_event = self._build_message_event(
+                    msg, MessageType.TEXT, update_id=update.update_id
+                )
+                forwarded_event = self._apply_telegram_group_observe_attribution(forwarded_event)
+                if self._merge_pending_forwarded_text(forwarded_event):
+                    return
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
@@ -4761,6 +4804,8 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
+        if self._is_group_chat(msg) and self._message_mentions_bot(msg):
+            event._await_forward_followup = True  # type: ignore[attr-defined]
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4822,13 +4867,51 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped key for text message batching."""
+        """Chat/thread/sender-scoped key for text message batching.
+
+        Shared observed-group sessions deliberately remove ``source.user_id``;
+        recover it from ``raw_message`` so simultaneous users in one topic can
+        never be coalesced.
+        """
         from gateway.session import build_session_key
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        raw_user = getattr(getattr(event, "raw_message", None), "from_user", None)
+        sender_id = getattr(raw_user, "id", None) or event.source.user_id or "unknown"
+        return f"{session_key}:sender:{sender_id}"
+
+    @staticmethod
+    def _is_forwarded_message(message: Message) -> bool:
+        """Return True for both modern and legacy PTB forwarded messages."""
+        return any(
+            getattr(message, attr, None) is not None
+            for attr in (
+                "forward_origin",
+                "forward_date",
+                "forward_from",
+                "forward_from_chat",
+                "forward_sender_name",
+            )
+        )
+
+    def _merge_pending_forwarded_text(self, event: MessageEvent) -> bool:
+        """Attach a forward to a pending same-sender instruction, if any."""
+        key = self._text_batch_key(event)
+        existing = self._pending_text_batches.get(key)
+        if existing is None or not getattr(existing, "_await_forward_followup", False):
+            return False
+        existing._await_forward_followup = False  # type: ignore[attr-defined]
+        self._enqueue_text_event(event)
+        logger.info(
+            "[Telegram] Merged forwarded text into pending instruction: chat=%s thread=%s sender=%s",
+            event.source.chat_id,
+            event.source.thread_id or "",
+            getattr(getattr(getattr(event, "raw_message", None), "from_user", None), "id", "unknown"),
+        )
+        return True
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -4885,7 +4968,9 @@ class TelegramAdapter(BasePlatformAdapter):
             pending = self._pending_text_batches.get(key)
             last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
             total_len = len(getattr(pending, "text", "") or "") if pending else 0
-            if last_len >= self._SPLIT_THRESHOLD:
+            if getattr(pending, "_await_forward_followup", False):
+                delay = self._FORWARD_FOLLOWUP_DELAY_S
+            elif last_len >= self._SPLIT_THRESHOLD:
                 delay = self._text_batch_split_delay_seconds
             elif total_len <= self._TEXT_BATCH_FAST_LEN:
                 delay = min(self._text_batch_delay_seconds, self._TEXT_BATCH_FAST_DELAY_S)
@@ -4958,25 +5043,13 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
-        if not self._should_process_message(update.message):
-            if self._should_observe_unmentioned_group_message(update.message):
-                _m = update.message
-                if _m.sticker:
-                    _observe_type = MessageType.STICKER
-                elif _m.photo:
-                    _observe_type = MessageType.PHOTO
-                elif _m.video:
-                    _observe_type = MessageType.VIDEO
-                elif _m.audio:
-                    _observe_type = MessageType.AUDIO
-                elif _m.voice:
-                    _observe_type = MessageType.VOICE
-                else:
-                    _observe_type = MessageType.DOCUMENT
-                self._observe_unmentioned_group_message(_m, _observe_type, update_id=update.update_id)
-            return
-
         msg = update.message
+        should_process = self._should_process_message(msg)
+        should_observe = False
+        if not should_process:
+            should_observe = self._should_observe_unmentioned_group_message(msg)
+            if not should_observe:
+                return
         
         # Determine media type
         if msg.sticker:
@@ -5003,8 +5076,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
             await self._handle_sticker(msg, event)
-            event = self._apply_telegram_group_observe_attribution(event)
-            await self.handle_message(event)
+            if should_process:
+                event = self._apply_telegram_group_observe_attribution(event)
+                await self.handle_message(event)
+            else:
+                self._observe_unmentioned_group_event(event)
             return
 
         # Apply observe attribution after caption is set; sticker is handled above
@@ -5032,6 +5108,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
+                if not should_process:
+                    self._observe_unmentioned_group_event(event)
+                    return
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
                     await self._queue_media_group_event(str(media_group_id), event)
@@ -5139,6 +5218,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
+                    if not should_process:
+                        self._observe_unmentioned_group_event(event)
+                        return
                     media_group_id = getattr(msg, "media_group_id", None)
                     if media_group_id:
                         await self._queue_media_group_event(str(media_group_id), event)
@@ -5167,7 +5249,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    await self.handle_message(event)
+                    if not should_process:
+                        self._observe_unmentioned_group_event(event)
+                    else:
+                        await self.handle_message(event)
                     return
 
                 # NOTE: image-document handling is performed earlier in this
@@ -5219,6 +5304,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
 
         media_group_id = getattr(msg, "media_group_id", None)
+        if not should_process:
+            self._observe_unmentioned_group_event(event)
+            return
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
             return

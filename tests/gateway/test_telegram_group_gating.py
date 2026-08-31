@@ -290,6 +290,25 @@ def test_unmentioned_group_observe_respects_chat_allowlist():
     asyncio.run(_run())
 
 
+def test_observed_group_context_preserves_media_paths():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    event = adapter._build_message_event(_group_message("", chat_id=-100), MessageType.PHOTO, update_id=1005)
+    event.media_urls = ["/home/hermes/.hermes/image_cache/img_test.jpg"]
+    event.media_types = ["image/jpeg"]
+
+    content = adapter._telegram_group_observe_attributed_text(event)
+
+    assert content == (
+        "[Alice Example|111]\n"
+        "[User sent an image: /home/hermes/.hermes/image_cache/img_test.jpg]"
+    )
+
+
 class _FakeSessionEntry:
     session_id = "telegram-group-session"
 

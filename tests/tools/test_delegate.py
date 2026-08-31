@@ -26,9 +26,11 @@ from tools.delegate_tool import (
     MAX_DEPTH,
     check_delegate_requirements,
     delegate_task,
+    _apply_specialist_contract,
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _toolset_satisfied,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -69,6 +71,9 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("specialist", props)
+        self.assertEqual(props["specialist"]["enum"], ["fitness", "nutrition", "medical", "miniapp"])
+        self.assertIn("specialist", props["tasks"]["items"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -155,6 +160,63 @@ class TestStripBlockedTools(unittest.TestCase):
     def test_empty_input(self):
         result = _strip_blocked_tools([])
         self.assertEqual(result, [])
+
+
+class TestHealthSpecialistContracts(unittest.TestCase):
+    def test_explicit_nutrition_specialist_adds_contract_and_toolsets(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Analyze today's meals.",
+                "specialist": "nutrition",
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "nutrition")
+        self.assertEqual(task["_specialist_label"], "🥗 *Питание*")
+        self.assertIn("SPECIALIST CONTRACT", task["goal"])
+        self.assertIn('skill_view(name="telegram_health/nutrition")', task["goal"])
+        self.assertIn("~/tenants/telegram_health/memory/nutrition.md", task["goal"])
+        self.assertEqual(
+            task["toolsets"],
+            ["skills", "file", "health-db", "terminal"],
+        )
+
+    def test_legacy_fitness_goal_infers_specialist_and_preserves_toolsets(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Действуй как fitness-специалист и составь план.",
+                "toolsets": ["terminal"],
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "fitness")
+        self.assertIn('skill_view(name="telegram_health/fitness")', task["goal"])
+        self.assertEqual(task["toolsets"], ["terminal", "skills", "file", "health-db"])
+
+    def test_health_db_alias_satisfies_required_toolset(self):
+        self.assertTrue(_toolset_satisfied("health-db", ["mcp-health-db"]))
+        self.assertTrue(_toolset_satisfied("mcp-health-db", ["health-db"]))
+
+    def test_explicit_miniapp_specialist_adds_contract_and_toolsets(self):
+        task = _apply_specialist_contract(
+            {
+                "goal": "Исправь отображение отмененных тренировок в Telegram Mini App.",
+                "specialist": "miniapp",
+            }
+        )
+
+        self.assertEqual(task["_specialist"], "miniapp")
+        self.assertEqual(task["_specialist_label"], "🧩 *Mini App*")
+        self.assertIn('skill_view(name="telegram_health/miniapp")', task["goal"])
+        self.assertIn("~/tenants/telegram_health/memory/miniapp.md", task["goal"])
+        self.assertEqual(
+            task["toolsets"],
+            ["skills", "file", "health-db", "terminal"],
+        )
+
+    def test_unknown_specialist_leaves_task_unchanged(self):
+        task = {"goal": "Do ordinary research.", "specialist": "sleep"}
+        self.assertEqual(_apply_specialist_contract(dict(task)), task)
 
 
 class TestDelegateTask(unittest.TestCase):

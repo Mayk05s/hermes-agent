@@ -99,6 +99,38 @@ class TestSessionSourceRoundtrip:
             SessionSource.from_dict({"platform": "nonexistent", "chat_id": "1"})
 
 
+def test_session_store_persists_origin_access_scope(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    with patch("hermes_state.SessionDB", return_value=db):
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_name="Work",
+        chat_type="group",
+        user_id="42",
+        user_name="Mikhail",
+        thread_id="777",
+        chat_topic="CV",
+        profile_name="default",
+        scope_name="cv",
+        memory_scope="cv",
+    )
+
+    entry = store.get_or_create_session(source)
+    row = db.get_session(entry.session_id)
+    payload = json.loads(row["access_scope"])
+
+    assert payload["session_key"] == build_session_key(source)
+    assert payload["origin"]["chat_id"] == "-1001"
+    assert payload["origin"]["thread_id"] == "777"
+    assert payload["origin"]["chat_topic"] == "CV"
+    assert payload["origin"]["memory_scope"] == "cv"
+
+
 class TestSessionSourceDescription:
     def test_local_cli(self):
         source = SessionSource(

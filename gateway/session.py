@@ -91,6 +91,9 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    profile_name: Optional[str] = None  # Resolved Hermes profile for isolation/routing
+    scope_name: Optional[str] = None  # Resolved profile-local topic scope
+    memory_scope: Optional[str] = None  # Resolved profile-local memory scope
     
     @property
     def description(self) -> str:
@@ -134,6 +137,12 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.profile_name:
+            d["profile_name"] = self.profile_name
+        if self.scope_name:
+            d["scope_name"] = self.scope_name
+        if self.memory_scope:
+            d["memory_scope"] = self.memory_scope
         return d
 
     @classmethod
@@ -152,6 +161,9 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            profile_name=data.get("profile_name"),
+            scope_name=data.get("scope_name"),
+            memory_scope=data.get("memory_scope"),
         )
     
 
@@ -372,6 +384,26 @@ def build_session_context_prompt(
             "You CAN send private (DM) messages via the send_message tool. "
             "Use target='yuanbao:direct:<account_id>' for DM "
             "and target='yuanbao:group:<group_code>' for group chat."
+        )
+    elif context.source.platform == Platform.TELEGRAM:
+        lines.append("")
+        lines.append(
+            "**Platform notes:** You are running inside Telegram. "
+            "If the right behavior is to acknowledge without a text reply, "
+            "make your entire final response exactly `[[reaction:<emoji>]]`, "
+            "choosing one appropriate Telegram reaction emoji such as "
+            "`[[reaction:\U0001f44d]]`, `[[reaction:\u2705]]`, `[[reaction:\u2764\ufe0f]]`, "
+            "`[[reaction:\U0001f602]]`, or `[[reaction:\U0001f44f]]`; the gateway will react "
+            "to the triggering message instead of sending a message. If nothing "
+            "should be visible at all, make your "
+            "entire final response exactly `[[silent]]`. Do not narrate that "
+            "you are staying silent, leaving someone else to answer, or not "
+            "intervening. If you decide that a request is a long-running plan, "
+            "research task, or multi-step tool task, include the hidden marker "
+            "`[[processing:eyes]]` once before starting that work; the gateway "
+            "will consume the marker and set a temporary 👀 reaction. Do not "
+            "use that marker for quick questions or simple one-tool actions, "
+            "and do not describe processing-status reactions in text."
         )
 
     # Connected platforms
@@ -626,6 +658,13 @@ def build_session_key(
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
     platform = source.platform.value
+    profile_name = str(getattr(source, "profile_name", "") or "").strip() or "default"
+    scope_name = str(getattr(source, "scope_name", "") or "").strip() or "default"
+    isolation_prefix = (
+        "agent:main"
+        if profile_name == "default" and scope_name == "default"
+        else f"agent:main:profile:{profile_name}:scope:{scope_name}"
+    )
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -633,11 +672,11 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"agent:main:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"agent:main:{platform}:dm:{dm_chat_id}"
+                return f"{isolation_prefix}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"{isolation_prefix}:{platform}:dm:{dm_chat_id}"
         if source.thread_id:
-            return f"agent:main:{platform}:dm:{source.thread_id}"
-        return f"agent:main:{platform}:dm"
+            return f"{isolation_prefix}:{platform}:dm:{source.thread_id}"
+        return f"{isolation_prefix}:{platform}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -645,7 +684,7 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = ["agent:main", platform, source.chat_type]
+    key_parts = [isolation_prefix, platform, source.chat_type]
 
     if source.chat_id:
         key_parts.append(source.chat_id)
@@ -937,6 +976,14 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "access_scope": json.dumps(
+                    {
+                        "session_key": session_key,
+                        "origin": source.to_dict(),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             }
 
         # SQLite operations outside the lock
@@ -1277,6 +1324,7 @@ class SessionStore:
                     platform_message_id=(
                         message.get("platform_message_id") or message.get("message_id")
                     ),
+                    observed=bool(message.get("observed")),
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
@@ -1307,6 +1355,58 @@ class SessionStore:
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)
             return []
+
+    def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
+        """Back up ``n`` user turns via soft-delete, keeping rows for audit.
+
+        Unlike :meth:`rewrite_transcript` (a hard replace used by /retry),
+        this flips the truncated rows to ``active=0`` in state.db so they
+        survive for audit and stay hidden from re-prompts and search. Mirrors
+        the CLI/TUI ``/undo [N]`` behavior via ``SessionDB.rewind_to_message``.
+
+        Returns a dict ``{"rewound_count", "turns_undone", "target_text"}`` on
+        success, or ``None`` if there's no DB or no user message to back up to.
+        ``n`` clamps to the oldest user turn when it exceeds the turn count.
+        """
+        if not self._db:
+            return None
+        if n < 1:
+            n = 1
+        try:
+            recents = self._db.list_recent_user_messages(session_id, limit=max(n, 10))
+        except Exception as e:
+            logger.debug("rewind_session: failed to list user messages: %s", e)
+            return None
+        if not recents:
+            return None
+        target_idx = min(n - 1, len(recents) - 1)
+        target_id = recents[target_idx]["id"]
+        try:
+            result = self._db.rewind_to_message(session_id, target_id)
+        except ValueError as e:
+            logger.debug("rewind_session: %s", e)
+            return None
+        except Exception as e:
+            logger.debug("rewind_session: rewind_to_message failed: %s", e)
+            return None
+        target_msg = result.get("target_message") or {}
+        content = target_msg.get("content") or ""
+        if isinstance(content, list):
+            parts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            target_text = "\n".join(t for t in parts if t)
+        elif isinstance(content, str):
+            target_text = content
+        else:
+            target_text = ""
+        return {
+            "rewound_count": result.get("rewound_count", 0),
+            "turns_undone": target_idx + 1,
+            "target_text": target_text,
+        }
 
 
 def build_session_context(

@@ -72,6 +72,52 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+def _canonical_target(target: str) -> str:
+    """Canonical form used by the profile-local outbound allowlist."""
+    platform, separator, recipient = str(target or "").strip().partition(":")
+    platform = platform.strip().lower()
+    if not separator:
+        return platform
+    return f"{platform}:{recipient.strip()}"
+
+
+def _configured_allowed_targets() -> set[str] | None:
+    """Read ``messaging.allowed_targets`` from the active profile config.
+
+    ``None`` preserves the historical unrestricted behavior when the setting
+    is absent. An explicitly empty list denies every outbound target.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception as exc:
+        # A configured restriction must never silently become unrestricted
+        # because config loading broke. Deny sends until the profile config is
+        # readable; healthy legacy installs still return None below when the
+        # setting is simply absent.
+        logger.warning("Could not load outbound messaging policy: %s", _sanitize_error_text(exc))
+        return set()
+    messaging = config.get("messaging")
+    if not isinstance(messaging, dict) or "allowed_targets" not in messaging:
+        return None
+    raw = messaging.get("allowed_targets")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list):
+        return set()
+    return {
+        canonical
+        for item in raw
+        if (canonical := _canonical_target(str(item)))
+    }
+
+
+def _target_allowed(target: str) -> bool:
+    allowed = _configured_allowed_targets()
+    return allowed is None or _canonical_target(target) in allowed
+
+
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
@@ -159,6 +205,11 @@ def send_message_tool(args, **kw):
 
 def _handle_list():
     """Return formatted list of available messaging targets."""
+    allowed = _configured_allowed_targets()
+    if allowed is not None:
+        # Do not expose the gateway-wide channel directory to a restricted
+        # profile. The allowlist itself is the complete reachable directory.
+        return json.dumps({"targets": sorted(allowed)})
     try:
         from gateway.channel_directory import format_directory_for_display
         return json.dumps({"targets": format_directory_for_display()})
@@ -172,6 +223,8 @@ def _handle_send(args):
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+    if not _target_allowed(target):
+        return json.dumps(_error("Outbound target is not allowed by this profile"))
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()

@@ -1,0 +1,6 @@
+name: mempalace
+version: 1.0.0
+description: "MemPalace — local profile-scoped knowledge graph memory rebuilt from Hermes chat history with curated markdown overlay."
+requires_env: []
+hooks:
+  - on_memory_write

@@ -20,6 +20,7 @@ data/
 .pytest_cache/
 .pytest-cache/
 tmp/
+/$tmp/
 temp_vision_images/
 hermes-*/*
 examples/

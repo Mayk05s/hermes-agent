@@ -2,11 +2,14 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with fast-first auto selection and
+several concrete providers:
 
-  - **local** (default, free) — faster-whisper running locally, no API key needed.
+  - **auto** (default) — fast cloud STT first, local engines as the final fallback.
+  - **local** (free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
   - **groq** (free tier) — Groq Whisper API, requires ``GROQ_API_KEY``.
+  - **nvidia** — NVIDIA NIM ASR API, requires ``NVIDIA_API_KEY``.
   - **openai** (paid) — OpenAI Whisper API, requires ``VOICE_TOOLS_OPENAI_KEY``.
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
@@ -78,17 +81,19 @@ _HAS_MISTRAL = _safe_find_spec("mistralai")
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROVIDER = "local"
+DEFAULT_PROVIDER = "auto"
 DEFAULT_LOCAL_MODEL = "base"
 DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
+DEFAULT_NVIDIA_STT_MODEL = os.getenv("STT_NVIDIA_MODEL", "nvidia/parakeet-ctc-1.1b-asr")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 
@@ -99,6 +104,9 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
+NVIDIA_MODELS = {"nvidia/parakeet-ctc-1.1b-asr", "nvidia/canary-1b"}
+AUTO_PROVIDER_ALIASES = {"", "auto", "chain"}
+AUTO_PROVIDER_SEQUENCE = ("groq", "nvidia", "openai", "xai", "local", "local_command")
 
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
@@ -197,109 +205,156 @@ def _normalize_local_command_model(model_name: Optional[str]) -> str:
     return _normalize_local_model(model_name)
 
 
+def _normalize_provider_name(provider: Any) -> str:
+    return str(provider or "").strip().lower()
+
+
+def _is_auto_provider(provider: Any) -> bool:
+    return _normalize_provider_name(provider) in AUTO_PROVIDER_ALIASES
+
+
+def _add_provider_once(sequence: list[str], provider: Any) -> None:
+    normalized = _normalize_provider_name(provider)
+    if not normalized or normalized == "none" or normalized in sequence:
+        return
+    if normalized in AUTO_PROVIDER_ALIASES:
+        return
+    sequence.append(normalized)
+
+
+def _auto_provider_sequence(stt_config: dict) -> list[str]:
+    """Return the fast-first STT chain used by ``provider: auto``.
+
+    This mirrors the Nanoclaw shape: a configurable primary/fallback pair,
+    with local Whisper engines kept as the final safety net instead of the
+    first choice.  ``primary`` defaults to Groq's turbo Whisper model because
+    it is the fast path the user asked to port.
+    """
+    sequence: list[str] = []
+    _add_provider_once(sequence, stt_config.get("primary") or "groq")
+    _add_provider_once(sequence, stt_config.get("fallback"))
+    for provider in AUTO_PROVIDER_SEQUENCE:
+        _add_provider_once(sequence, provider)
+    return sequence
+
+
+def _provider_available(provider: str) -> bool:
+    """Return whether a provider has enough local configuration to try."""
+    if provider == "local":
+        return _HAS_FASTER_WHISPER
+    if provider == "local_command":
+        return _has_local_command()
+    if provider == "groq":
+        return bool(_HAS_OPENAI and get_env_value("GROQ_API_KEY"))
+    if provider == "nvidia":
+        return bool(_HAS_OPENAI and get_env_value("NVIDIA_API_KEY"))
+    if provider == "openai":
+        return bool(_HAS_OPENAI and _has_openai_audio_backend())
+    if provider == "xai":
+        try:
+            from tools.xai_http import resolve_xai_http_credentials
+
+            return bool(resolve_xai_http_credentials().get("api_key"))
+        except Exception:
+            return False
+    return False
+
+
+def _get_auto_provider(stt_config: dict) -> str:
+    for provider in _auto_provider_sequence(stt_config):
+        if _provider_available(provider):
+            logger.info("Auto STT selected provider: %s", provider)
+            return provider
+    return "none"
+
+
 def _get_provider(stt_config: dict) -> str:
     """Determine which STT provider to use.
 
     When ``stt.provider`` is explicitly set in config, that choice is
-    honoured — no silent cloud fallback.  When no provider is configured,
-    auto-detect tries: local > groq (free) > openai (paid).
+    honoured — no silent cloud fallback.  ``auto``/``chain`` use the
+    Nanoclaw-style fast-first chain: Groq > configured fallback > other cloud
+    providers > local engines.
     """
     if not is_stt_enabled(stt_config):
         return "none"
 
-    explicit = "provider" in stt_config
-    provider = stt_config.get("provider", DEFAULT_PROVIDER)
+    provider = _normalize_provider_name(stt_config.get("provider", DEFAULT_PROVIDER))
+
+    if _is_auto_provider(provider):
+        return _get_auto_provider(stt_config)
 
     # --- Explicit provider: respect the user's choice ----------------------
 
-    if explicit:
-        if provider == "local":
-            if _HAS_FASTER_WHISPER:
-                return "local"
-            if _has_local_command():
-                return "local_command"
-            logger.warning(
-                "STT provider 'local' configured but unavailable "
-                "(install faster-whisper or set HERMES_LOCAL_STT_COMMAND)"
-            )
-            return "none"
+    if provider == "local":
+        if _HAS_FASTER_WHISPER:
+            return "local"
+        if _has_local_command():
+            return "local_command"
+        logger.warning(
+            "STT provider 'local' configured but unavailable "
+            "(install faster-whisper or set HERMES_LOCAL_STT_COMMAND)"
+        )
+        return "none"
 
-        if provider == "local_command":
-            if _has_local_command():
-                return "local_command"
-            if _HAS_FASTER_WHISPER:
-                logger.info("Local STT command unavailable, using local faster-whisper")
-                return "local"
-            logger.warning(
-                "STT provider 'local_command' configured but unavailable"
-            )
-            return "none"
+    if provider == "local_command":
+        if _has_local_command():
+            return "local_command"
+        if _HAS_FASTER_WHISPER:
+            logger.info("Local STT command unavailable, using local faster-whisper")
+            return "local"
+        logger.warning(
+            "STT provider 'local_command' configured but unavailable"
+        )
+        return "none"
 
-        if provider == "groq":
-            if _HAS_OPENAI and get_env_value("GROQ_API_KEY"):
-                return "groq"
-            logger.warning(
-                "STT provider 'groq' configured but GROQ_API_KEY not set"
-            )
-            return "none"
+    if provider == "groq":
+        if _provider_available("groq"):
+            return "groq"
+        logger.warning(
+            "STT provider 'groq' configured but GROQ_API_KEY not set"
+        )
+        return "none"
 
-        if provider == "openai":
-            if _HAS_OPENAI and _has_openai_audio_backend():
-                return "openai"
-            logger.warning(
-                "STT provider 'openai' configured but no API key available"
-            )
-            return "none"
+    if provider == "nvidia":
+        if _provider_available("nvidia"):
+            return "nvidia"
+        logger.warning(
+            "STT provider 'nvidia' configured but NVIDIA_API_KEY not set"
+        )
+        return "none"
 
-        if provider == "mistral":
-            # `mistralai` PyPI package was quarantined on 2026-05-12 after a
-            # malicious 2.4.6 release. Refuse to use this provider until it's
-            # available again so we surface a clear message instead of an
-            # opaque ImportError mid-call.
-            logger.warning(
-                "STT provider 'mistral' (Voxtral Transcribe) is temporarily "
-                "disabled — `mistralai` PyPI package is quarantined "
-                "(malicious 2.4.6 release on 2026-05-12). Falling back to "
-                "another provider. Set stt.provider in config.yaml to 'local' "
-                "or 'openai' to silence this warning."
-            )
-            return "none"
+    if provider == "openai":
+        if _provider_available("openai"):
+            return "openai"
+        logger.warning(
+            "STT provider 'openai' configured but no API key available"
+        )
+        return "none"
 
-        if provider == "xai":
-            from tools.xai_http import resolve_xai_http_credentials
+    if provider == "mistral":
+        # `mistralai` PyPI package was quarantined on 2026-05-12 after a
+        # malicious 2.4.6 release. Refuse to use this provider until it's
+        # available again so we surface a clear message instead of an opaque
+        # ImportError mid-call.
+        logger.warning(
+            "STT provider 'mistral' (Voxtral Transcribe) is temporarily "
+            "disabled — `mistralai` PyPI package is quarantined "
+            "(malicious 2.4.6 release on 2026-05-12). Set stt.provider in "
+            "config.yaml to 'auto', 'groq', 'local', or 'openai' to silence "
+            "this warning."
+        )
+        return "none"
 
-            if resolve_xai_http_credentials().get("api_key"):
-                return "xai"
-            logger.warning(
-                "STT provider 'xai' configured but no xAI credentials are available"
-            )
-            return "none"
-
-        return provider  # Unknown — let it fail downstream
-
-    # --- Auto-detect (no explicit provider): local > groq > openai > xai ---
-    # mistral is intentionally skipped while `mistralai` is quarantined on
-    # PyPI (malicious 2.4.6 release on 2026-05-12).
-
-    if _HAS_FASTER_WHISPER:
-        return "local"
-    if _has_local_command():
-        return "local_command"
-    if _HAS_OPENAI and get_env_value("GROQ_API_KEY"):
-        logger.info("No local STT available, using Groq Whisper API")
-        return "groq"
-    if _HAS_OPENAI and _has_openai_audio_backend():
-        logger.info("No local STT available, using OpenAI Whisper API")
-        return "openai"
-    try:
-        from tools.xai_http import resolve_xai_http_credentials
-
-        if resolve_xai_http_credentials().get("api_key"):
-            logger.info("No local STT available, using xAI Grok STT API")
+    if provider == "xai":
+        if _provider_available("xai"):
             return "xai"
-    except Exception:
-        pass
-    return "none"
+        logger.warning(
+            "STT provider 'xai' configured but no xAI credentials are available"
+        )
+        return "none"
+
+    return provider  # Unknown — let it fail downstream
 
 # ---------------------------------------------------------------------------
 # Shared validation
@@ -566,7 +621,7 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": "openai package not installed"}
 
     # Auto-correct model if caller passed an OpenAI-only model
-    if model_name in OPENAI_MODELS:
+    if model_name in OPENAI_MODELS or model_name in NVIDIA_MODELS:
         logger.info("Model %s not available on Groq, using %s", model_name, DEFAULT_GROQ_STT_MODEL)
         model_name = DEFAULT_GROQ_STT_MODEL
 
@@ -603,6 +658,62 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
         logger.error("Groq transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
 
+
+# ---------------------------------------------------------------------------
+# Provider: nvidia (NIM ASR API)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_nvidia(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using NVIDIA NIM ASR via an OpenAI-compatible endpoint."""
+    api_key = get_env_value("NVIDIA_API_KEY")
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "NVIDIA_API_KEY not set"}
+
+    if not _HAS_OPENAI:
+        return {"success": False, "transcript": "", "error": "openai package not installed"}
+
+    if model_name in OPENAI_MODELS or model_name in GROQ_MODELS:
+        logger.info("Model %s not available on NVIDIA NIM, using %s", model_name, DEFAULT_NVIDIA_STT_MODEL)
+        model_name = DEFAULT_NVIDIA_STT_MODEL
+
+    try:
+        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
+        client = OpenAI(api_key=api_key, base_url=NVIDIA_BASE_URL, timeout=30, max_retries=0)
+        try:
+            with open(file_path, "rb") as audio_file:
+                transcription = client.audio.transcriptions.create(
+                    model=model_name,
+                    file=audio_file,
+                    response_format="text",
+                )
+
+            transcript_text = _extract_transcript_text(transcription)
+            logger.info(
+                "Transcribed %s via NVIDIA NIM (%s, %d chars)",
+                Path(file_path).name,
+                model_name,
+                len(transcript_text),
+            )
+
+            return {"success": True, "transcript": transcript_text, "provider": "nvidia"}
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except APIConnectionError as e:
+        return {"success": False, "transcript": "", "error": f"Connection error: {e}"}
+    except APITimeoutError as e:
+        return {"success": False, "transcript": "", "error": f"Request timeout: {e}"}
+    except APIError as e:
+        return {"success": False, "transcript": "", "error": f"API error: {e}"}
+    except Exception as e:
+        logger.error("NVIDIA NIM transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
+
 # ---------------------------------------------------------------------------
 # Provider: openai (Whisper API)
 # ---------------------------------------------------------------------------
@@ -623,7 +734,7 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": "openai package not installed"}
 
     # Auto-correct model if caller passed a Groq-only model
-    if model_name in GROQ_MODELS:
+    if model_name in GROQ_MODELS or model_name in NVIDIA_MODELS:
         logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
         model_name = DEFAULT_STT_MODEL
 
@@ -811,13 +922,112 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _transcribe_with_provider(
+    provider: str,
+    file_path: str,
+    stt_config: dict,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Dispatch to a single resolved provider."""
+    if provider == "local":
+        local_cfg = stt_config.get("local", {})
+        model_name = _normalize_local_model(
+            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        )
+        return _transcribe_local(file_path, model_name)
+
+    if provider == "local_command":
+        local_cfg = stt_config.get("local", {})
+        model_name = _normalize_local_command_model(
+            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        )
+        return _transcribe_local_command(file_path, model_name)
+
+    if provider == "groq":
+        model_name = model or DEFAULT_GROQ_STT_MODEL
+        return _transcribe_groq(file_path, model_name)
+
+    if provider == "nvidia":
+        nvidia_cfg = stt_config.get("nvidia", {})
+        model_name = model or nvidia_cfg.get("model", DEFAULT_NVIDIA_STT_MODEL)
+        return _transcribe_nvidia(file_path, model_name)
+
+    if provider == "openai":
+        openai_cfg = stt_config.get("openai", {})
+        model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
+        return _transcribe_openai(file_path, model_name)
+
+    if provider == "mistral":
+        mistral_cfg = stt_config.get("mistral", {})
+        model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
+        return _transcribe_mistral(file_path, model_name)
+
+    if provider == "xai":
+        # xAI Grok STT doesn't use a model parameter — pass through for logging
+        model_name = model or "grok-stt"
+        return _transcribe_xai(file_path, model_name)
+
+    return {
+        "success": False,
+        "transcript": "",
+        "error": f"Unknown STT provider: {provider}",
+        "provider": provider,
+    }
+
+
+def _transcribe_auto_chain(
+    file_path: str,
+    stt_config: dict,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Try the configured fast-first provider chain until one succeeds."""
+    failures: list[str] = []
+
+    for provider in _auto_provider_sequence(stt_config):
+        if not _provider_available(provider):
+            continue
+
+        result = _transcribe_with_provider(provider, file_path, stt_config, model=model)
+        if result.get("success"):
+            result.setdefault("provider", provider)
+            return result
+
+        error = str(result.get("error") or "unknown error")
+        failures.append(f"{provider}: {error}")
+        logger.warning("Auto STT provider '%s' failed: %s", provider, error)
+
+    if failures:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "All auto STT providers failed: " + "; ".join(failures),
+        }
+
+    return _no_provider_error()
+
+
+def _no_provider_error() -> Dict[str, Any]:
+    return {
+        "success": False,
+        "transcript": "",
+        "error": (
+            "No STT provider available. Configure provider: auto with GROQ_API_KEY "
+            "for fast Groq Whisper, set NVIDIA_API_KEY for NVIDIA NIM ASR, "
+            "set VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY for OpenAI Whisper, "
+            "configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, install "
+            "faster-whisper for local transcription, or "
+            f"configure {LOCAL_STT_COMMAND_ENV} / a local whisper CLI."
+        ),
+    }
+
+
 def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
 
     Provider priority:
-      1. User config (``stt.provider`` in config.yaml)
-      2. Auto-detect: local faster-whisper (free) > Groq (free tier) > OpenAI (paid)
+      1. Explicit user config (``stt.provider`` in config.yaml)
+      2. ``auto``/``chain``: Groq > configured fallback > other cloud providers > local
 
     Args:
         file_path: Absolute path to the audio file to transcribe.
@@ -844,53 +1054,16 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
         }
 
+    configured_provider = _normalize_provider_name(stt_config.get("provider", DEFAULT_PROVIDER))
+    if _is_auto_provider(configured_provider):
+        return _transcribe_auto_chain(file_path, stt_config, model=model)
+
     provider = _get_provider(stt_config)
-
-    if provider == "local":
-        local_cfg = stt_config.get("local", {})
-        model_name = _normalize_local_model(
-            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
-        )
-        return _transcribe_local(file_path, model_name)
-
-    if provider == "local_command":
-        local_cfg = stt_config.get("local", {})
-        model_name = _normalize_local_command_model(
-            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
-        )
-        return _transcribe_local_command(file_path, model_name)
-
-    if provider == "groq":
-        model_name = model or DEFAULT_GROQ_STT_MODEL
-        return _transcribe_groq(file_path, model_name)
-
-    if provider == "openai":
-        openai_cfg = stt_config.get("openai", {})
-        model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
-        return _transcribe_openai(file_path, model_name)
-
-    if provider == "mistral":
-        mistral_cfg = stt_config.get("mistral", {})
-        model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
-        return _transcribe_mistral(file_path, model_name)
-
-    if provider == "xai":
-        # xAI Grok STT doesn't use a model parameter — pass through for logging
-        model_name = model or "grok-stt"
-        return _transcribe_xai(file_path, model_name)
+    if provider in {"local", "local_command", "groq", "nvidia", "openai", "mistral", "xai"}:
+        return _transcribe_with_provider(provider, file_path, stt_config, model=model)
 
     # No provider available
-    return {
-        "success": False,
-        "transcript": "",
-        "error": (
-            "No STT provider available. Install faster-whisper for free local "
-            f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
-            "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
-            "or OPENAI_API_KEY for the OpenAI Whisper API."
-        ),
-    }
+    return _no_provider_error()
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:

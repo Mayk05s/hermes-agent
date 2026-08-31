@@ -48,6 +48,7 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
@@ -87,10 +88,18 @@ class TestGetProviderFallbackPriority:
     """Auto-detect fallback priority and explicit provider behaviour."""
 
     def test_auto_detect_prefers_local(self):
-        """Auto-detect prefers local over any cloud provider."""
+        """Auto-detect uses local when no fast cloud provider is configured."""
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "local"
+
+    def test_auto_detect_prefers_groq_over_local(self, monkeypatch):
+        """Auto-detect: Groq turbo is the fast path even when local exists."""
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._HAS_OPENAI", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({}) == "groq"
 
     def test_auto_detect_prefers_groq_over_openai(self, monkeypatch):
         """Auto-detect: groq (free) is preferred over openai (paid)."""
@@ -101,6 +110,16 @@ class TestGetProviderFallbackPriority:
              patch("tools.transcription_tools._HAS_OPENAI", True):
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "groq"
+
+    def test_auto_detect_prefers_nvidia_over_openai(self, monkeypatch):
+        """Auto-detect: NVIDIA is the Nanoclaw-style fast fallback after Groq."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._has_local_command", return_value=False), \
+             patch("tools.transcription_tools._HAS_OPENAI", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({}) == "nvidia"
 
     def test_explicit_openai_no_key_returns_none(self, monkeypatch):
         """Explicit openai with no key returns none — no cross-provider fallback."""
@@ -294,6 +313,50 @@ class TestTranscribeGroq:
 
         assert result["success"] is False
         assert "Permission denied" in result["error"]
+
+
+# ============================================================================
+# _get_provider / _transcribe_nvidia
+# ============================================================================
+
+class TestGetProviderNvidia:
+    def test_nvidia_when_key_set(self, monkeypatch):
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+        with patch("tools.transcription_tools._HAS_OPENAI", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "nvidia"}) == "nvidia"
+
+    def test_nvidia_explicit_no_key_returns_none(self, monkeypatch):
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        with patch("tools.transcription_tools._HAS_OPENAI", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "nvidia"}) == "none"
+
+
+class TestTranscribeNvidia:
+    def test_no_key(self, monkeypatch):
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        from tools.transcription_tools import _transcribe_nvidia
+        result = _transcribe_nvidia("/tmp/test.ogg", "nvidia/parakeet-ctc-1.1b-asr")
+        assert result["success"] is False
+        assert "NVIDIA_API_KEY" in result["error"]
+
+    def test_successful_transcription(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "hello from parakeet"
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client) as mock_openai_cls:
+            from tools.transcription_tools import _transcribe_nvidia, NVIDIA_BASE_URL
+            result = _transcribe_nvidia(sample_wav, "nvidia/parakeet-ctc-1.1b-asr")
+
+        assert result["success"] is True
+        assert result["transcript"] == "hello from parakeet"
+        assert result["provider"] == "nvidia"
+        assert mock_openai_cls.call_args.kwargs["base_url"] == NVIDIA_BASE_URL
+        mock_client.close.assert_called_once()
 
 
 # ============================================================================
@@ -803,7 +866,7 @@ class TestTranscribeAudioDispatch:
         mock_groq.assert_called_once()
 
     def test_dispatches_to_local(self, sample_ogg):
-        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "local"}), \
              patch("tools.transcription_tools._get_provider", return_value="local"), \
              patch("tools.transcription_tools._transcribe_local",
                    return_value={"success": True, "transcript": "hi"}) as mock_local:
@@ -825,7 +888,7 @@ class TestTranscribeAudioDispatch:
         mock_openai.assert_called_once()
 
     def test_no_provider_returns_error(self, sample_ogg):
-        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "unknown"}), \
              patch("tools.transcription_tools._get_provider", return_value="none"):
             from tools.transcription_tools import transcribe_audio
             result = transcribe_audio(sample_ogg)
@@ -856,7 +919,7 @@ class TestTranscribeAudioDispatch:
         assert "not found" in result["error"]
 
     def test_model_override_passed_to_groq(self, sample_ogg):
-        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "groq"}), \
              patch("tools.transcription_tools._get_provider", return_value="groq"), \
              patch("tools.transcription_tools._transcribe_groq",
                    return_value={"success": True, "transcript": "hi"}) as mock_groq:
@@ -867,7 +930,7 @@ class TestTranscribeAudioDispatch:
         assert kwargs.get("model_name") or mock_groq.call_args[0][1] == "whisper-large-v3"
 
     def test_model_override_passed_to_local(self, sample_ogg):
-        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "local"}), \
              patch("tools.transcription_tools._get_provider", return_value="local"), \
              patch("tools.transcription_tools._transcribe_local",
                    return_value={"success": True, "transcript": "hi"}) as mock_local:
@@ -877,7 +940,7 @@ class TestTranscribeAudioDispatch:
         assert mock_local.call_args[0][1] == "large-v3"
 
     def test_default_model_used_when_none(self, sample_ogg):
-        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "groq"}), \
              patch("tools.transcription_tools._get_provider", return_value="groq"), \
              patch("tools.transcription_tools._transcribe_groq",
                    return_value={"success": True, "transcript": "hi"}) as mock_groq:
@@ -887,7 +950,7 @@ class TestTranscribeAudioDispatch:
         assert mock_groq.call_args[0][1] == DEFAULT_GROQ_STT_MODEL
 
     def test_config_local_model_used(self, sample_ogg):
-        config = {"local": {"model": "small"}}
+        config = {"provider": "local", "local": {"model": "small"}}
         with patch("tools.transcription_tools._load_stt_config", return_value=config), \
              patch("tools.transcription_tools._get_provider", return_value="local"), \
              patch("tools.transcription_tools._transcribe_local",
@@ -898,7 +961,7 @@ class TestTranscribeAudioDispatch:
         assert mock_local.call_args[0][1] == "small"
 
     def test_config_openai_model_used(self, sample_ogg):
-        config = {"openai": {"model": "gpt-4o-transcribe"}}
+        config = {"provider": "openai", "openai": {"model": "gpt-4o-transcribe"}}
         with patch("tools.transcription_tools._load_stt_config", return_value=config), \
              patch("tools.transcription_tools._get_provider", return_value="openai"), \
              patch("tools.transcription_tools._transcribe_openai",
@@ -907,6 +970,21 @@ class TestTranscribeAudioDispatch:
             transcribe_audio(sample_ogg, model=None)
 
         assert mock_openai.call_args[0][1] == "gpt-4o-transcribe"
+
+    def test_auto_chain_falls_back_after_provider_failure(self, sample_ogg):
+        config = {"provider": "auto", "primary": "groq", "fallback": "nvidia"}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._provider_available", return_value=True), \
+             patch("tools.transcription_tools._transcribe_groq",
+                   return_value={"success": False, "transcript": "", "error": "rate limit"}), \
+             patch("tools.transcription_tools._transcribe_nvidia",
+                   return_value={"success": True, "transcript": "fast fallback", "provider": "nvidia"}):
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["transcript"] == "fast fallback"
+        assert result["provider"] == "nvidia"
 
 
 # ============================================================================
@@ -1091,7 +1169,7 @@ class TestTranscribeAudioMistralDispatch:
         assert mock_mistral.call_args[0][1] == "voxtral-mini-2602"
 
     def test_model_override_passed_to_mistral(self, sample_ogg):
-        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "mistral"}), \
              patch("tools.transcription_tools._get_provider", return_value="mistral"), \
              patch("tools.transcription_tools._transcribe_mistral",
                    return_value={"success": True, "transcript": "hi"}) as mock_mistral:
@@ -1355,7 +1433,7 @@ class TestTranscribeAudioXAIDispatch:
         assert mock_xai.call_args[0][1] == "grok-stt"
 
     def test_model_override_passed_to_xai(self, sample_ogg):
-        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "xai"}), \
              patch("tools.transcription_tools._get_provider", return_value="xai"), \
              patch("tools.transcription_tools._transcribe_xai",
                    return_value={"success": True, "transcript": "hi"}) as mock_xai:
