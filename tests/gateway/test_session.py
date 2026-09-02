@@ -122,13 +122,14 @@ def test_session_store_persists_origin_access_scope(tmp_path):
 
     entry = store.get_or_create_session(source)
     row = db.get_session(entry.session_id)
-    payload = json.loads(row["access_scope"])
+    assert row["access_scope"] == build_session_key(source)
 
-    assert payload["session_key"] == build_session_key(source)
-    assert payload["origin"]["chat_id"] == "-1001"
-    assert payload["origin"]["thread_id"] == "777"
-    assert payload["origin"]["chat_topic"] == "CV"
-    assert payload["origin"]["memory_scope"] == "cv"
+    persisted = json.loads((tmp_path / "sessions" / "sessions.json").read_text())
+    origin = persisted[entry.session_key]["origin"]
+    assert origin["chat_id"] == "-1001"
+    assert origin["thread_id"] == "777"
+    assert origin["chat_topic"] == "CV"
+    assert origin["memory_scope"] == "cv"
 
 
 class TestSessionSourceDescription:

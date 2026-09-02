@@ -315,6 +315,24 @@ def test_refresh_falls_back_to_generic_message_on_unparseable_body(monkeypatch):
     assert "status 401" in str(err)
 
 
+def test_is_rate_limited_auth_error_distinguishes_credential_errors():
+    from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, is_rate_limited_auth_error
+
+    rate_limited = AuthError(
+        "quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE, relogin_required=False
+    )
+    missing_creds = AuthError(
+        "No Codex credentials stored.",
+        provider="openai-codex",
+        code="codex_auth_missing",
+        relogin_required=True,
+    )
+
+    assert is_rate_limited_auth_error(rate_limited) is True
+    assert is_rate_limited_auth_error(missing_creds) is False
+    assert is_rate_limited_auth_error(ValueError("nope")) is False
+
+
 def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypatch):
     called = {"device_login": 0}
 

@@ -78,7 +78,30 @@ class MemoryProvider(ABC):
           - agent_workspace (str): Shared workspace name (e.g. "hermes").
           - parent_session_id (str): For subagents, the parent's session_id.
           - user_id (str): Platform user identifier (gateway sessions).
+          - memory_access_context (MemoryAccessContext | None): immutable
+            gateway-authorized scope. Providers must fail closed when their
+            operation requires scoped memory and this value is absent.
         """
+
+    @property
+    def enforces_trusted_access_context(self) -> bool:
+        """Whether this provider enforces ``MemoryAccessContext`` for every operation.
+
+        Providers return ``False`` until their storage adapter applies the
+        trusted boundary to reads, writes, prefetch, and tool calls. The
+        MemPalace integration uses this as a hard gate against its legacy
+        profile-global/local backend.
+        """
+        return False
+
+    def set_access_context(self, context: Any) -> None:
+        """Bind the immutable context for the current request.
+
+        Called on every gateway request, including with ``None`` to clear a
+        prior cached request. Implementations must not retain an earlier
+        non-null context when the current request has none.
+        """
+        self._memory_access_context = context
 
     def system_prompt_block(self) -> str:
         """Return text to include in the system prompt.

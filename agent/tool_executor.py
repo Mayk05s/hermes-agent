@@ -36,6 +36,7 @@ from agent.tool_dispatch_helpers import (
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
     make_tool_result_message,
+    is_explicit_local_cli_context,
 )
 from tools.terminal_tool import (
     _get_approval_callback,
@@ -606,6 +607,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
         elif function_name == "session_search":
+            gateway_scoped = not is_explicit_local_cli_context(
+                getattr(agent, "platform", ""),
+                getattr(agent, "_gateway_session_key", None),
+            )
             session_db = agent._get_session_db_for_recall()
             if not session_db:
                 from hermes_state import format_session_db_unavailable
@@ -623,42 +628,64 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     db=session_db,
                     current_session_id=agent.session_id,
                     current_access_scope=getattr(agent, "_gateway_session_key", None),
+                    require_access_scope=gateway_scoped,
                 )
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
         elif function_name == "query_chat_agent":
-            from tools.registry import registry as _tool_registry
-            function_result = _tool_registry.dispatch(
-                function_name,
-                function_args,
-                current_access_scope=getattr(agent, "_gateway_session_key", None),
-            )
+            if not is_explicit_local_cli_context(
+                getattr(agent, "platform", ""),
+                getattr(agent, "_gateway_session_key", None),
+            ):
+                function_result = json.dumps(
+                    {
+                        "success": False,
+                        "error": "Cross-scope query is unavailable until a selected-fact broker is configured.",
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                from tools.registry import registry as _tool_registry
+                function_result = _tool_registry.dispatch(
+                    function_name,
+                    function_args,
+                    current_access_scope=getattr(agent, "_gateway_session_key", None),
+                )
             tool_duration = time.time() - tool_start_time
         elif function_name == "memory":
-            target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            function_result = _memory_tool(
-                action=function_args.get("action"),
-                target=target,
-                content=function_args.get("content"),
-                old_text=function_args.get("old_text"),
-                store=agent._memory_store,
-            )
-            # Bridge: notify external memory provider of built-in memory writes
-            if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
-                try:
-                    agent._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                        metadata=agent._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=getattr(tool_call, "id", None),
-                        ),
-                    )
-                except Exception:
-                    pass
+            if not getattr(agent, "_builtin_profile_memory_allowed", False):
+                function_result = json.dumps(
+                    {
+                        "success": False,
+                        "error": "Built-in memory is unavailable in this context.",
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                target = function_args.get("target", "memory")
+                from tools.memory_tool import memory_tool as _memory_tool
+                function_result = _memory_tool(
+                    action=function_args.get("action"),
+                    target=target,
+                    content=function_args.get("content"),
+                    old_text=function_args.get("old_text"),
+                    store=agent._memory_store,
+                )
+                # Bridge: notify external memory provider of built-in memory writes
+                if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
+                    try:
+                        agent._memory_manager.on_memory_write(
+                            function_args.get("action", ""),
+                            target,
+                            function_args.get("content", ""),
+                            metadata=agent._build_memory_write_metadata(
+                                task_id=effective_task_id,
+                                tool_call_id=getattr(tool_call, "id", None),
+                            ),
+                        )
+                    except Exception:
+                        pass
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")

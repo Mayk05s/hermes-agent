@@ -41,6 +41,11 @@ class ScrollFakeDB:
         }
 
 
+class NeverCalledDB:
+    def __getattr__(self, name):
+        raise AssertionError(f"DB must not be used without a trusted scope: {name}")
+
+
 def test_session_search_passes_current_scope_filter_to_db_discovery():
     db = ScopedFakeDB()
 
@@ -98,3 +103,62 @@ def test_scoped_scroll_denies_raw_cross_scope_read():
     assert result["success"] is False
     assert "scope" in result["error"].lower()
     assert "bob secret" not in json.dumps(result)
+
+
+def test_gateway_search_without_scope_fails_before_opening_db():
+    result = json.loads(session_search(
+        query="private canary",
+        db=NeverCalledDB(),
+        current_access_scope=None,
+        require_access_scope=True,
+    ))
+
+    assert result == {
+        "success": False,
+        "error": "Session history is unavailable for the current access scope.",
+    }
+
+
+def test_gateway_search_with_malformed_scope_fails_before_query():
+    result = json.loads(session_search(
+        query="private canary",
+        db=NeverCalledDB(),
+        current_access_scope="../../other-user",
+        require_access_scope=True,
+    ))
+
+    assert result == {
+        "success": False,
+        "error": "Session history is unavailable for the current access scope.",
+    }
+
+
+def test_group_search_never_returns_private_dm_canary(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        private_scope = "agent:main:telegram:dm:mikhail"
+        group_scope = "agent:main:telegram:group:family"
+        db.create_session("private", "telegram", access_scope=private_scope)
+        db.append_message(
+            "private", "user", "PRIVATE_SESSION_CANARY_MIKHAIL"
+        )
+        db.create_session("group", "telegram", access_scope=group_scope)
+        db.append_message("group", "user", "ordinary group context")
+
+        result = json.loads(session_search(
+            query="PRIVATE_SESSION_CANARY_MIKHAIL",
+            db=db,
+            current_session_id="group",
+            current_access_scope=group_scope,
+            require_access_scope=True,
+        ))
+
+        assert result["success"] is True
+        assert result["results"] == []
+        assert "PRIVATE_SESSION_CANARY_MIKHAIL" not in json.dumps(
+            result["results"]
+        )
+    finally:
+        db.close()

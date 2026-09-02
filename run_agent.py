@@ -393,12 +393,14 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        user_id_alt: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        memory_access_context=None,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
@@ -462,12 +464,14 @@ class AIAgent:
             prefill_messages=prefill_messages,
             platform=platform,
             user_id=user_id,
+            user_id_alt=user_id_alt,
             user_name=user_name,
             chat_id=chat_id,
             chat_name=chat_name,
             chat_type=chat_type,
             thread_id=thread_id,
             gateway_session_key=gateway_session_key,
+            memory_access_context=memory_access_context,
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
@@ -482,6 +486,19 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
+
+    def bind_memory_access_context(self, context) -> None:
+        """Replace the trusted context for the current request, or clear it."""
+        try:
+            from gateway.memory_access import MemoryAccessContext
+
+            trusted = context if isinstance(context, MemoryAccessContext) else None
+        except Exception:
+            trusted = None
+        self._memory_access_context = trusted
+        manager = getattr(self, "_memory_manager", None)
+        if manager is not None:
+            manager.set_access_context(trusted)
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.

@@ -1,9 +1,9 @@
-"""Mediated cross-scope query tool skeleton.
+"""Disabled cross-scope query tool placeholder.
 
-This tool deliberately does not read another chat's history or memory.  It only
-checks whether the current/source scope is allowed to ask a target scope a
-specific question, then delegates to a mediated runner which must execute inside
-the target scope and return a final answer/summary.
+The former skeleton accepted a model-selected target and a generic directional
+grant.  That is not a safe disclosure boundary: private-to-group disclosure
+requires a separate selected-fact broker, not target-agent transcript access.
+Keep the registered handler fail-closed until that broker exists.
 """
 
 from __future__ import annotations
@@ -11,18 +11,8 @@ from __future__ import annotations
 import json
 from typing import Callable, Optional
 
-from gateway.access_grants import check_scope_query_grant
-from gateway.access_scope import normalize_scope_key
-
 MediatedRunner = Callable[..., str]
 GrantChecker = Callable[[str, str], bool]
-
-
-def _default_mediated_runner(*, source_scope: str, target_scope: str, question: str) -> str:
-    raise NotImplementedError(
-        "mediated cross-scope agent execution is not wired yet; this foundational "
-        "slice only enforces grants and the no-raw-read tool contract"
-    )
 
 
 def query_chat_agent(
@@ -33,63 +23,30 @@ def query_chat_agent(
     mediated_runner: Optional[MediatedRunner] = None,
     grant_checker: Optional[GrantChecker] = None,
 ) -> str:
-    """Ask another chat/topic agent a concrete question through a mediated grant.
+    """Fail closed regardless of target, grants, or injected runner.
 
-    The response shape never includes raw messages/history/memory.  Missing
-    grants return a structured ``requires_approval`` payload with the directional
-    grant key the gateway/UX can approve using once/session/always/deny.
+    Parameters remain for source compatibility only.  In particular, neither a
+    model-selected ``target_scope`` nor a generic grant can enable access.
     """
 
-    src = normalize_scope_key(source_scope or "")
-    dst = normalize_scope_key(target_scope)
-    if not src:
-        return json.dumps({"success": False, "error": "source_scope is required"}, ensure_ascii=False)
-    if not dst:
-        return json.dumps({"success": False, "error": "target_scope is required"}, ensure_ascii=False)
-    if not isinstance(question, str) or not question.strip():
-        return json.dumps({"success": False, "error": "question is required"}, ensure_ascii=False)
-
-    decision = check_scope_query_grant(src, dst)
-    if grant_checker is not None:
-        allowed = bool(grant_checker(src, dst))
-    else:
-        allowed = decision.allowed
-
-    if not allowed:
-        return json.dumps({
+    del question, target_scope, source_scope, mediated_runner, grant_checker
+    return json.dumps(
+        {
             "success": False,
-            "requires_approval": True,
-            "grant_key": decision.grant_key,
-            "source_scope": src,
-            "target_scope": dst,
-            "reason": decision.reason,
-            "message": "Approval permits asking the target chat agent; it does not permit reading raw history or memory.",
-        }, ensure_ascii=False)
-
-    runner = mediated_runner or _default_mediated_runner
-    try:
-        answer = runner(source_scope=src, target_scope=dst, question=question.strip())
-    except NotImplementedError as exc:
-        return json.dumps({
-            "success": False,
-            "error": str(exc),
-            "source_scope": src,
-            "target_scope": dst,
-        }, ensure_ascii=False)
-
-    return json.dumps({
-        "success": True,
-        "source_scope": src,
-        "target_scope": dst,
-        "answer": str(answer),
-    }, ensure_ascii=False)
+            "error": (
+                "Cross-scope query is unavailable until a selected-fact broker "
+                "is configured."
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 QUERY_CHAT_AGENT_SCHEMA = {
     "name": "query_chat_agent",
     "description": (
-        "Ask another chat/topic agent a concrete question via a mediated cross-scope grant. "
-        "This does not expose raw history, messages, or memory; the caller receives only the target agent's final answer/summary."
+        "Reserved selected-fact broker operation. This capability is currently "
+        "disabled and never reads another chat's transcript or memory."
     ),
     "parameters": {
         "type": "object",

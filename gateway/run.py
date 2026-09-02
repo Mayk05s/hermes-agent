@@ -1162,6 +1162,12 @@ logger = logging.getLogger(__name__)
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# In-process authorization stamp for memory propagation. Platform payloads
+# can pre-populate arbitrary MessageEvent attributes, but cannot reproduce
+# this object identity. Every gateway entry path overwrites/clears the stamp
+# before it is trusted.
+_MEMORY_AUTHORIZED_EVENT_STAMP = object()
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
@@ -2514,6 +2520,108 @@ class GatewayRunner:
         )
         return routed
 
+    @staticmethod
+    def _memory_source_for_current_event(
+        event: MessageEvent,
+        routed_source: SessionSource,
+    ) -> tuple[SessionSource, bool]:
+        """Return an ephemeral source with the current event's actor/provenance.
+
+        Telegram observed-group routing intentionally strips the participant
+        from the shared session source. Recover it only from the current raw
+        platform event; never from persisted session metadata or observed
+        history. This ephemeral copy is used solely by the memory resolver.
+        """
+        event_source = getattr(event, "source", None)
+        user_id = getattr(event_source, "user_id", None)
+        user_id_alt = getattr(event_source, "user_id_alt", None)
+        platform = getattr(getattr(routed_source, "platform", None), "value", "")
+        if not user_id and not user_id_alt and platform == "telegram":
+            raw_user = getattr(getattr(event, "raw_message", None), "from_user", None)
+            raw_user_id = getattr(raw_user, "id", None)
+            if raw_user_id is not None:
+                user_id = str(raw_user_id)
+        message_id = getattr(event, "message_id", None)
+        ephemeral = dataclasses.replace(
+            routed_source,
+            user_id=str(user_id) if user_id is not None else None,
+            user_id_alt=str(user_id_alt) if user_id_alt is not None else None,
+            message_id=str(message_id) if message_id is not None else None,
+        )
+        return ephemeral, bool(user_id or user_id_alt)
+
+    def _memory_access_context_for_event(
+        self,
+        event: MessageEvent,
+        routed_source: SessionSource,
+        *,
+        request_authorized: bool,
+    ):
+        """Resolve trusted memory scope from the current authenticated event."""
+        if request_authorized is not True:
+            return None
+        try:
+            from gateway.memory_access import (
+                decode_memory_opaque_id_key,
+                parse_memory_access_policy,
+                resolve_memory_access_context,
+            )
+
+            root_config = _load_gateway_config()
+            if not isinstance(root_config, dict):
+                return None
+            memory_config = root_config.get("memory")
+            if not isinstance(memory_config, dict) or "access" not in memory_config:
+                return None
+            policy = parse_memory_access_policy(memory_config.get("access"))
+            opaque_key = decode_memory_opaque_id_key(
+                os.getenv("HERMES_MEMORY_OPAQUE_ID_KEY", "")
+            )
+            current_source, principal_verified = self._memory_source_for_current_event(
+                event, routed_source
+            )
+            return resolve_memory_access_context(
+                current_source,
+                policy,
+                request_authorized=True,
+                principal_verified=principal_verified,
+                opaque_id_key=opaque_key,
+            )
+        except Exception as exc:
+            # Memory is optional, but an invalid/missing policy or key must
+            # disable it for this request instead of falling back to a broader
+            # profile-scoped provider.
+            logger.warning(
+                "Trusted memory context unavailable; memory disabled (%s)",
+                type(exc).__name__,
+            )
+            return None
+
+    @staticmethod
+    def _proxy_memory_access_must_fail_closed(memory_access_context: Any) -> bool:
+        """Whether legacy proxy mode lacks a safe memory-context protocol."""
+        if memory_access_context is not None:
+            return True
+        try:
+            from gateway.memory_access import parse_memory_access_policy
+
+            root_config = _load_gateway_config()
+            if not isinstance(root_config, dict):
+                return True
+            memory_config = root_config.get("memory")
+            if memory_config is None:
+                return False
+            if not isinstance(memory_config, dict):
+                return True
+            if "access" not in memory_config:
+                return False
+            policy = parse_memory_access_policy(memory_config.get("access"))
+            return bool(policy.principals or policy.groups)
+        except Exception:
+            # An unreadable or invalid configured policy cannot prove that
+            # this legacy transport is safe.
+            return True
+
     def _profile_allowed_skills_for_source(self, source: SessionSource) -> list[str]:
         profile_name = str(getattr(source, "profile_name", "") or "default")
         try:
@@ -3537,11 +3645,92 @@ class GatewayRunner:
         except Exception:
             return False
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    @staticmethod
+    def _memory_event_actor_key(event: MessageEvent) -> tuple[str, str, str]:
+        source = getattr(event, "source", None)
+        platform = str(
+            getattr(getattr(source, "platform", None), "value", "") or ""
+        )
+        user_id = str(getattr(source, "user_id", None) or "")
+        user_id_alt = str(getattr(source, "user_id_alt", None) or "")
+        if not user_id and not user_id_alt and platform == "telegram":
+            raw_user = getattr(getattr(event, "raw_message", None), "from_user", None)
+            user_id = str(getattr(raw_user, "id", None) or "")
+        return platform, user_id, user_id_alt
+
+    @staticmethod
+    def _stamp_event_memory_authorization(
+        event: MessageEvent,
+        authorized: bool,
+    ) -> None:
+        """Overwrite any input-supplied value with a gateway-owned stamp."""
+        event._gateway_memory_authorization_stamp = (
+            _MEMORY_AUTHORIZED_EVENT_STAMP if authorized is True else None
+        )
+
+    @staticmethod
+    def _memory_event_is_authorized(event: MessageEvent) -> bool:
+        return (
+            getattr(event, "_gateway_memory_authorization_stamp", None)
+            is _MEMORY_AUTHORIZED_EVENT_STAMP
+        )
+
+    @staticmethod
+    def _memory_event_boundary_key(event: MessageEvent) -> tuple[str, ...]:
+        source = getattr(event, "source", None)
+        return (
+            str(getattr(getattr(source, "platform", None), "value", "") or ""),
+            str(getattr(source, "chat_type", None) or ""),
+            str(getattr(source, "chat_id", None) or ""),
+            str(getattr(source, "thread_id", None) or ""),
+            str(getattr(source, "profile_name", None) or ""),
+            str(getattr(source, "scope_name", None) or ""),
+            str(getattr(source, "memory_scope", None) or ""),
+        )
+
+    @staticmethod
+    def _memory_event_message_id(event: MessageEvent) -> str:
+        value = getattr(event, "message_id", None)
+        if value is None:
+            value = getattr(getattr(event, "source", None), "message_id", None)
+        return str(value or "")
+
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: bool = False,
+    ) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        existing = adapter._pending_messages.get(session_key)
+        if (
+            existing is not None
+            and (
+                self._memory_event_is_authorized(existing)
+                != self._memory_event_is_authorized(event)
+                or self._memory_event_actor_key(existing)
+                != self._memory_event_actor_key(event)
+                or self._memory_event_boundary_key(existing)
+                != self._memory_event_boundary_key(event)
+                or self._memory_event_message_id(existing)
+                != self._memory_event_message_id(event)
+            )
+        ):
+            # A shared lane may receive overlapping messages from different
+            # people, authorization paths, scopes, or source events. Keep
+            # those as distinct FIFO turns so content and provenance are
+            # never merged under the first event's access context.
+            self._enqueue_fifo(session_key, event, adapter)
+            return
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            event,
+            merge_text=merge_text,
+        )
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -3559,6 +3748,11 @@ class GatewayRunner:
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        # Like the main dispatch path, mark only after this current event has
+        # passed gateway authorization. The marker is transient and lets the
+        # recursive drain rebuild a fresh MemoryAccessContext.
+        self._stamp_event_memory_authorization(event, True)
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -3651,8 +3845,7 @@ class GatewayRunner:
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
-            merge_pending_message_event(
-                adapter._pending_messages,
+            self._queue_or_replace_pending_event(
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
@@ -7566,6 +7759,9 @@ class GatewayRunner:
         6. Run agent conversation
         7. Return response
         """
+        # Discard any input/plugin-supplied authorization marker before this
+        # event reaches hooks or auth. Only the gateway can stamp it later.
+        self._stamp_event_memory_authorization(event, False)
         source = event.source
 
         # Internal events (e.g. background-process completion notifications)
@@ -7663,6 +7859,11 @@ class GatewayRunner:
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Transient, gateway-owned marker for queued follow-up events. It is
+        # assigned only after the current event passed authorization and is
+        # never serialized into SessionSource/transcript state.
+        self._stamp_event_memory_authorization(event, not is_internal)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -7959,6 +8160,7 @@ class GatewayRunner:
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
+                    self._stamp_event_memory_authorization(queued_event, True)
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
@@ -7986,6 +8188,7 @@ class GatewayRunner:
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
                         )
+                        self._stamp_event_memory_authorization(queued_event, True)
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
@@ -8008,6 +8211,7 @@ class GatewayRunner:
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
+                    self._stamp_event_memory_authorization(queued_event, True)
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
@@ -8113,7 +8317,7 @@ class GatewayRunner:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    self._queue_or_replace_pending_event(_quick_key, event)
                 return None
 
             _telegram_followup_grace = float(
@@ -8134,8 +8338,7 @@ class GatewayRunner:
                 )
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
+                    self._queue_or_replace_pending_event(
                         _quick_key,
                         event,
                         merge_text=True,
@@ -8154,8 +8357,7 @@ class GatewayRunner:
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
+                    self._queue_or_replace_pending_event(
                         _quick_key,
                         event,
                         merge_text=True,
@@ -8681,7 +8883,9 @@ class GatewayRunner:
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            _agent_result = await self._handle_message_with_agent(
+                event, source, _quick_key, _run_generation
+            )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -9064,6 +9268,13 @@ class GatewayRunner:
                 pass
 
         source = self._source_with_profile_scope(source)
+        memory_access_context = self._memory_access_context_for_event(
+            event,
+            source,
+            request_authorized=(
+                self._memory_event_is_authorized(event)
+            ),
+        )
         try:
             event.source = source
         except Exception:
@@ -9689,6 +9900,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                memory_access_context=memory_access_context,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -16849,6 +17061,7 @@ class GatewayRunner:
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        memory_access_fingerprint: str | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -16876,6 +17089,11 @@ class GatewayRunner:
         broke #27371's per-user-peer contract in multi-user gateways.
         Per-user agent rebuilds in shared threads trade prompt-cache
         warmth for correct memory attribution.
+
+        ``memory_access_fingerprint`` is the stable effective ACL/cache
+        fingerprint. It excludes per-message source provenance, so sequential
+        messages with the same boundary reuse the agent while participant,
+        destination, profile/zone, grant, and policy changes rebuild it.
         """
         import hashlib, json as _j
 
@@ -16902,6 +17120,7 @@ class GatewayRunner:
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                str(memory_access_fingerprint or ""),
             ],
             sort_keys=True,
             default=str,
@@ -17108,7 +17327,34 @@ class GatewayRunner:
                 self._agent_cache.pop(session_key, None)
 
     @staticmethod
-    def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
+    def _bind_agent_memory_access_context(agent: Any, context: Any) -> None:
+        """Replace current request context on an agent, including with None."""
+        if context is not None:
+            try:
+                from gateway.memory_access import MemoryAccessContext
+
+                if not isinstance(context, MemoryAccessContext):
+                    context = None
+            except Exception:
+                context = None
+        binder = getattr(type(agent), "bind_memory_access_context", None)
+        if callable(binder):
+            binder(agent, context)
+            return
+        # Compatibility for test doubles/older cached instances. New agents
+        # use the method above so their MemoryManager is updated too.
+        agent._memory_access_context = context
+        manager = getattr(agent, "_memory_manager", None)
+        if manager is not None and hasattr(manager, "set_access_context"):
+            manager.set_access_context(context)
+
+    @classmethod
+    def _init_cached_agent_for_turn(
+        cls,
+        agent: Any,
+        interrupt_depth: int,
+        memory_access_context: Any = None,
+    ) -> None:
         """Reset per-turn state on a cached agent before a new turn starts.
 
         Both _last_activity_ts and _last_activity_desc are only reset for
@@ -17125,6 +17371,7 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+        cls._bind_agent_memory_access_context(agent, memory_access_context)
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
@@ -17590,6 +17837,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        memory_access_context=None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17603,8 +17851,31 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        if memory_access_context is not None:
+            try:
+                from gateway.memory_access import MemoryAccessContext
+
+                if not isinstance(memory_access_context, MemoryAccessContext):
+                    memory_access_context = None
+            except Exception:
+                memory_access_context = None
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if self._proxy_memory_access_must_fail_closed(memory_access_context):
+                logger.warning(
+                    "Gateway proxy disabled: authenticated memory-context protocol unavailable"
+                )
+                return {
+                    "final_response": (
+                        "⚠️ Proxy mode is unavailable while scoped memory access is configured."
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "history_offset": len(history),
+                    "session_id": session_id,
+                    "response_previewed": False,
+                }
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -18465,6 +18736,11 @@ class GatewayRunner:
                 },
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
+                memory_access_fingerprint=(
+                    memory_access_context.cache_fingerprint
+                    if memory_access_context is not None
+                    else ""
+                ),
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -18481,7 +18757,11 @@ class GatewayRunner:
                                 _cache.move_to_end(session_key)
                             except KeyError:
                                 pass
-                        self._init_cached_agent_for_turn(agent, _interrupt_depth)
+                        self._init_cached_agent_for_turn(
+                            agent,
+                            _interrupt_depth,
+                            memory_access_context,
+                        )
                         logger.debug("Reusing cached agent for session %s", session_key)
 
             if agent is None:
@@ -18515,6 +18795,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    memory_access_context=memory_access_context,
                     system_prompt_signature=_sig,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
@@ -19622,7 +19903,7 @@ class GatewayRunner:
                     )
                     adapter = self.adapters.get(source.platform)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._queue_or_replace_pending_event(session_key, pending_event)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
@@ -19703,6 +19984,7 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_memory_access_context = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -19720,6 +20002,14 @@ class GatewayRunner:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_source = self._source_with_profile_scope(next_source)
+                    next_memory_access_context = self._memory_access_context_for_event(
+                        pending_event,
+                        next_source,
+                        request_authorized=(
+                            self._memory_event_is_authorized(pending_event)
+                        ),
+                    )
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -19745,6 +20035,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    memory_access_context=next_memory_access_context,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

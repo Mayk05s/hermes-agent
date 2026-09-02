@@ -30,6 +30,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.session_id = "test-session-id"
     agent.model = "test-model"
     agent.platform = "cli"
+    agent._builtin_profile_memory_allowed = True
     agent._session_db = session_db
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent

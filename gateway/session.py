@@ -976,14 +976,10 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
-                "access_scope": json.dumps(
-                    {
-                        "session_key": session_key,
-                        "origin": source.to_dict(),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
+                # Exact transcript ACL key. Raw destination/user metadata is
+                # already persisted in sessions.json and must not replace the
+                # equality key used by SessionDB scope filters.
+                "access_scope": session_key,
             }
 
         # SQLite operations outside the lock

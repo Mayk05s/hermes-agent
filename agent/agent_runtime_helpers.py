@@ -39,7 +39,11 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_surrogates,
 )
-from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+from agent.tool_dispatch_helpers import (
+    _trajectory_normalize_msg,
+    is_explicit_local_cli_context,
+    make_tool_result_message,
+)
 from agent.trajectory import convert_scratchpad_to_think
 from agent.error_classifier import classify_api_error, FailoverReason
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
@@ -1514,6 +1518,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             store=agent._todo_store,
         )
     elif function_name == "session_search":
+        gateway_scoped = not is_explicit_local_cli_context(
+            getattr(agent, "platform", ""),
+            getattr(agent, "_gateway_session_key", None),
+        )
         session_db = agent._get_session_db_for_recall()
         if not session_db:
             from hermes_state import format_session_db_unavailable
@@ -1530,8 +1538,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             db=session_db,
             current_session_id=agent.session_id,
             current_access_scope=getattr(agent, "_gateway_session_key", None),
+            require_access_scope=gateway_scoped,
         )
     elif function_name == "memory":
+        if not getattr(agent, "_builtin_profile_memory_allowed", False):
+            return json.dumps(
+                {"success": False, "error": "Built-in memory is unavailable in this context."},
+                ensure_ascii=False,
+            )
         target = function_args.get("target", "memory")
         from tools.memory_tool import memory_tool as _memory_tool
         result = _memory_tool(
@@ -1557,6 +1571,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 pass
         return result
     elif function_name == "query_chat_agent":
+        if not is_explicit_local_cli_context(
+            getattr(agent, "platform", ""),
+            getattr(agent, "_gateway_session_key", None),
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Cross-scope query is unavailable until a selected-fact broker is configured.",
+                },
+                ensure_ascii=False,
+            )
         from tools.registry import registry as _tool_registry
         return _tool_registry.dispatch(
             function_name,

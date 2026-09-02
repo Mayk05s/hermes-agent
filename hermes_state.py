@@ -317,6 +317,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 DEFERRED_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
+CREATE INDEX IF NOT EXISTS idx_sessions_access_scope
+    ON sessions(access_scope);
 """
 
 FTS_SQL = """
@@ -1532,7 +1534,11 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(
+        self,
+        session_id: str,
+        scope_filter: Optional[str] = None,
+    ) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child session where:
@@ -1548,19 +1554,32 @@ class SessionDB:
         input itself doesn't exist).
         """
         current = session_id
+        if scope_filter is not None and not self.session_matches_scope(
+            current, scope_filter
+        ):
+            return current
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
+            scope_sql = " AND access_scope = ?" if scope_filter is not None else ""
+            query = (
+                "SELECT id FROM sessions "
+                "WHERE parent_session_id = ?"
+                f"{scope_sql} "
+                "AND started_at >= ("
+                "    SELECT ended_at FROM sessions "
+                "    WHERE id = ? AND end_reason = 'compression'"
+                ") "
+                "ORDER BY started_at DESC LIMIT 1"
+            )
             with self._lock:
                 cursor = self._conn.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE parent_session_id = ? "
-                    "  AND started_at >= ("
-                    "      SELECT ended_at FROM sessions "
-                    "      WHERE id = ? AND end_reason = 'compression'"
-                    "  ) "
-                    "ORDER BY started_at DESC LIMIT 1",
-                    (current, current),
+                    query,
+                    (
+                        (current, scope_filter, current)
+                        if scope_filter is not None
+                        else (current, current)
+                    ),
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -1580,6 +1599,7 @@ class SessionDB:
         order_by_last_active: bool = False,
         include_archived: bool = False,
         archived_only: bool = False,
+        scope_filter: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1632,6 +1652,9 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if scope_filter is not None:
+            where_clauses.append("s.access_scope = ?")
+            params.append(scope_filter)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
@@ -1663,6 +1686,11 @@ class SessionDB:
                     JOIN sessions child ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
                       AND child.started_at >= parent.ended_at
+                      AND child.access_scope IS (
+                          SELECT root.access_scope
+                          FROM sessions root
+                          WHERE root.id = c.root_id
+                      )
                 ),
                 chain_max AS (
                     SELECT
@@ -1744,11 +1772,15 @@ class SessionDB:
                 if s.get("end_reason") != "compression":
                     projected.append(s)
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_compression_tip(
+                    s["id"], scope_filter=scope_filter
+                )
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
-                tip_row = self._get_session_rich_row(tip_id)
+                tip_row = self._get_session_rich_row(
+                    tip_id, scope_filter=scope_filter
+                )
                 if not tip_row:
                     projected.append(s)
                     continue
@@ -1768,7 +1800,11 @@ class SessionDB:
 
         return sessions
 
-    def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def _get_session_rich_row(
+        self,
+        session_id: str,
+        scope_filter: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a single session with the same enriched columns as
         ``list_sessions_rich`` (preview + last_active). Returns None if the
         session doesn't exist.
@@ -1788,9 +1824,12 @@ class SessionDB:
                 ) AS last_active
             FROM sessions s
             WHERE s.id = ?
+              AND (? IS NULL OR s.access_scope = ?)
         """
         with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+            cursor = self._conn.execute(
+                query, (session_id, scope_filter, scope_filter)
+            )
             row = cursor.fetchone()
         if not row:
             return None
@@ -2067,11 +2106,41 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def session_matches_scope(self, session_id: str, scope_filter: str) -> bool:
+        """Return whether a session belongs to one exact transcript scope."""
+        if not isinstance(session_id, str) or not isinstance(scope_filter, str):
+            return False
+        if not session_id or not scope_filter:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions "
+                "WHERE id = ? AND access_scope = ? LIMIT 1",
+                (session_id, scope_filter),
+            ).fetchone()
+        return row is not None
+
+    def message_matches_scope(self, message_id: int, scope_filter: str) -> bool:
+        """Return whether a message's owning session has one exact scope."""
+        if isinstance(message_id, bool) or not isinstance(message_id, int):
+            return False
+        if not isinstance(scope_filter, str) or not scope_filter:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.id = ? AND s.access_scope = ? LIMIT 1",
+                (message_id, scope_filter),
+            ).fetchone()
+        return row is not None
+
     def get_messages_around(
         self,
         session_id: str,
         around_message_id: int,
         window: int = 5,
+        scope_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Load a window of messages anchored on a specific message id.
 
@@ -2094,11 +2163,24 @@ class SessionDB:
         """
         if window < 0:
             window = 0
+        scope_sql = (
+            " AND EXISTS ("
+            "SELECT 1 FROM sessions s "
+            "WHERE s.id = messages.session_id AND s.access_scope = ?)"
+            if scope_filter is not None
+            else ""
+        )
         with self._lock:
             # Confirm the anchor exists in this session.
             anchor_exists = self._conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
-                (around_message_id, session_id),
+                "SELECT 1 FROM messages "
+                "WHERE id = ? AND session_id = ?"
+                f"{scope_sql} LIMIT 1",
+                (
+                    (around_message_id, session_id, scope_filter)
+                    if scope_filter is not None
+                    else (around_message_id, session_id)
+                ),
             ).fetchone()
             if not anchor_exists:
                 return {"window": [], "messages_before": 0, "messages_after": 0}
@@ -2107,15 +2189,25 @@ class SessionDB:
             # (ASC, take window). Final order is id ASC.
             before_rows = self._conn.execute(
                 "SELECT * FROM messages "
-                "WHERE session_id = ? AND id <= ? "
+                "WHERE session_id = ? AND id <= ?"
+                f"{scope_sql} "
                 "ORDER BY id DESC LIMIT ?",
-                (session_id, around_message_id, window + 1),
+                (
+                    (session_id, around_message_id, scope_filter, window + 1)
+                    if scope_filter is not None
+                    else (session_id, around_message_id, window + 1)
+                ),
             ).fetchall()
             after_rows = self._conn.execute(
                 "SELECT * FROM messages "
-                "WHERE session_id = ? AND id > ? "
+                "WHERE session_id = ? AND id > ?"
+                f"{scope_sql} "
                 "ORDER BY id ASC LIMIT ?",
-                (session_id, around_message_id, window),
+                (
+                    (session_id, around_message_id, scope_filter, window)
+                    if scope_filter is not None
+                    else (session_id, around_message_id, window)
+                ),
             ).fetchall()
 
         # before_rows is DESC; reverse so it's ASC, then concatenate after_rows.
@@ -2152,6 +2244,7 @@ class SessionDB:
         window: int = 5,
         bookend: int = 3,
         keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+        scope_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return an anchored window plus session bookends.
 
@@ -2185,7 +2278,10 @@ class SessionDB:
         # Reuse the primitive — handles anchor-existence, content decoding,
         # tool_calls deserialisation, and boundary counts.
         primitive = self.get_messages_around(
-            session_id, around_message_id, window=window
+            session_id,
+            around_message_id,
+            window=window,
+            scope_filter=scope_filter,
         )
         window_rows = primitive["window"]
         if not window_rows:
@@ -2224,21 +2320,40 @@ class SessionDB:
                     role_placeholders = ",".join("?" for _ in keep_roles)
                     role_clause = f" AND role IN ({role_placeholders})"
                     role_params = list(keep_roles)
+                scope_clause = (
+                    " AND EXISTS (SELECT 1 FROM sessions s "
+                    "WHERE s.id = messages.session_id AND s.access_scope = ?)"
+                    if scope_filter is not None
+                    else ""
+                )
+                scope_params = [scope_filter] if scope_filter is not None else []
 
                 bookend_start_rows = self._conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id < ?{role_clause} "
-                    f"AND length(content) > 0 "
+                    f"AND length(content) > 0{scope_clause} "
                     f"ORDER BY id ASC LIMIT ?",
-                    (session_id, window_min_id, *role_params, bookend),
+                    (
+                        session_id,
+                        window_min_id,
+                        *role_params,
+                        *scope_params,
+                        bookend,
+                    ),
                 ).fetchall()
 
                 bookend_end_rows = self._conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id > ?{role_clause} "
-                    f"AND length(content) > 0 "
+                    f"AND length(content) > 0{scope_clause} "
                     f"ORDER BY id DESC LIMIT ?",
-                    (session_id, window_max_id, *role_params, bookend),
+                    (
+                        session_id,
+                        window_max_id,
+                        *role_params,
+                        *scope_params,
+                        bookend,
+                    ),
                 ).fetchall()
                 # End rows came back DESC for the LIMIT cap; flip to ASC.
                 bookend_end_rows = list(reversed(bookend_end_rows))
@@ -2721,6 +2836,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        scope_filter: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -2795,6 +2911,9 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+        if scope_filter is not None:
+            where_clauses.append("s.access_scope = ?")
+            params.append(scope_filter)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -2870,6 +2989,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if scope_filter is not None:
+                    tri_where.append("s.access_scope = ?")
+                    tri_params.append(scope_filter)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -2925,6 +3047,11 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if not include_inactive:
+                    like_where.append("m.active = 1")
+                if scope_filter is not None:
+                    like_where.append("s.access_scope = ?")
+                    like_params.append(scope_filter)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,

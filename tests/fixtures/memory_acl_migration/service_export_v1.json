@@ -1,0 +1,42 @@
+{
+  "format": "mempalace-offline-export-v1",
+  "records": [
+    {
+      "kind": "drawer",
+      "id": "drawer-private-1",
+      "wing": "legacy-personal",
+      "payload": {
+        "room": "personal",
+        "content": "PRIVATE_SERVICE_CANARY"
+      },
+      "provenance": {
+        "adapter": "legacy-import",
+        "source": "profile-personal"
+      }
+    },
+    {
+      "kind": "document",
+      "id": "abcddcba",
+      "wing": "legacy-group",
+      "payload": {
+        "filename": "group-note.txt",
+        "content_base64": "R1JPVVBfU0VSVklDRV9DQU5BUlk="
+      },
+      "provenance": {
+        "adapter": "legacy-document"
+      }
+    },
+    {
+      "kind": "kg_entity",
+      "id": "legacy-null-entity",
+      "wing": null,
+      "payload": {
+        "name": "Unscoped legacy entity",
+        "type": "unknown"
+      },
+      "provenance": {
+        "adapter": "legacy-kg"
+      }
+    }
+  ]
+}

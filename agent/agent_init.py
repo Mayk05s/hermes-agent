@@ -49,6 +49,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailController,
     ToolGuardrailDecision,
 )
+from agent.tool_dispatch_helpers import is_explicit_local_cli_context
 from hermes_cli.config import cfg_get
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
@@ -136,6 +137,80 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _memory_provider_allowed_for_context(
+    provider_name: str,
+    provider: Any,
+    memory_access_context: Any,
+    *,
+    platform: Optional[str],
+    gateway_session_key: Optional[str] = None,
+) -> bool:
+    """Allow external memory only when its current caller can be scoped."""
+    if is_explicit_local_cli_context(platform, gateway_session_key):
+        return True
+    try:
+        from gateway.memory_access import MemoryAccessContext
+
+        trusted_context = isinstance(memory_access_context, MemoryAccessContext)
+    except Exception:
+        trusted_context = False
+    return bool(
+        provider is not None
+        and trusted_context
+        and getattr(provider, "enforces_trusted_access_context", False) is True
+    )
+
+
+def _builtin_profile_memory_allowed(
+    config: Any,
+    *,
+    platform: Optional[str],
+    gateway_session_key: Optional[str],
+    parent_session_id: Optional[str] = None,
+) -> bool:
+    """Keep legacy files local when trusted scoped memory policy is active.
+
+    MEMORY.md and USER.md are profile-global and cannot safely represent the
+    per-principal boundary. A non-empty gateway policy therefore uses only the
+    trusted external memory adapter. Invalid configured policy also fails
+    closed. Explicit local CLI use remains backward compatible.
+    """
+    if parent_session_id:
+        return False
+    platform_key = str(platform or "").strip().lower()
+    if is_explicit_local_cli_context(platform, gateway_session_key):
+        return True
+    if platform_key == "cron":
+        return False
+    if not isinstance(config, dict):
+        return False
+    memory_config = config.get("memory")
+    if memory_config is None:
+        return True
+    if not isinstance(memory_config, dict):
+        return False
+    if "access" not in memory_config:
+        return True
+    try:
+        from gateway.memory_access import parse_memory_access_policy
+
+        policy = parse_memory_access_policy(memory_config.get("access"))
+    except Exception:
+        return False
+    return not bool(policy.principals or policy.groups)
+
+
+def _remove_agent_tools(agent: Any, names: set[str]) -> None:
+    """Remove frozen tool definitions and validation names together."""
+    if agent.tools:
+        agent.tools = [
+            tool
+            for tool in agent.tools
+            if tool.get("function", {}).get("name") not in names
+        ]
+    agent.valid_tool_names.difference_update(names)
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -183,12 +258,14 @@ def init_agent(
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
+    user_id_alt: str = None,
     user_name: str = None,
     chat_id: str = None,
     chat_name: str = None,
     chat_type: str = None,
     thread_id: str = None,
     gateway_session_key: str = None,
+    memory_access_context: Any = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
@@ -265,12 +342,23 @@ def init_agent(
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
+    agent._user_id_alt = user_id_alt
     agent._user_name = user_name
     agent._chat_id = chat_id
     agent._chat_name = chat_name
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    try:
+        from gateway.memory_access import MemoryAccessContext
+
+        agent._memory_access_context = (
+            memory_access_context
+            if isinstance(memory_access_context, MemoryAccessContext)
+            else None
+        )
+    except Exception:
+        agent._memory_access_context = None
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1031,16 +1119,31 @@ def init_agent(
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
 
+    agent._builtin_profile_memory_allowed = _builtin_profile_memory_allowed(
+        _agent_cfg,
+        platform=platform,
+        gateway_session_key=gateway_session_key,
+        parent_session_id=parent_session_id,
+    )
+    if not agent._builtin_profile_memory_allowed:
+        _remove_agent_tools(agent, {"memory"})
+    if not is_explicit_local_cli_context(platform, gateway_session_key):
+        # The cross-scope skeleton accepts a model-selected target and has no
+        # selected-fact disclosure broker. It is unavailable in every gateway.
+        _remove_agent_tools(agent, {"query_chat_agent"})
+
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+    mem_config = _agent_cfg.get("memory", {})
+    if not isinstance(mem_config, dict):
+        mem_config = {}
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    if not skip_memory and agent._builtin_profile_memory_allowed:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1067,7 +1170,22 @@ def init_agent(
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
+                agent._memory_manager.set_access_context(agent._memory_access_context)
                 _mp = _load_mem(_mem_provider_name)
+                if not _memory_provider_allowed_for_context(
+                    _mem_provider_name,
+                    _mp,
+                    agent._memory_access_context,
+                    platform=platform,
+                    gateway_session_key=gateway_session_key,
+                ):
+                    # Gateway memory providers must enforce the trusted
+                    # request boundary themselves. Legacy providers remain
+                    # available only to the explicit local CLI path.
+                    _ra().logger.warning(
+                        "External memory provider disabled: trusted scoped adapter/context unavailable"
+                    )
+                    _mp = None
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 if agent._memory_manager.providers:
@@ -1076,6 +1194,7 @@ def init_agent(
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
+                        "memory_access_context": agent._memory_access_context,
                     }
                     # Thread session title for memory provider scoping
                     # (e.g. honcho uses this to derive chat-scoped session keys)
@@ -1089,6 +1208,8 @@ def init_agent(
                     # Thread gateway user identity for per-user memory scoping
                     if agent._user_id:
                         _init_kwargs["user_id"] = agent._user_id
+                    if agent._user_id_alt:
+                        _init_kwargs["user_id_alt"] = agent._user_id_alt
                     if agent._user_name:
                         _init_kwargs["user_name"] = agent._user_name
                     if agent._chat_id:

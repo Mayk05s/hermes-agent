@@ -1,7 +1,6 @@
 """Test that AuthError triggers fallback provider resolution (#7230)."""
 
-import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -23,13 +22,18 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
 
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
 
-        call_count = {"n": 0}
+        calls = []
 
         def _mock_resolve(**kwargs):
-            call_count["n"] += 1
-            requested = kwargs.get("requested", "")
-            if requested and "codex" in str(requested).lower():
+            calls.append(kwargs)
+            if len(calls) == 1:
+                assert kwargs == {}
                 raise AuthError("Codex token refresh failed with status 401")
+            assert kwargs == {
+                "requested": "openrouter",
+                "explicit_base_url": None,
+                "explicit_api_key": None,
+            }
             return {
                 "api_key": "fallback-key",
                 "base_url": "https://openrouter.ai/api/v1",
@@ -51,8 +55,7 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
 
         assert result["provider"] == "openrouter"
         assert result["api_key"] == "fallback-key"
-        # Should have been called at least twice (primary + fallback)
-        assert call_count["n"] >= 2
+        assert len(calls) == 2
 
     def test_auth_error_no_fallback_raises(self, tmp_path, monkeypatch):
         """When primary fails and no fallback configured, RuntimeError is raised."""

@@ -64,7 +64,11 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-def _resolve_to_parent(db, session_id: str) -> str:
+def _resolve_to_parent(
+    db,
+    session_id: str,
+    current_access_scope: Optional[str] = None,
+) -> str:
     """Walk parent_session_id chain to the lineage root. Falls back to input on errors."""
     if not session_id:
         return session_id
@@ -73,11 +77,20 @@ def _resolve_to_parent(db, session_id: str) -> str:
     while cur and cur not in visited:
         visited.add(cur)
         try:
+            if current_access_scope:
+                if not hasattr(db, "session_matches_scope"):
+                    break
+                if not db.session_matches_scope(cur, current_access_scope):
+                    break
             s = db.get_session(cur)
             if not s:
                 break
             parent = s.get("parent_session_id")
             if not parent:
+                break
+            if current_access_scope and not db.session_matches_scope(
+                parent, current_access_scope
+            ):
                 break
             cur = parent
         except Exception as e:
@@ -133,7 +146,11 @@ def _list_recent_sessions(
             sessions = db.list_sessions_rich(**list_kwargs)
         # fetch extra so we can skip current
 
-        current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
+        current_root = (
+            _resolve_to_parent(db, current_session_id, current_access_scope)
+            if current_session_id
+            else None
+        )
 
         results = []
         for s in sessions:
@@ -198,11 +215,28 @@ def _scroll(
             window = 5
     window = max(1, min(window, 20))
 
+    scoped_unavailable = "session is unavailable in the current access scope"
+    if current_access_scope:
+        try:
+            if not hasattr(db, "session_matches_scope") or not hasattr(
+                db, "message_matches_scope"
+            ):
+                return tool_error(scoped_unavailable, success=False)
+            if not db.session_matches_scope(session_id, current_access_scope):
+                return tool_error(scoped_unavailable, success=False)
+            if not db.message_matches_scope(
+                around_message_id, current_access_scope
+            ):
+                return tool_error(scoped_unavailable, success=False)
+        except Exception:
+            logging.debug("session scope ownership check failed", exc_info=True)
+            return tool_error(scoped_unavailable, success=False)
+
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
     if current_session_id:
-        a_root = _resolve_to_parent(db, session_id)
-        c_root = _resolve_to_parent(db, current_session_id)
+        a_root = _resolve_to_parent(db, session_id, current_access_scope)
+        c_root = _resolve_to_parent(db, current_session_id, current_access_scope)
         if a_root and c_root and a_root == c_root:
             return tool_error(
                 "scroll rejected: anchor lives in the current session lineage (already in your active context)",
@@ -216,44 +250,23 @@ def _scroll(
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         session_meta = {}
     if not session_meta:
-        return tool_error(f"session_id not found: {session_id}", success=False)
-
-    if current_access_scope:
-        try:
-            if not hasattr(db, "session_matches_scope"):
-                return tool_error(
-                    "scroll rejected: DB lacks scoped session ownership checks",
-                    success=False,
-                )
-            in_scope = db.session_matches_scope(session_id, current_access_scope)
-        except Exception as e:
-            logging.debug("session scope ownership check failed: %s", e, exc_info=True)
-            return tool_error("scroll rejected: failed to verify session scope ownership", success=False)
-        if not in_scope:
-            return tool_error(
-                "scroll rejected: session_id is outside the current access scope",
-                success=False,
-            )
-
-        try:
-            if not hasattr(db, "message_matches_scope"):
-                return tool_error(
-                    "scroll rejected: DB lacks scoped message ownership checks",
-                    success=False,
-                )
-            anchor_in_scope = db.message_matches_scope(around_message_id, current_access_scope)
-        except Exception as e:
-            logging.debug("anchor message scope ownership check failed: %s", e, exc_info=True)
-            return tool_error("scroll rejected: failed to verify anchor message scope ownership", success=False)
-        if not anchor_in_scope:
-            return tool_error(
-                "scroll rejected: anchor message is outside the current access scope",
-                success=False,
-            )
+        return tool_error(
+            scoped_unavailable if current_access_scope else f"session_id not found: {session_id}",
+            success=False,
+        )
 
     # Fetch the window
     try:
-        view = db.get_messages_around(session_id, around_message_id, window=window)
+        view_kwargs = {"window": window}
+        if current_access_scope:
+            view_kwargs["scope_filter"] = current_access_scope
+        view = db.get_messages_around(
+            session_id, around_message_id, **view_kwargs
+        )
+    except TypeError:
+        if current_access_scope:
+            return tool_error(scoped_unavailable, success=False)
+        raise
     except Exception as e:
         logging.error("get_messages_around failed: %s", e, exc_info=True)
         return tool_error(f"failed to load messages: {e}", success=False)
@@ -264,7 +277,7 @@ def _scroll(
     # message id that lives in a descendant (compaction / delegation creates
     # child sessions). Locate the real owning session and refetch.
     rebind_warning = None
-    if not messages:
+    if not messages and not current_access_scope:
         owning = None
         try:
             conn = getattr(db, "_conn", None)
@@ -278,22 +291,6 @@ def _scroll(
             logging.debug("owning-session lookup failed: %s", e, exc_info=True)
             owning = None
         if owning and owning != session_id:
-            if current_access_scope:
-                try:
-                    if not hasattr(db, "session_matches_scope"):
-                        return tool_error(
-                            "scroll rejected: DB lacks scoped session ownership checks",
-                            success=False,
-                        )
-                    owning_in_scope = db.session_matches_scope(owning, current_access_scope)
-                except Exception as e:
-                    logging.debug("anchor scope ownership check failed: %s", e, exc_info=True)
-                    return tool_error("scroll rejected: failed to verify anchor message scope ownership", success=False)
-                if not owning_in_scope:
-                    return tool_error(
-                        "scroll rejected: anchor message is outside the current access scope",
-                        success=False,
-                    )
             a_root = _resolve_to_parent(db, session_id)
             o_root = _resolve_to_parent(db, owning)
             if a_root and o_root and a_root == o_root:
@@ -316,7 +313,11 @@ def _scroll(
 
     if not messages:
         return tool_error(
-            f"around_message_id {around_message_id} not in session_id {session_id}",
+            (
+                scoped_unavailable
+                if current_access_scope
+                else f"around_message_id {around_message_id} not in session_id {session_id}"
+            ),
             success=False,
         )
 
@@ -387,7 +388,11 @@ def _discover(
             "message": "No matching sessions found.",
         }, ensure_ascii=False)
 
-    current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
+    current_lineage_root = (
+        _resolve_to_parent(db, current_session_id, current_access_scope)
+        if current_session_id
+        else None
+    )
 
     # Dedupe by lineage. Keep the raw owning session_id on the surviving
     # row — only that pairs validly with the FTS5 match id for the anchored
@@ -395,7 +400,7 @@ def _discover(
     seen_sessions = {}
     for r in raw_results:
         raw_sid = r["session_id"]
-        resolved_sid = _resolve_to_parent(db, raw_sid)
+        resolved_sid = _resolve_to_parent(db, raw_sid, current_access_scope)
         # Skip the current session lineage
         if current_lineage_root and resolved_sid == current_lineage_root:
             continue
@@ -413,7 +418,10 @@ def _discover(
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view_kwargs = {"window": 5, "bookend": 3}
+            if current_access_scope:
+                view_kwargs["scope_filter"] = current_access_scope
+            view = db.get_anchored_view(hit_sid, msg_id, **view_kwargs)
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
@@ -461,6 +469,7 @@ def session_search(
     db=None,
     current_session_id: str = None,
     current_access_scope: Optional[str] = None,
+    require_access_scope: bool = False,
     # Scroll shape
     session_id: str = None,
     around_message_id: int = None,
@@ -477,6 +486,26 @@ def session_search(
     Scroll wins over discovery when both are set — the agent has explicitly
     asked for a slice of a known session.
     """
+    if not current_access_scope and require_access_scope is not True:
+        try:
+            from tools.approval import get_current_session_key
+            current_access_scope = get_current_session_key(default="") or None
+        except Exception:
+            current_access_scope = None
+
+    if current_access_scope:
+        try:
+            from gateway.access_scope import normalize_scope_key
+
+            current_access_scope = normalize_scope_key(current_access_scope)
+        except Exception:
+            current_access_scope = None
+    if require_access_scope is True and not current_access_scope:
+        return tool_error(
+            "Session history is unavailable for the current access scope.",
+            success=False,
+        )
+
     if db is None:
         try:
             from hermes_state import SessionDB
@@ -485,13 +514,6 @@ def session_search(
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
-
-    if not current_access_scope:
-        try:
-            from tools.approval import get_current_session_key
-            current_access_scope = get_current_session_key(default="") or None
-        except Exception:
-            current_access_scope = None
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:

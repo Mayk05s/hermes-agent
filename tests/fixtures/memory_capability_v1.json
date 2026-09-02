@@ -1,0 +1,59 @@
+{
+  "description": "Deterministic test-only MemPalace capability v1 verifier vector. None of these credentials may be used outside tests.",
+  "environment": {
+    "MEMPALACE_BASE_URL": "https://memory.invalid",
+    "MEMPALACE_BEARER_TOKEN": "fixture-coarse-bearer-not-secret",
+    "MEMPALACE_BEARER_KID": "hermes-memory-v1",
+    "MEMPALACE_CAPABILITY_ISSUER": "hermes",
+    "MEMPALACE_CAPABILITY_AUDIENCE": "mempalace",
+    "MEMPALACE_CAPABILITY_HMAC_SECRET_HERMES": "fixture-hmac-secret-32-bytes-long!",
+    "MEMPALACE_POLICY_FINGERPRINT": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "MEMPALACE_CAPABILITY_TTL_SECONDS": "30"
+  },
+  "request": {
+    "method": "GET",
+    "raw_target": "/wings?limit=2&offset=1",
+    "body_utf8": "",
+    "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "authorization": "Bearer fixture-coarse-bearer-not-secret",
+    "request_id": "r_fixture0000000001"
+  },
+  "claims": {
+    "v": 1,
+    "iss": "hermes",
+    "aud": "mempalace",
+    "sub": "principal:p_aaaaaaaaaaaaaaaa",
+    "principal_id": "p_aaaaaaaaaaaaaaaa",
+    "actor_ref": "a_bbbbbbbbbbbbbbbb",
+    "source_ref": null,
+    "destination": {
+      "kind": "dm",
+      "platform": "telegram",
+      "chat_id": "c_cccccccccccccccc",
+      "thread_id": "root"
+    },
+    "read_wings": [
+      "private.p_aaaaaaaaaaaaaaaa.health",
+      "private.p_aaaaaaaaaaaaaaaa.personal"
+    ],
+    "write_wing": null,
+    "grants": [],
+    "policy_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "iat": 1788288000,
+    "exp": 1788288030,
+    "jti": "r_fixture0000000001",
+    "bearer_kid": "hermes-memory-v1",
+    "method": "GET",
+    "path": "/wings?limit=2&offset=1",
+    "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "canonical_payload_utf8": "{\"actor_ref\":\"a_bbbbbbbbbbbbbbbb\",\"aud\":\"mempalace\",\"bearer_kid\":\"hermes-memory-v1\",\"body_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"destination\":{\"chat_id\":\"c_cccccccccccccccc\",\"kind\":\"dm\",\"platform\":\"telegram\",\"thread_id\":\"root\"},\"exp\":1788288030,\"grants\":[],\"iat\":1788288000,\"iss\":\"hermes\",\"jti\":\"r_fixture0000000001\",\"method\":\"GET\",\"path\":\"/wings?limit=2&offset=1\",\"policy_fingerprint\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"principal_id\":\"p_aaaaaaaaaaaaaaaa\",\"read_wings\":[\"private.p_aaaaaaaaaaaaaaaa.health\",\"private.p_aaaaaaaaaaaaaaaa.personal\"],\"source_ref\":null,\"sub\":\"principal:p_aaaaaaaaaaaaaaaa\",\"v\":1,\"write_wing\":null}",
+  "canonical_payload_hex": "7b226163746f725f726566223a22615f62626262626262626262626262626262222c22617564223a226d656d70616c616365222c226265617265725f6b6964223a226865726d65732d6d656d6f72792d7631222c22626f64795f736861323536223a2265336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535222c2264657374696e6174696f6e223a7b22636861745f6964223a22635f63636363636363636363636363636363222c226b696e64223a22646d222c22706c6174666f726d223a2274656c656772616d222c227468726561645f6964223a22726f6f74227d2c22657870223a313738383238383033302c226772616e7473223a5b5d2c22696174223a313738383238383030302c22697373223a226865726d6573222c226a7469223a22725f6669787475726530303030303030303031222c226d6574686f64223a22474554222c2270617468223a222f77696e67733f6c696d69743d32266f66667365743d31222c22706f6c6963795f66696e6765727072696e74223a227368613235363a30303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030222c227072696e636970616c5f6964223a22705f61616161616161616161616161616161222c22726561645f77696e6773223a5b22707269766174652e705f616161616161616161616161616161612e6865616c7468222c22707269766174652e705f616161616161616161616161616161612e706572736f6e616c225d2c22736f757263655f726566223a6e756c6c2c22737562223a227072696e636970616c3a705f61616161616161616161616161616161222c2276223a312c2277726974655f77696e67223a6e756c6c7d",
+  "capability_header": "v1.eyJhY3Rvcl9yZWYiOiJhX2JiYmJiYmJiYmJiYmJiYmIiLCJhdWQiOiJtZW1wYWxhY2UiLCJiZWFyZXJfa2lkIjoiaGVybWVzLW1lbW9yeS12MSIsImJvZHlfc2hhMjU2IjoiZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NSIsImRlc3RpbmF0aW9uIjp7ImNoYXRfaWQiOiJjX2NjY2NjY2NjY2NjY2NjY2MiLCJraW5kIjoiZG0iLCJwbGF0Zm9ybSI6InRlbGVncmFtIiwidGhyZWFkX2lkIjoicm9vdCJ9LCJleHAiOjE3ODgyODgwMzAsImdyYW50cyI6W10sImlhdCI6MTc4ODI4ODAwMCwiaXNzIjoiaGVybWVzIiwianRpIjoicl9maXh0dXJlMDAwMDAwMDAwMSIsIm1ldGhvZCI6IkdFVCIsInBhdGgiOiIvd2luZ3M_bGltaXQ9MiZvZmZzZXQ9MSIsInBvbGljeV9maW5nZXJwcmludCI6InNoYTI1NjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwicHJpbmNpcGFsX2lkIjoicF9hYWFhYWFhYWFhYWFhYWFhIiwicmVhZF93aW5ncyI6WyJwcml2YXRlLnBfYWFhYWFhYWFhYWFhYWFhYS5oZWFsdGgiLCJwcml2YXRlLnBfYWFhYWFhYWFhYWFhYWFhYS5wZXJzb25hbCJdLCJzb3VyY2VfcmVmIjpudWxsLCJzdWIiOiJwcmluY2lwYWw6cF9hYWFhYWFhYWFhYWFhYWFhIiwidiI6MSwid3JpdGVfd2luZyI6bnVsbH0.MyXsXby_mq_3NoRk5FkAeM_SwlYEwO5381CQFAxUsWI",
+  "capability_header_sha256": "264fff54913170d286f1d36d6c78d7bf44d04309b239c4347a6a37d9ca676654",
+  "expected": {
+    "first_verification": "accepted",
+    "first_dispatch_consume": "accepted",
+    "second_dispatch_consume": "capability_replayed"
+  }
+}

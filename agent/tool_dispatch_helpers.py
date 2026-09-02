@@ -36,6 +36,20 @@ from agent.tool_result_classification import (
 
 logger = logging.getLogger(__name__)
 
+
+def is_explicit_local_cli_context(
+    platform: Any,
+    gateway_session_key: Optional[str],
+) -> bool:
+    """Return whether a tool call is certainly from the legacy local CLI.
+
+    An empty platform is local only when no gateway scope key is present.  A
+    gateway adapter may omit its platform label, so treating an empty label as
+    CLI on its own would make transcript and cross-scope guards fail open.
+    """
+    platform_key = str(platform or "").strip().lower()
+    return not gateway_session_key and platform_key in {"", "cli"}
+
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})

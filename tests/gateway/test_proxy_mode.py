@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform, StreamingConfig
+from gateway.memory_access import parse_memory_access_policy, resolve_memory_access_context
 from gateway.platforms.base import resolve_proxy_url
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -36,6 +37,51 @@ def _make_source(platform=Platform.MATRIX):
         user_id="@user:server.org",
         user_name="testuser",
         thread_id=None,
+    )
+
+
+def _active_memory_config():
+    return {
+        "memory": {
+            "access": {
+                "version": 1,
+                "default_private_zone": "personal",
+                "default_group_zone": "general",
+                "groups": [
+                    {
+                        "id": "matrix-room",
+                        "platform": "matrix",
+                        "chat_id": "!room:server.org",
+                        "zone": "general",
+                    }
+                ],
+                "principals": [
+                    {
+                        "id": "p_k3m7w2r5t6y4q2zx",
+                        "identities": [
+                            {"platform": "matrix", "user_id": "@user:server.org"}
+                        ],
+                        "dm_destinations": [
+                            {"platform": "matrix", "chat_id": "@user:server.org"}
+                        ],
+                        "private_zones": ["personal"],
+                        "group_memberships": ["matrix-room"],
+                        "dm_rules": [],
+                    }
+                ],
+            }
+        }
+    }
+
+
+def _group_memory_context():
+    source = _make_source()
+    return resolve_memory_access_context(
+        source,
+        parse_memory_access_policy(_active_memory_config()["memory"]["access"]),
+        request_authorized=True,
+        principal_verified=True,
+        opaque_id_key=b"proxy-memory-test-key-material-32b",
     )
 
 
@@ -191,19 +237,112 @@ class TestRunAgentProxyDispatch:
 
         runner._run_agent_via_proxy = AsyncMock(return_value=expected_result)
 
-        result = await runner._run_agent(
-            message="hi",
-            context_prompt="",
-            history=[],
-            source=source,
-            session_id="test-session-123",
-            session_key="test-key",
-            run_generation=7,
-        )
+        empty_policy = {
+            "memory": {
+                "access": {
+                    "version": 1,
+                    "default_private_zone": "personal",
+                    "default_group_zone": "general",
+                    "groups": [],
+                    "principals": [],
+                }
+            }
+        }
+        with patch("gateway.run._load_gateway_config", return_value=empty_policy):
+            result = await runner._run_agent(
+                message="hi",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="test-session-123",
+                session_key="test-key",
+                run_generation=7,
+            )
 
         assert result["final_response"] == "Hello from remote!"
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+
+    @pytest.mark.asyncio
+    async def test_active_memory_policy_with_valid_context_denies_legacy_proxy(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner._run_agent_via_proxy = AsyncMock()
+        memory_context = _group_memory_context()
+        assert memory_context is not None
+
+        with patch(
+            "gateway.run._load_gateway_config",
+            return_value=_active_memory_config(),
+        ):
+            result = await runner._run_agent(
+                message="hi",
+                context_prompt="",
+                history=[],
+                source=_make_source(),
+                session_id="test-session",
+                memory_access_context=memory_context,
+            )
+
+        assert result["api_calls"] == 0
+        assert "scoped memory access" in result["final_response"]
+        runner._run_agent_via_proxy.assert_not_called()
+        assert "authenticated memory-context protocol unavailable" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("memory_context", [None, {"write_wing": "forged"}])
+    async def test_active_memory_policy_without_valid_context_denies_legacy_proxy(
+        self,
+        monkeypatch,
+        memory_context,
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner._run_agent_via_proxy = AsyncMock()
+
+        with patch(
+            "gateway.run._load_gateway_config",
+            return_value=_active_memory_config(),
+        ):
+            result = await runner._run_agent(
+                message="hi",
+                context_prompt="",
+                history=[],
+                source=_make_source(),
+                session_id="test-session",
+                memory_access_context=memory_context,
+            )
+
+        assert result["api_calls"] == 0
+        runner._run_agent_via_proxy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_memory_policy_denies_legacy_proxy_without_logging_details(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner._run_agent_via_proxy = AsyncMock()
+        invalid = {"memory": {"access": {"principals": "secret-policy-value"}}}
+
+        with patch("gateway.run._load_gateway_config", return_value=invalid):
+            result = await runner._run_agent(
+                message="hi",
+                context_prompt="",
+                history=[],
+                source=_make_source(),
+                session_id="test-session",
+            )
+
+        assert result["api_calls"] == 0
+        runner._run_agent_via_proxy.assert_not_called()
+        assert "secret-policy-value" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_run_agent_skips_proxy_when_not_configured(self, monkeypatch):

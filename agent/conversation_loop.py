@@ -111,7 +111,15 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     """
     stored_prompt = None
     stored_state = "missing"
-    if conversation_history and agent._session_db:
+    # A stored prompt predates the current access-policy decision and may
+    # contain a legacy MEMORY.md/USER.md snapshot or memory recalled under a
+    # since-revoked membership. Scoped/invalid gateway policy therefore
+    # always rebuilds from the current trusted context instead of restoring
+    # this profile-global cache artifact.
+    restore_persisted_prompt = getattr(
+        agent, "_builtin_profile_memory_allowed", True
+    ) is True
+    if conversation_history and agent._session_db and restore_persisted_prompt:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:

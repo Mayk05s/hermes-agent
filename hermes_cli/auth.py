@@ -726,6 +726,9 @@ def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> 
 # Error Types
 # =============================================================================
 
+CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+
+
 class AuthError(RuntimeError):
     """Structured auth error with UX mapping hints."""
 
@@ -741,6 +744,15 @@ class AuthError(RuntimeError):
         self.provider = provider
         self.code = code
         self.relogin_required = relogin_required
+
+
+def is_rate_limited_auth_error(error: Exception) -> bool:
+    """Return whether an auth failure represents an upstream quota limit."""
+    return (
+        isinstance(error, AuthError)
+        and not error.relogin_required
+        and error.code == CODEX_RATE_LIMITED_CODE
+    )
 
 
 def format_auth_error(error: Exception) -> str:

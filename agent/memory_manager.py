@@ -252,6 +252,7 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self._memory_access_context = None
 
     # -- Registration --------------------------------------------------------
 
@@ -279,6 +280,7 @@ class MemoryManager:
                 return
             self._has_external = True
 
+        provider.set_access_context(self._memory_access_context)
         self._providers.append(provider)
 
         # Index tool names → provider for routing
@@ -300,6 +302,32 @@ class MemoryManager:
             provider.name,
             len(provider.get_tool_schemas()),
         )
+
+    def set_access_context(self, context: Any) -> None:
+        """Replace current request scope on every provider, including with None."""
+        self._memory_access_context = context
+        failed = []
+        for provider in list(self._providers):
+            try:
+                provider.set_access_context(context)
+            except Exception as exc:
+                failed.append(provider)
+                logger.warning(
+                    "Memory provider '%s' rejected current access context (%s)",
+                    provider.name,
+                    type(exc).__name__,
+                )
+        if failed:
+            failed_ids = {id(provider) for provider in failed}
+            self._providers = [
+                provider for provider in self._providers if id(provider) not in failed_ids
+            ]
+            self._tool_to_provider = {
+                name: owner
+                for name, owner in self._tool_to_provider.items()
+                if id(owner) not in failed_ids
+            }
+            self._has_external = any(provider.name != "builtin" for provider in self._providers)
 
     @property
     def providers(self) -> List[MemoryProvider]:
