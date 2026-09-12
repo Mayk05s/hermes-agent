@@ -1704,6 +1704,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             
             message_ids = []
+            shopping_list_url = str((metadata or {}).get("shopping_list_url") or "").strip()
+            if not re.fullmatch(
+                r"https://t\.me/TripiooBot\?startapp=shopping_(?:buy|take)_[A-Za-z0-9_-]+",
+                shopping_list_url,
+                flags=re.IGNORECASE,
+            ):
+                shopping_list_url = ""
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
@@ -1724,6 +1731,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
+                # Attach the action only to the final chunk, so one response
+                # always yields exactly one button for the resolved list.
+                reply_markup = None
+                if shopping_list_url and i == len(chunks) - 1:
+                    reply_markup = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Открыть список", url=shopping_list_url)
+                    ]])
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 reply_to_source = reply_to or (
@@ -1760,6 +1774,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                reply_markup=reply_markup,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -1774,6 +1789,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    reply_markup=reply_markup,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),

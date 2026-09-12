@@ -253,6 +253,54 @@ async def test_send_omits_general_topic_thread_id():
 
 
 @pytest.mark.asyncio
+async def test_send_attaches_exact_shopping_button_from_trusted_metadata(monkeypatch):
+    from gateway.platforms import telegram as telegram_mod
+
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardButton", _FakeInlineKeyboardButton)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardMarkup", _FakeInlineKeyboardMarkup)
+    adapter = _make_adapter()
+    call_log = []
+    url = "https://t.me/TripiooBot?startapp=shopping_take_0J3QsCDQvNC-0YDQtdC1"
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=43)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    result = await adapter.send(
+        chat_id="-100123",
+        content="Создал список.",
+        metadata={"thread_id": "1", "shopping_list_url": url},
+    )
+
+    assert result.success is True
+    markup = call_log[0]["reply_markup"]
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "Открыть список"
+    assert button.kwargs["url"] == url
+
+
+@pytest.mark.asyncio
+async def test_send_rejects_untrusted_shopping_button_url():
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=44)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    result = await adapter.send(
+        chat_id="-100123",
+        content="Обычный ответ.",
+        metadata={"shopping_list_url": "https://evil.example/open"},
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_markup"] is None
+
+
+@pytest.mark.asyncio
 async def test_send_typing_preserves_general_topic_thread_id():
     """Typing for forum General must send message_thread_id=1, not None.
 

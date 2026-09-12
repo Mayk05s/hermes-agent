@@ -993,6 +993,11 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Trusted, event-scoped delivery directives produced by the gateway after
+    # tool execution. They are never populated from model text. Kept after all
+    # historical fields to preserve positional-constructor compatibility.
+    outbound_metadata: Dict[str, Any] = field(default_factory=dict)
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -3126,6 +3131,13 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
 
+            # The handler may add trusted delivery directives after inspecting
+            # structured tool results. Merge only after it returns so the final
+            # send sees them, while the typing task keeps its original metadata.
+            if event.outbound_metadata:
+                _thread_metadata = dict(_thread_metadata or {})
+                _thread_metadata.update(event.outbound_metadata)
+
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
             # for system notices like "✨ New session started!" that the user
@@ -3181,6 +3193,8 @@ class BasePlatformAdapter(ABC):
                 local_files, text_content = self.extract_local_files(text_content)
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                if event.outbound_metadata.get("shopping_list_url") and not text_content:
+                    text_content = "Открыть список"
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -3214,6 +3228,7 @@ class BasePlatformAdapter(ABC):
                         if (
                             self.platform == Platform.TELEGRAM
                             and text_content
+                            and not event.outbound_metadata.get("shopping_list_url")
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content

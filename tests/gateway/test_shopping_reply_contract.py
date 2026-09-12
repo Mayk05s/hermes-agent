@@ -2,7 +2,10 @@
 
 import json
 
-from gateway.shopping_reply_contract import enforce_shopping_reply_contract
+from gateway.shopping_reply_contract import (
+    enforce_shopping_reply_contract,
+    shopping_reply_target_url,
+)
 
 
 SEA_URL = "https://t.me/TripiooBot?startapp=shopping_take_0J3QsCDQvNC-0YDQtdC1"
@@ -65,9 +68,8 @@ def test_sea_add_then_readback_gets_exactly_one_target_link():
         "Создал общий список. Проверил — оба пункта в списке.", messages, history_offset=0
     )
 
-    assert actual.endswith(f"[Открыть список]({SEA_URL})")
-    assert actual.count(SEA_URL) == 1
-    assert actual.count("Открыть список") == 1
+    assert actual == "Создал общий список. Проверил — оба пункта в списке."
+    assert shopping_reply_target_url(messages) == SEA_URL
 
 
 def test_real_protected_transcript_envelope_is_parsed_safely():
@@ -85,8 +87,8 @@ def test_real_protected_transcript_envelope_is_parsed_safely():
 
     actual = enforce_shopping_reply_contract("Создал список.", messages)
 
-    assert actual.endswith(f"[Открыть список]({SEA_URL})")
-    assert actual.count(SEA_URL) == 1
+    assert actual == "Создал список."
+    assert shopping_reply_target_url(messages) == SEA_URL
 
 
 def test_protected_envelope_source_must_match_trusted_tool_call():
@@ -112,8 +114,8 @@ def test_existing_target_url_is_normalized_to_one_named_link():
 
     actual = enforce_shopping_reply_contract(response, messages)
 
-    assert actual.count(SEA_URL) == 1
-    assert actual.count("Открыть список") == 1
+    assert actual == "Готово."
+    assert shopping_reply_target_url(messages) == SEA_URL
 
 
 def test_no_link_for_successful_noop_mutation():
@@ -129,9 +131,8 @@ def test_exact_read_only_list_gets_link():
         _call("read", "mcp_health_actions_list_shopping_items"),
         _result("read", "list-shopping-items", {"changed": False, "open": True, "launch_url": SEA_URL}, listName="На море"),
     ]
-    assert enforce_shopping_reply_contract("Вот список.", messages).endswith(
-        f"[Открыть список]({SEA_URL})"
-    )
+    assert enforce_shopping_reply_contract("Вот список.", messages) == "Вот список."
+    assert shopping_reply_target_url(messages) == SEA_URL
 
 
 def test_ambiguous_or_general_read_does_not_get_link():
@@ -188,8 +189,35 @@ def test_history_offset_selects_current_protected_result():
         "Вот список.", old + current, history_offset=len(old)
     )
 
-    assert actual.endswith(f"[Открыть список]({SEA_URL})")
+    assert actual == "Вот список."
+    assert shopping_reply_target_url(old + current, history_offset=len(old)) == SEA_URL
     assert "_old" not in actual
+
+
+def test_multi_list_readback_vetoes_prior_mutation_target():
+    other_url = SEA_URL + "_other"
+    messages = [
+        _call("add", "mcp_health_actions_add_shopping_items"),
+        _result("add", "add-shopping-items", {"changed": True, "launch_url": SEA_URL}),
+        _call("read", "mcp_health_actions_list_shopping_items"),
+        _result(
+            "read",
+            "list-shopping-items",
+            {"open": True, "launch_urls": [SEA_URL, other_url]},
+        ),
+    ]
+    response = f"Готово. [Открыть список]({SEA_URL})"
+
+    assert shopping_reply_target_url(messages) is None
+    assert enforce_shopping_reply_contract(response, messages) == "Готово."
+
+
+def test_invalid_history_offset_fails_closed():
+    messages = [
+        _call("add", "mcp_health_actions_add_shopping_items"),
+        _result("add", "add-shopping-items", {"changed": True, "launch_url": SEA_URL}),
+    ]
+    assert shopping_reply_target_url(messages, history_offset=len(messages) + 1) is None
 
 
 def test_untrusted_tool_with_lookalike_metadata_does_not_trigger():

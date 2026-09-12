@@ -334,3 +334,29 @@ async def test_process_message_plain_string_behaves_unchanged():
     adapter._send_with_retry.assert_called_once()
     assert adapter._send_with_retry.call_args.kwargs["content"] == "plain reply"
     assert adapter.deleted == []  # no auto-delete for plain replies
+
+
+@pytest.mark.asyncio
+async def test_process_message_merges_event_scoped_outbound_metadata():
+    adapter = _delete_adapter()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="sent-1")
+    )
+    url = "https://t.me/TripiooBot?startapp=shopping_take_0J3QsCDQvNC-0YDQtdC1"
+
+    async def _handler(evt):
+        evt.outbound_metadata["shopping_list_url"] = url
+        return "Создал список."
+
+    adapter.set_message_handler(_handler)
+    event = _make_event()
+    session_key = "agent:main:telegram:private:42"
+    with patch("gateway.platforms.base.asyncio.sleep", AsyncMock()), patch.object(
+        adapter, "_keep_typing", new=AsyncMock()
+    ):
+        await adapter._process_message_background(event, session_key)
+
+    adapter._send_with_retry.assert_called_once()
+    metadata = adapter._send_with_retry.call_args.kwargs["metadata"]
+    assert metadata["shopping_list_url"] == url
+    assert metadata["notify"] is True

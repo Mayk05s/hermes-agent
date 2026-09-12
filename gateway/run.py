@@ -9980,7 +9980,6 @@ class GatewayRunner:
             # concrete list-level launch_url plus changed/open operation
             # metadata; when exactly one target is resolved it must survive even
             # if the model forgets to copy the URL into its prose.
-            _shopping_link_was_appended = False
             _shopping_target_url = None
             if source.platform == Platform.TELEGRAM:
                 try:
@@ -9999,16 +9998,15 @@ class GatewayRunner:
                     _shopping_target_url = _shopping_reply_target_url(
                         agent_messages, history_offset=_shopping_history_offset,
                     )
-                    _response_before_shopping_contract = response
                     response = _enforce_shopping_reply_contract(
                         response,
                         agent_messages,
                         history_offset=_shopping_history_offset,
                     )
-                    _shopping_link_was_appended = bool(
-                        _shopping_target_url
-                        and _shopping_target_url not in _response_before_shopping_contract
-                    )
+                    if _shopping_target_url:
+                        event.outbound_metadata["shopping_list_url"] = _shopping_target_url
+                        if not response:
+                            response = "Открыть список"
                 except Exception as _shopping_contract_err:
                     logger.error(
                         "shopping reply contract enforcement failed: %s",
@@ -10297,22 +10295,22 @@ class GatewayRunner:
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
-                # Token streaming may have delivered the model prose before the
-                # final tool-result postcondition above ran.  Send only the
-                # missing contract link as the trailing final reply.  The family
-                # production profile disables Telegram streaming so duplicate
-                # model-authored URLs can also be normalized before delivery;
-                # this branch preserves correctness for other configurations.
-                if _shopping_link_was_appended and _shopping_target_url:
+                # Token streaming cannot attach transport metadata to already
+                # emitted chunks. Send one small trailing message with the exact
+                # inline button selected from this turn's structured tool results.
+                if _shopping_target_url:
                     try:
                         _shopping_adapter = self.adapters.get(source.platform)
                         if _shopping_adapter:
                             await _shopping_adapter.send(
                                 source.chat_id,
-                                f"[Открыть список]({_shopping_target_url})",
-                                metadata=self._thread_metadata_for_source(
-                                    source, self._reply_anchor_for_event(event),
-                                ),
+                                "Открыть список",
+                                metadata={
+                                    **(self._thread_metadata_for_source(
+                                        source, self._reply_anchor_for_event(event),
+                                    ) or {}),
+                                    "shopping_list_url": _shopping_target_url,
+                                },
                             )
                     except Exception as _shopping_send_err:
                         logger.error(
