@@ -118,12 +118,13 @@ def test_existing_target_url_is_normalized_to_one_named_link():
     assert shopping_reply_target_url(messages) == SEA_URL
 
 
-def test_no_link_for_successful_noop_mutation():
+def test_successful_noop_mutation_still_gets_exact_list_button_target():
     messages = [
         _call("move", "mcp_health_actions_move_shopping_items"),
         _result("move", "move-shopping-items", {"changed": False, "launch_url": SEA_URL}),
     ]
     assert enforce_shopping_reply_contract("Нечего менять.", messages) == "Нечего менять."
+    assert shopping_reply_target_url(messages) == SEA_URL
 
 
 def test_exact_read_only_list_gets_link():

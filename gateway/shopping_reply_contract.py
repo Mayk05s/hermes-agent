@@ -134,7 +134,11 @@ def _result_decision(
         return False, None, False
 
     if action in _MUTATION_ACTIONS:
-        eligible = miniapp.get("changed") is True
+        # A successful idempotent/no-op mutation still worked with this exact
+        # list.  The reply contract is about operation scope, not whether rows
+        # happened to change, so keep the button whenever the structured result
+        # supplies one unambiguous list URL.
+        eligible = True
     else:
         eligible = miniapp.get("open") is True
     if not eligible:
