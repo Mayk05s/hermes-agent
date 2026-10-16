@@ -5186,6 +5186,11 @@ class GatewayRunner:
         """Return restart-safe metadata for one durable inbox event."""
         return {
             "reply_to_text": getattr(event, "reply_to_text", None),
+            "authenticated_memory_admissions": getattr(event, "authenticated_memory_admissions", []),
+            "authenticated_memory_identity_receipt": getattr(event, "authenticated_memory_identity_receipt", None),
+            "authenticated_user_request_text": getattr(
+                event, "authenticated_user_request_text", None
+            ),
             "auto_skill": getattr(event, "auto_skill", None),
             "channel_prompt": getattr(event, "channel_prompt", None),
             "channel_context": getattr(event, "channel_context", None),
@@ -5205,6 +5210,23 @@ class GatewayRunner:
                 event, "telegram_transcript_only_history_text", None
             ),
         }
+
+    def _observe_authenticated_memory_event(self, event: MessageEvent) -> None:
+        """Admit passive facts through the same ingress without creating a job."""
+        raw = getattr(event, "raw_message", None)
+        original = getattr(raw, "text", None) or getattr(raw, "caption", None)
+        if not isinstance(original, str) or not original.strip():
+            return
+        source = self._source_with_profile_scope(event.source)
+        if not self._is_user_authorized(source):
+            return
+        config = self._load_profile_config_for_name(source.profile_name or "default")
+        route = self._memory_provider_route_for_source(source, config, event.message_id)
+        if route is None or not route.provider_options.get("automatic_config"):
+            return
+        observed = dataclasses.replace(event, source=source, authenticated_user_request_text=original)
+        observed.memory_observation_only = True
+        self._ingest_durable_inbox_event(observed, source, self._session_key_for_source(source))
 
     def _ingest_durable_inbox_event(
         self,
@@ -5272,6 +5294,11 @@ class GatewayRunner:
                     user_id=requester_user_id,
                     user_name=requester_user_name or None,
                 )
+        try:
+            from gateway.memory_ingress import capture_authenticated_memory
+            capture_authenticated_memory(self, event, source)
+        except Exception as memory_capture_error:
+            logger.warning("Authenticated memory capture unavailable (%s)", type(memory_capture_error).__name__)
         inbox, created = store.ingest_event(
             thread_key=thread_key,
             platform=_gateway_platform_value(source.platform),
@@ -5286,6 +5313,7 @@ class GatewayRunner:
             ),
             media=media,
             event_metadata=self._durable_event_metadata(event),
+            context_only=bool(getattr(event, "memory_observation_only", False)),
         )
         event.durable_inbox_id = str(inbox["event_id"])
         event.job_thread_key = thread_key
@@ -5754,6 +5782,9 @@ class GatewayRunner:
                     platform_update_id=inbox.get("platform_update_id"),
                     reply_to_message_id=inbox.get("reply_to_message_id"),
                     reply_to_text=event_metadata.get("reply_to_text"),
+                    authenticated_user_request_text=event_metadata.get(
+                        "authenticated_user_request_text"
+                    ),
                     media_urls=[
                         str(item.get("path") or "")
                         for item in media_payload
@@ -5914,6 +5945,10 @@ class GatewayRunner:
             int(consumed_versions.get(job_id) or 1),
         )
         final_text = str(result_text or "").strip()
+        reply_metadata = {}
+        if event.outbound_metadata.get('credential_deliveries'):
+            reply_metadata['credential_deliveries'] = event.outbound_metadata['credential_deliveries']
+            final_text = final_text or '🔐 Доступ подготовлен.'
         if not final_text:
             # A missing final response is diagnostic information, not a
             # user-facing result.  Mark it delivered so startup recovery
@@ -5931,6 +5966,7 @@ class GatewayRunner:
                 final_text,
                 delivered=delivered,
                 input_version=input_version,
+                **({"result_metadata": reply_metadata} if reply_metadata else {}),
             )
         if completed:
             getattr(self, "_scheduled_durable_job_ids", set()).discard(job_id)
@@ -6191,10 +6227,17 @@ class GatewayRunner:
             # Recovery is an implementation detail. Deliver the actual
             # stored result, without a lifecycle banner or internal job ID.
             content = result_text
+            metadata = dict(self._thread_metadata_for_source(source, job.get("request_message_id")) or {})
+            try:
+                reply_metadata = json.loads(current.get("result_metadata_json") or "{}")
+            except (TypeError, ValueError):
+                reply_metadata = {}
+            if isinstance(reply_metadata, dict) and isinstance(reply_metadata.get('credential_deliveries'), list):
+                metadata['credential_deliveries'] = reply_metadata['credential_deliveries']
             result = await adapter._send_with_retry(
                 chat_id=source.chat_id,
                 content=content,
-                metadata=self._thread_metadata_for_source(source, None),
+                metadata=metadata,
             )
             success = bool(getattr(result, "success", False))
             store.record_delivery(
@@ -11543,6 +11586,7 @@ class GatewayRunner:
                         self._schedule_durable_job_continuation(durable_job_id)
 
             if not result_is_current:
+                event.outbound_metadata.pop('credential_deliveries', None)
                 # A semantic scope update arrived after this attempt began and
                 # could not be consumed safely. The combined request is already
                 # durable; suppress this obsolete answer and let the continuation
@@ -12076,6 +12120,12 @@ class GatewayRunner:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _job_id = str(getattr(event, "durable_job_id", None) or "")
+        if getattr(event, "raw_message", None) is None and (_job_id or getattr(event, "durable_inbox_id", None)):
+            try:
+                from gateway.memory_ingress import restore_authenticated_memory_identity
+                restore_authenticated_memory_identity(self, event, source)
+            except Exception as memory_identity_error:
+                logger.warning("Authenticated memory recovery unavailable (%s)", type(memory_identity_error).__name__)
         if _job_id and not getattr(event, "durable_recovery", False):
             _job_store = self._durable_store()
             _job_record = _job_store.get(_job_id) if _job_store is not None else None
@@ -12099,7 +12149,11 @@ class GatewayRunner:
         # reply context, media notes, or sender attribution are prepended.
         # Intent guards must never classify instructions inside those injected
         # blocks as user write intent.
-        _raw_user_message_text = event.text or ""
+        _raw_user_message_text = (
+            event.authenticated_user_request_text
+            if event.authenticated_user_request_text is not None
+            else event.text or ""
+        )
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -12838,6 +12892,9 @@ class GatewayRunner:
                         "durable_request_text",
                         None,
                     ),
+                    memory_turn_input=getattr(event, "authenticated_memory_input", None),
+                    memory_turn_inputs=getattr(event, "authenticated_memory_inputs", ()),
+                    memory_turn_identity=getattr(event, "authenticated_memory_identity", None),
                 )
 
             if (
@@ -12935,6 +12992,11 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+            if source.platform == Platform.TELEGRAM and agent_result.get('credential_deliveries'):
+                event.outbound_metadata['credential_deliveries'] = agent_result['credential_deliveries']
+                agent_result['already_sent'] = False
+                # Plaintext is decrypted only by the final Telegram renderer.
+                response = '🔐 Доступ подготовлен: пароль под спойлером, сообщение удаляется через 15 минут.'
             _runtime_user_config = _load_gateway_config()
             await self._notify_fallback_activation_once(
                 agent_result.get("fallback_activation"),
@@ -13291,6 +13353,7 @@ class GatewayRunner:
             return response
             
         except Exception as e:
+            event.outbound_metadata.pop('credential_deliveries', None)
             # Stop typing indicator on error too
             try:
                 _err_adapter = self.adapters.get(source.platform)
@@ -21188,6 +21251,22 @@ class GatewayRunner:
 
     # ------------------------------------------------------------------
 
+    def _memory_provider_route_for_source(self, source, user_config, event_message_id=None):
+        """Resolve optional memory routing from authenticated gateway facts."""
+        from dataclasses import replace
+        from gateway.memory_routing import resolve_memory_provider_route, verified_memory_identity
+
+        memory_config = user_config.get("memory") or {}
+        if not (memory_config.get("trusted_provider_route") or memory_config.get("trusted_provider_routes")
+                or memory_config.get("trusted_shared_deny_route") is not None):
+            return None
+        trusted_source = replace(source, message_id=source.message_id or event_message_id)
+        return resolve_memory_provider_route(
+            trusted_source, user_config,
+            request_authorized=self._is_user_authorized(source),
+            principal_verified=verified_memory_identity(source, self._pairing_store_for_source(source)),
+        )
+
     async def _run_agent(
         self,
         message: str,
@@ -21203,6 +21282,9 @@ class GatewayRunner:
         durable_job_id: Optional[str] = None,
         durable_recovery: bool = False,
         durable_request_text: Optional[str] = None,
+        memory_turn_input=None,
+        memory_turn_inputs=(),
+        memory_turn_identity=None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -21253,6 +21335,13 @@ class GatewayRunner:
         from run_agent import AIAgent
         import queue
 
+        from gateway.credential_delivery import CredentialReplyCollector
+        _credential_adapter = self.adapters.get(source.platform)
+        credential_collector = CredentialReplyCollector(
+            source.chat_id, source.thread_id,
+            getattr(getattr(_credential_adapter, '_bot', None), 'id', None),
+        )
+
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
                 return True
@@ -21273,6 +21362,9 @@ class GatewayRunner:
         )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        from gateway.memory_ingress import matching_input
+        memory_source = matching_input(memory_turn_input, source, event_message_id) or matching_input(memory_turn_identity, source, event_message_id) or source
+        memory_provider_route = self._memory_provider_route_for_source(memory_source, user_config, event_message_id)
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -22130,6 +22222,8 @@ class GatewayRunner:
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
+                                    if source.platform == Platform.TELEGRAM and credential_collector.snapshot():
+                                        return
                                     _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
@@ -22137,6 +22231,8 @@ class GatewayRunner:
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
+                    return
+                if source.platform == Platform.TELEGRAM and credential_collector.snapshot():
                     return
                 if _stream_consumer is not None:
                     if already_streamed:
@@ -22175,6 +22271,7 @@ class GatewayRunner:
                     "profile.memory_scope": str(getattr(source, "memory_scope", "") or "default"),
                     "profile.topic_isolation": "true" if getattr(source, "topic_isolation", False) else "false",
                     "agent.skip_memory": "true" if agent_cfg_local.get("skip_memory", False) else "false",
+                    "memory.trusted_route": memory_provider_route.cache_fingerprint if memory_provider_route else "legacy",
                     "source.platform": getattr(getattr(source, "platform", None), "value", source.platform),
                     "source.chat_id": str(getattr(source, "chat_id", "") or ""),
                     "source.thread_id": str(getattr(source, "thread_id", "") or ""),
@@ -22211,6 +22308,9 @@ class GatewayRunner:
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     skip_memory=bool(agent_cfg_local.get("skip_memory", False)),
+                    memory_access_context=memory_provider_route.context if memory_provider_route else None,
+                    memory_provider_override=memory_provider_route.provider if memory_provider_route else None,
+                    memory_provider_options=memory_provider_route.provider_options if memory_provider_route else None,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
@@ -22242,9 +22342,23 @@ class GatewayRunner:
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            if memory_provider_route:
+                agent.set_memory_access_context(memory_provider_route.context)
+                agent._trusted_memory_input = memory_turn_input
+                agent._trusted_memory_identity = memory_turn_identity
+                agent._trusted_memory_inputs = memory_turn_inputs or ((memory_turn_input,) if memory_turn_input else ())
+                agent._trusted_memory_provider_options = memory_provider_route.provider_options
+                for _memory_provider in getattr(agent._memory_manager, "providers", ()):
+                    if memory_turn_input is not None:
+                        try:
+                            _memory_provider.on_authenticated_event(agent._trusted_memory_inputs)
+                        except Exception as exc:
+                            logger.warning("Authenticated memory binding unavailable (%s)", type(exc).__name__)
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback
+            agent._credential_delivery_callback = credential_collector.record if source.platform == Platform.TELEGRAM else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -22744,6 +22858,7 @@ class GatewayRunner:
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
+                    "credential_deliveries": credential_collector.snapshot(),
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
@@ -22902,6 +23017,7 @@ class GatewayRunner:
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
+                "credential_deliveries": credential_collector.snapshot(),
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
@@ -23456,6 +23572,11 @@ class GatewayRunner:
                         or (_sc and getattr(_sc, "final_content_delivered", False))
                     )
                     first_response = result.get("final_response", "")
+                    _first_metadata = dict(_status_thread_metadata or {})
+                    if source.platform == Platform.TELEGRAM and result.get('credential_deliveries'):
+                        _first_metadata['credential_deliveries'] = result['credential_deliveries']
+                        _already_streamed = False
+                        first_response = '🔐 Доступ подготовлен.'
                     if first_response and not _already_streamed:
                         try:
                             logger.info(
@@ -23473,13 +23594,13 @@ class GatewayRunner:
                                 _first_response_event,
                                 adapter,
                                 send_text=True,
-                                text_metadata=_status_thread_metadata,
+                                text_metadata=_first_metadata,
                             )
                             if not _first_response_processed:
                                 await adapter.send(
                                     source.chat_id,
                                     first_response,
-                                    metadata=_status_thread_metadata,
+                                    metadata=_first_metadata,
                                 )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -23638,7 +23759,7 @@ class GatewayRunner:
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
-        if isinstance(response, dict) and not response.get("failed"):
+        if isinstance(response, dict) and not response.get("failed") and not response.get("credential_deliveries"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             _streamed = bool(

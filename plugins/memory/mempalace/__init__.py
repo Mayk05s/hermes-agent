@@ -63,6 +63,36 @@ GRAPH_SCHEMA = {
 
 
 class MemPalaceMemoryProvider(MemoryProvider):
+    def for_access_context(self, context, *, options=None):
+        from gateway.memory_access import MemoryAccessContext
+        from pathlib import Path
+        from dotenv import dotenv_values
+        from .capability_client import MemPalaceCapabilityClient
+        from .capability_provider import MemPalaceMemoryProvider as ScopedProvider
+
+        if type(context) is not MemoryAccessContext:
+            raise ValueError("Trusted memory context required")
+        path = Path((options or {}).get("credential_file", ""))
+        if not path.is_absolute() or path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+            raise ValueError("Protected memory client configuration required")
+        # No shared os.environ changes: credentials stay in this adapter only.
+        environment = dict(dotenv_values(path))
+        public_config = (options or {}).get("client_config", {})
+        for key, env_name in {
+            "base_url": "MEMPALACE_BASE_URL", "bearer_kid": "MEMPALACE_BEARER_KID",
+            "issuer": "MEMPALACE_CAPABILITY_ISSUER", "audience": "MEMPALACE_CAPABILITY_AUDIENCE",
+            "policy_fingerprint": "MEMPALACE_POLICY_FINGERPRINT", "ttl_seconds": "MEMPALACE_CAPABILITY_TTL_SECONDS",
+        }.items():
+            if key in public_config:
+                environment[env_name] = str(public_config[key])
+        client = MemPalaceCapabilityClient(environ=environment)
+        if not client.configured():
+            raise ValueError("Memory capability client unavailable")
+        provider = ScopedProvider(client=client)
+        provider._automatic_config = str((options or {}).get("automatic_config") or "")
+        provider.set_access_context(context)
+        return provider
+
     def __init__(self) -> None:
         self._profile = "default"
         self._profile_home: Optional[Path] = None

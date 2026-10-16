@@ -370,6 +370,9 @@ class AIAgent:
         thread_id: str = None,
         gateway_session_key: str = None,
         system_prompt_signature: str = None,
+        memory_access_context=None,
+        memory_provider_override: str = None,
+        memory_provider_options: dict = None,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
@@ -441,6 +444,9 @@ class AIAgent:
             thread_id=thread_id,
             gateway_session_key=gateway_session_key,
             system_prompt_signature=system_prompt_signature,
+            memory_access_context=memory_access_context,
+            memory_provider_override=memory_provider_override,
+            memory_provider_options=memory_provider_options,
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
@@ -455,6 +461,18 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
+
+    def set_memory_access_context(self, context):
+        """Refresh per-event provenance without mutating cached access rights."""
+        from gateway.memory_access import MemoryAccessContext
+        previous = getattr(self, "_memory_access_context", None)
+        if type(context) is not MemoryAccessContext or type(previous) is not MemoryAccessContext:
+            raise ValueError("Typed memory context required")
+        if context.cache_fingerprint != previous.cache_fingerprint:
+            raise ValueError("Memory authorization changed; construct a fresh agent")
+        self._memory_access_context = context
+        for provider in getattr(self._memory_manager, "providers", ()):
+            provider.set_access_context(context)
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.

@@ -1,0 +1,235 @@
+{
+  "description": "Capability-safe MCP v1 conformance surface when the exact MemPalace 3.3.2 trusted scoped ABI patch is installed.",
+  "tools_list": {
+    "request": {
+      "jsonrpc": "2.0",
+      "id": "fixture-tools-list",
+      "method": "tools/list",
+      "params": {}
+    },
+    "http_status": 200,
+    "safe_tools": [
+      {
+        "name": "get_document",
+        "operation": "read",
+        "allowed_arguments": ["doc_id"],
+        "required_arguments": ["doc_id"]
+      },
+      {
+        "name": "list_wings",
+        "operation": "read",
+        "allowed_arguments": [],
+        "required_arguments": []
+      },
+      {
+        "name": "mempalace_add_drawer",
+        "operation": "write",
+        "allowed_arguments": ["content", "room"],
+        "required_arguments": ["content", "room"]
+      },
+      {
+        "name": "mempalace_delete_drawer",
+        "operation": "write",
+        "allowed_arguments": ["drawer_id"],
+        "required_arguments": ["drawer_id"]
+      },
+      {
+        "name": "mempalace_get_drawer",
+        "operation": "read",
+        "allowed_arguments": ["drawer_id"],
+        "required_arguments": ["drawer_id"]
+      },
+      {
+        "name": "mempalace_get_taxonomy",
+        "operation": "read",
+        "allowed_arguments": [],
+        "required_arguments": []
+      },
+      {
+        "name": "mempalace_kg_add",
+        "operation": "write",
+        "allowed_arguments": ["object", "predicate", "subject", "valid_from"],
+        "required_arguments": ["object", "predicate", "subject"]
+      },
+      {
+        "name": "mempalace_kg_invalidate",
+        "operation": "write",
+        "allowed_arguments": ["ended", "object", "predicate", "subject"],
+        "required_arguments": ["object", "predicate", "subject"]
+      },
+      {
+        "name": "mempalace_kg_query",
+        "operation": "read",
+        "allowed_arguments": ["as_of", "direction", "entity"],
+        "required_arguments": ["entity"]
+      },
+      {
+        "name": "mempalace_kg_stats",
+        "operation": "read",
+        "allowed_arguments": [],
+        "required_arguments": []
+      },
+      {
+        "name": "mempalace_kg_timeline",
+        "operation": "read",
+        "allowed_arguments": ["entity"],
+        "required_arguments": []
+      },
+      {
+        "name": "mempalace_list_drawers",
+        "operation": "read",
+        "allowed_arguments": ["limit", "offset", "room"],
+        "required_arguments": []
+      },
+      {
+        "name": "mempalace_list_rooms",
+        "operation": "read",
+        "allowed_arguments": [],
+        "required_arguments": []
+      },
+      {
+        "name": "mempalace_list_wings",
+        "operation": "read",
+        "allowed_arguments": [],
+        "required_arguments": []
+      },
+      {
+        "name": "mempalace_search",
+        "operation": "read",
+        "allowed_arguments": ["context", "limit", "max_distance", "min_similarity", "query", "room"],
+        "required_arguments": ["query"]
+      },
+      {
+        "name": "mempalace_update_drawer",
+        "operation": "write",
+        "allowed_arguments": ["content", "drawer_id", "room"],
+        "required_arguments": ["drawer_id"],
+        "additional_constraint": "at least one of content or room is required"
+      },
+      {
+        "name": "put_page",
+        "operation": "write",
+        "allowed_arguments": ["content", "slug"],
+        "required_arguments": ["content", "slug"]
+      },
+      {
+        "name": "query",
+        "operation": "read",
+        "allowed_arguments": ["limit", "query"],
+        "required_arguments": ["query"]
+      },
+      {
+        "name": "upload_document",
+        "operation": "write",
+        "allowed_arguments": ["content_base64", "filename"],
+        "required_arguments": ["content_base64", "filename"]
+      }
+    ]
+  },
+  "argument_constraints": {
+    "integer": {
+      "limit": {"minimum": 1, "maximum": 50},
+      "offset": {"minimum": 0, "maximum": 49},
+      "pagination_window": "limit + offset must not exceed 50"
+    },
+    "number": {
+      "max_distance": {"minimum": 0, "maximum": 2, "finite": true},
+      "min_similarity": {"minimum": -1, "maximum": 1, "finite": true}
+    },
+    "string_max_utf8_bytes": {
+      "as_of": 64,
+      "content": 100000,
+      "content_base64": 22020096,
+      "context": 4096,
+      "direction": 16,
+      "doc_id": 128,
+      "drawer_id": 512,
+      "ended": 64,
+      "entity": 128,
+      "filename": 255,
+      "object": 128,
+      "predicate": 128,
+      "query": 2048,
+      "room": 128,
+      "slug": 120,
+      "subject": 128,
+      "valid_from": 64
+    },
+    "reserved_arguments_rejected": [
+      "_access_provenance",
+      "_authorized_wing",
+      "actor_ref",
+      "added_by",
+      "capability",
+      "grants",
+      "metadata",
+      "palace",
+      "palace_path",
+      "principal_id",
+      "read_wings",
+      "source",
+      "source_closet",
+      "source_file",
+      "source_ref",
+      "source_wing",
+      "sub",
+      "target_wing",
+      "wing",
+      "wings",
+      "write_wing"
+    ]
+  },
+  "envelopes": {
+    "initialize_success": {
+      "http_status": 200,
+      "body": {
+        "jsonrpc": "2.0",
+        "id": "fixture-initialize",
+        "result": {
+          "protocolVersion": "2024-11-05",
+          "capabilities": {"tools": {}},
+          "serverInfo": {"name": "mempalace", "version": "<installed-version>"}
+        }
+      }
+    },
+    "tool_success": {
+      "http_status": 200,
+      "body": {
+        "jsonrpc": "2.0",
+        "id": "fixture-call",
+        "result": {
+          "content": [
+            {"type": "text", "text": "<JSON-encoded tool payload>"}
+          ]
+        }
+      }
+    },
+    "authorized_tool_failure": {
+      "http_status": 200,
+      "body": {
+        "jsonrpc": "2.0",
+        "id": "fixture-call",
+        "result": {
+          "content": [
+            {"type": "text", "text": "<JSON-encoded failure payload>"}
+          ],
+          "isError": true
+        }
+      }
+    },
+    "capability_or_schema_denial": {
+      "http_status": 403,
+      "body": {"error": "memory capability denied"}
+    },
+    "notification_initialized_success": {
+      "http_status": 204,
+      "body": null
+    }
+  },
+  "unsupported_v1_families": [
+    "diary",
+    "palace-global operational status and reconnect",
+    "tunnels and graph traversal",
+    "model-selected wing, scope, principal, grant, or provenance arguments"
+  ]
+}

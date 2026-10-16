@@ -1632,6 +1632,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    if function_name in getattr(agent, "_trusted_memory_blocked_tools", ()):
+        return json.dumps({"error": "Tool denied by trusted memory boundary"})
     # Check plugin hooks for a block directive before executing anything.
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
@@ -1672,8 +1674,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             db=session_db,
             current_session_id=agent.session_id,
         )
+    elif function_name == "credential_vault":
+        from tools.credential_vault_tool import invoke_credential_vault
+        return invoke_credential_vault(agent, function_args)
     elif function_name == "memory":
         target = function_args.get("target", "memory")
+        replacement = agent._memory_manager.handle_builtin_memory(function_args) if agent._memory_manager else None
+        if replacement is not None:
+            return replacement
         from tools.memory_tool import memory_tool as _memory_tool
         result = _memory_tool(
             action=function_args.get("action"),

@@ -188,6 +188,9 @@ def init_agent(
     thread_id: str = None,
     gateway_session_key: str = None,
     system_prompt_signature: str = None,
+    memory_access_context=None,
+    memory_provider_override: str = None,
+    memory_provider_options: dict = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
@@ -1074,13 +1077,19 @@ def init_agent(
     agent._aux_compression_context_length_config = None
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+    from gateway.memory_access import MemoryAccessContext
+    agent._memory_access_context = memory_access_context
+    _trusted_memory_route = memory_provider_override is not None
+    if _trusted_memory_route and type(memory_access_context) is not MemoryAccessContext:
+        raise ValueError("Trusted memory route requires typed context")
+    mem_config = _agent_cfg.get("memory", {}) or {}
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    if not skip_memory and not _trusted_memory_route:
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1101,15 +1110,36 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
+    if _trusted_memory_route:
+        # Old profile-global files/tools must not coexist with scoped memory.
+        _old_tools = {"memory", "query_chat_agent"}
+        if (memory_provider_options or {}).get("replace_builtin_memory") is True:
+            _old_tools.discard("memory")
+        if memory_access_context.destination_kind == "group":
+            # Chat transcripts are independently authorized by the server's
+            # profile boundary. Keep history search available alongside scoped
+            # personal/fact memory; cross-context grant tools stay disabled.
+            _old_tools.add("recall_access")
+        agent._trusted_memory_blocked_tools = frozenset(_old_tools)
+        agent.tools = [t for t in (agent.tools or []) if t.get("function", {}).get("name") not in _old_tools]
+        agent.valid_tool_names.difference_update(_old_tools)
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            if _trusted_memory_route:
+                _mem_provider_name = memory_provider_override
 
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
                 _mp = _load_mem(_mem_provider_name)
+                if _trusted_memory_route:
+                    if _mp is None:
+                        raise ValueError("Trusted memory provider unavailable")
+                    _mp = _mp.for_access_context(memory_access_context, options=memory_provider_options)
+                    if not _mp.is_available() or getattr(_mp, "enforces_trusted_access_context", False) is not True:
+                        raise ValueError("Trusted memory provider unavailable")
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 if agent._memory_manager.providers:
@@ -1118,6 +1148,7 @@ def init_agent(
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
+                        "memory_access_context": memory_access_context,
                     }
                     # Thread session title for memory provider scoping
                     # (e.g. honcho uses this to derive chat-scoped session keys)
@@ -1160,6 +1191,9 @@ def init_agent(
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None
         except Exception as _mpe:
+            if _trusted_memory_route:
+                # Never downgrade a selected route to legacy or file memory.
+                raise RuntimeError("Trusted memory provider initialization failed") from None
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 

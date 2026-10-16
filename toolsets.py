@@ -47,7 +47,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    "todo", "memory", "credential_vault",
     # Session history search
     "session_search", "recall_access",
     # Clarifying questions
@@ -217,6 +217,12 @@ TOOLSETS = {
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
+        "includes": []
+    },
+
+    "credential-vault": {
+        "description": "Encrypted account storage scoped to verified users and destinations",
+        "tools": ["credential_vault"],
         "includes": []
     },
 

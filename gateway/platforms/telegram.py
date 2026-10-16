@@ -2227,6 +2227,11 @@ class TelegramAdapter(BasePlatformAdapter):
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
+            from gateway.credential_delivery import credential_expiry_loop
+            previous_expiry_task = getattr(self, '_credential_expiry_task', None)
+            if previous_expiry_task is not None:
+                previous_expiry_task.cancel()
+            self._credential_expiry_task = asyncio.create_task(credential_expiry_loop(self))
 
             # Set up DM topics (Bot API 9.4 — Private Chat Topics)
             # Runs after connection is established so the bot can call createForumTopic.
@@ -2250,6 +2255,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        expiry_task = getattr(self, '_credential_expiry_task', None)
+        if expiry_task is not None:
+            expiry_task.cancel()
+            await asyncio.gather(expiry_task, return_exceptions=True)
+            self._credential_expiry_task = None
         direct_codex_tasks = list(getattr(self, "_direct_codex_tasks", set()))
         for task in direct_codex_tasks:
             task.cancel()
@@ -2322,6 +2332,11 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        if metadata and 'credential_deliveries' in metadata:
+            if not self._bot:
+                return SendResult(success=False, error='Not connected')
+            from gateway.credential_delivery import deliver_credentials
+            return await deliver_credentials(self, chat_id, metadata['credential_deliveries'], metadata, reply_to)
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
@@ -6976,6 +6991,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _observe_unmentioned_group_event(self, event: MessageEvent) -> None:
         """Append a pre-built skipped group event, preserving cached media paths."""
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        memory_observer = getattr(runner, "_observe_authenticated_memory_event", None)
+        if callable(memory_observer):
+            try:
+                memory_observer(event)
+            except Exception as exc:
+                logger.warning("Passive memory admission unavailable (%s)", type(exc).__name__)
         store = getattr(self, "_session_store", None)
         if not store:
             return
@@ -8566,14 +8588,45 @@ class TelegramAdapter(BasePlatformAdapter):
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        is_forwarded = self._is_forwarded_message(
+            getattr(event, "raw_message", None)
+        )
+        # Keep each admitted original event intact before merging mutable text.
+        # Memory capture validates raw author/chat/message/thread congruence for
+        # each constituent and rejects forwarded content independently.
+        import copy
+        memory_constituent = copy.copy(event)
+        memory_constituent.authenticated_memory_constituents = None
+        raw_original = getattr(getattr(event, "raw_message", None), "text", None)
+        memory_constituent.authenticated_user_request_text = "" if is_forwarded else raw_original
         if existing is None:
+            event.authenticated_memory_constituents = (memory_constituent,)
+            if event.authenticated_user_request_text is None:
+                event.authenticated_user_request_text = (
+                    "" if is_forwarded else (event.text or "")
+                )
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            event._original_text_event_count = 1  # type: ignore[attr-defined]
+            event._contains_forwarded_text = is_forwarded  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
+            existing.authenticated_memory_constituents = tuple(getattr(existing, "authenticated_memory_constituents", ())) + (memory_constituent,)
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            if not is_forwarded and event.text:
+                direct_text = existing.authenticated_user_request_text or ""
+                existing.authenticated_user_request_text = (
+                    f"{direct_text}\n{event.text}" if direct_text else event.text
+                )
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            existing._original_text_event_count = (  # type: ignore[attr-defined]
+                int(getattr(existing, "_original_text_event_count", 1)) + 1
+            )
+            existing._contains_forwarded_text = bool(  # type: ignore[attr-defined]
+                getattr(existing, "_contains_forwarded_text", False)
+                or is_forwarded
+            )
             # Replies to access cards carry an authoritative target-chat
             # binding. Preserve it if Telegram batches the reply with another
             # short message from the same owner DM.

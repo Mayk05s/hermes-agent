@@ -1559,6 +1559,22 @@ class MessageEvent:
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+
+    # Authenticated text authored in the current inbound turn, excluding text
+    # copied from forwarded Telegram messages. ``None`` means the adapter did
+    # not provide a separate provenance view, so callers may use ``text``.
+    # Calendar and other write guards must use this field rather than treating
+    # a merged forward as fresh user authorization.
+    authenticated_user_request_text: Optional[str] = None
+    # Immutable original constituents survive adapter dataclasses.replace()
+    # transformations. Only the trusted ingress module creates bound inputs.
+    authenticated_memory_constituents: tuple = ()
+    authenticated_memory_inputs: tuple = ()
+    authenticated_memory_input: Any = None
+    authenticated_memory_identity: Any = None
+    authenticated_memory_identity_receipt: Any = None
+    authenticated_memory_admissions: list = field(default_factory=list)
+    memory_observation_only: bool = False
     
     # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
     # Discord channel_skill_bindings).  A single name or ordered list.
@@ -1621,6 +1637,10 @@ class MessageEvent:
     # commits to producing a response.  This is a dataclass field (rather than
     # an ad-hoc attribute) so dataclasses.replace() preserves the same gate.
     _typing_indicator_ready: Any = field(default=None, repr=False, compare=False)
+
+    # Trusted, event-scoped delivery directives produced by the gateway after
+    # structured tool execution. They are never populated from model text.
+    outbound_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def mark_response_started(self) -> None:
         """Release a deferred typing indicator once a response will be made."""
@@ -4409,6 +4429,13 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+
+            # Merge trusted per-turn directives only after the handler has
+            # inspected structured tool results. The typing task keeps the
+            # original metadata snapshot.
+            if event.outbound_metadata:
+                _thread_metadata = dict(_thread_metadata or {})
+                _thread_metadata.update(event.outbound_metadata)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used

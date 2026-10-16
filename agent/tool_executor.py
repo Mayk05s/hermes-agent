@@ -185,7 +185,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
-        if _ts_scope_block is not None:
+        if function_name in getattr(agent, "_trusted_memory_blocked_tools", ()):
+            block_result = json.dumps({"error": "Tool denied by trusted memory boundary"})
+        elif _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
         else:
@@ -595,7 +597,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
-        if _ts_scope_block is not None:
+        if function_name in getattr(agent, "_trusted_memory_blocked_tools", ()):
+            _block_msg = "Tool denied by trusted memory boundary"
+        elif _ts_scope_block is not None:
             _block_msg = _ts_scope_block
         else:
             try:
@@ -729,16 +733,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+        elif function_name == "credential_vault":
+            from tools.credential_vault_tool import invoke_credential_vault
+            function_result = invoke_credential_vault(agent, function_args)
+            tool_duration = time.time() - tool_start_time
         elif function_name == "memory":
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
-            function_result = _memory_tool(
+            function_result = agent._memory_manager.handle_builtin_memory(function_args) if agent._memory_manager else None
+            if function_result is None:
+                function_result = _memory_tool(
                 action=function_args.get("action"),
                 target=target,
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
                 store=agent._memory_store,
-            )
+                )
             # Bridge: notify external memory provider of built-in memory writes
             if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
                 try:

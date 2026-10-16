@@ -49,6 +49,14 @@ class MemoryProvider(ABC):
 
     # -- Core lifecycle (implement these) ------------------------------------
 
+    def for_access_context(self, context: Any, *, options=None) -> "MemoryProvider":
+        """Select a context-enforcing adapter before availability/tool indexing.
+
+        Optional generic gateway surface. Unsupported providers must reject an
+        explicit trusted route rather than silently using an unscoped backend.
+        """
+        raise ValueError("Memory provider does not support trusted access contexts")
+
     @abstractmethod
     def is_available(self) -> bool:
         """Return True if this provider is configured, has credentials, and is ready.
@@ -89,6 +97,21 @@ class MemoryProvider(ABC):
         recall context is injected separately via prefetch().
         """
         return ""
+
+    def on_authenticated_event(self, evidence: Any) -> None:
+        """Optional immutable original-ingress hook, never called by a model."""
+
+    def seal_authenticated_identity(self, identity: Any) -> Optional[dict]:
+        """Optional durable identity-only receipt; never ingestion evidence."""
+        return None
+
+    def verify_authenticated_identity(self, receipt: Any) -> Optional[dict]:
+        """Verify an identity receipt against this provider's current route."""
+        return None
+
+    def handle_builtin_memory(self, args: Dict[str, Any]) -> Optional[str]:
+        """Optionally replace built-in memory before any local file mutation."""
+        return None
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.

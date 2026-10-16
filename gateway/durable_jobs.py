@@ -189,6 +189,7 @@ class DurableJobStore:
                 "routing_summary": "TEXT",
                 "delivery_message_id": "TEXT",
                 "source_profile": "TEXT NOT NULL DEFAULT ''",
+                "result_metadata_json": "TEXT NOT NULL DEFAULT '{}'",
             }
             for column, definition in migrations.items():
                 if column not in existing_columns:
@@ -302,6 +303,7 @@ class DurableJobStore:
         message_type: str = "text",
         media: Optional[list[dict[str, Any]]] = None,
         event_metadata: Optional[dict[str, Any]] = None,
+        context_only: bool = False,
     ) -> tuple[Dict[str, Any], bool]:
         """Durably accept an inbound event before semantic job routing.
 
@@ -327,7 +329,7 @@ class DurableJobStore:
                         request_text, request_message_id, platform_update_id,
                         reply_to_message_id, message_type, media_json, event_json,
                         status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event_id,
@@ -354,6 +356,7 @@ class DurableJobStore:
                             separators=(",", ":"),
                             default=str,
                         ),
+                        "context_only" if context_only else "received",
                         now,
                         now,
                     ),
@@ -916,6 +919,7 @@ class DurableJobStore:
                    SET input_version = ?, request_text = ?, updated_at = ?,
                        status = 'resume_pending',
                        result_text = CASE WHEN status = 'completed' THEN NULL ELSE result_text END,
+                       result_metadata_json = CASE WHEN status = 'completed' THEN '{}' ELSE result_metadata_json END,
                        result_input_version = CASE WHEN status = 'completed' THEN NULL ELSE result_input_version END,
                        completed_at = CASE WHEN status = 'completed' THEN NULL ELSE completed_at END
                  WHERE job_id = ?
@@ -1231,6 +1235,7 @@ class DurableJobStore:
         *,
         delivered: bool = False,
         input_version: Optional[int] = None,
+        result_metadata: Optional[dict[str, Any]] = None,
     ) -> bool:
         now = time.time()
         delivered_at = now if delivered else None
@@ -1248,7 +1253,7 @@ class DurableJobStore:
                    SET status = 'completed', result_text = ?, error_text = NULL,
                        completed_at = COALESCE(completed_at, ?),
                        delivered_at = COALESCE(delivered_at, ?),
-                       updated_at = ?, result_input_version = ?
+                       updated_at = ?, result_input_version = ?, result_metadata_json = ?
                  WHERE job_id = ?
                    AND status IN ('pending', 'running', 'resume_pending')
                    AND input_version = ?
@@ -1259,6 +1264,7 @@ class DurableJobStore:
                     delivered_at,
                     now,
                     expected_version,
+                    json.dumps(result_metadata or {}, ensure_ascii=False),
                     job_id,
                     expected_version,
                 ),
@@ -1279,7 +1285,7 @@ class DurableJobStore:
             cur = conn.execute(
                 """
                 UPDATE gateway_jobs
-                   SET status = 'failed', result_text = ?, error_text = ?,
+                   SET status = 'failed', result_text = ?, error_text = ?, result_metadata_json = '{}',
                        completed_at = COALESCE(completed_at, ?),
                        delivered_at = COALESCE(delivered_at, ?),
                        updated_at = ?

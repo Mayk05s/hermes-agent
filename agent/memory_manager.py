@@ -410,6 +410,14 @@ class MemoryManager:
                     provider.name, e,
                 )
 
+    def handle_builtin_memory(self, args: Dict[str, Any]) -> Optional[str]:
+        """Provider replacement runs before a built-in file mutation."""
+        for provider in self._providers:
+            result = provider.handle_builtin_memory(args)
+            if result is not None:
+                return result
+        return None
+
     # -- Tools ---------------------------------------------------------------
 
     def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
