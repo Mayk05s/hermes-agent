@@ -21260,6 +21260,29 @@ class GatewayRunner:
         if not (memory_config.get("trusted_provider_route") or memory_config.get("trusted_provider_routes")
                 or memory_config.get("trusted_shared_deny_route") is not None):
             return None
+        # Optional Telegram memory must not authenticate unrelated transports.
+        # In particular, a shared-chat denial template is not a local/CLI route.
+        routes = memory_config.get('trusted_provider_routes', [])
+        if not isinstance(routes, list):
+            raise ValueError('Invalid trusted memory routes')
+        configured = [memory_config.get('trusted_provider_route'), *routes]
+        platforms = set()
+        for raw in configured:
+            if not raw:
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError('Invalid trusted memory route')
+            match = raw.get('match')
+            if isinstance(match, dict):
+                platforms.add(match.get('platform'))
+            elif raw.get('enabled') is True:
+                raise ValueError('Invalid trusted memory route match')
+        if memory_config.get('trusted_shared_deny_route') is not None:
+            # Denial templates apply to Telegram even if their configuration
+            # is malformed. Let the resolver reject them, never fall back.
+            platforms.add('telegram')
+        if getattr(source.platform, 'value', source.platform) not in platforms:
+            return None
         trusted_source = replace(source, message_id=source.message_id or event_message_id)
         return resolve_memory_provider_route(
             trusted_source, user_config,

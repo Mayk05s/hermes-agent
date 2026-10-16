@@ -86,6 +86,31 @@ def test_real_gateway_method_uses_auth_and_message_fallback(route_setup,monkeypa
     runner._is_user_authorized.assert_called_once()
 
 
+def test_unconfigured_transport_does_not_enter_memory_auth(route_setup):
+    from gateway.run import GatewayRunner
+    source, cfg = route_setup
+    runner = object.__new__(GatewayRunner)
+    runner._is_user_authorized = Mock(side_effect=AssertionError('Unrouted transport authenticated'))
+    runner._pairing_store_for_source = Mock(side_effect=AssertionError('Unrouted pairing store opened'))
+    cfg['memory']['trusted_shared_deny_route'] = dict(enabled=True, platform='telegram')
+    assert runner._memory_provider_route_for_source(replace(source, platform=Platform.LOCAL), cfg, '987') is None
+    runner._is_user_authorized.assert_not_called()
+
+
+@pytest.mark.parametrize('memory_config', [
+    {'trusted_shared_deny_route': {'platform': 'telegram', 'enabled': 'true'}},
+    {'trusted_provider_routes': 'invalid'},
+])
+def test_gateway_rejects_malformed_memory_routes_before_fallback(route_setup, memory_config):
+    from gateway.run import GatewayRunner
+    source, _ = route_setup
+    runner = object.__new__(GatewayRunner)
+    runner._is_user_authorized = Mock(return_value=True)
+    runner._pairing_store_for_source = Mock(return_value=SimpleNamespace(is_approved=lambda *a: True))
+    with pytest.raises(ValueError):
+        runner._memory_provider_route_for_source(replace(source, chat_type='group'), {'memory': memory_config}, '987')
+
+
 def test_refresh_context_rejects_new_rights(route_setup):
     from run_agent import AIAgent
     source,cfg = route_setup; route = resolve(source,cfg)
