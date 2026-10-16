@@ -238,6 +238,17 @@ TOOLSETS = {
         "includes": []
     },
 
+    "github-issues": {
+        "description": "Scoped Telegram issue sources, formatting, media and publication",
+        "tools": ["github_issue_intake"],
+        "includes": []
+    },
+    "github-issue-specialist": {
+        "description": "Isolated Telegram feedback specialist for LessonPilot and BoxMap",
+        "tools": ["github_issue_specialist"],
+        "includes": []
+    },
+
     "workspace_external": {
         "description": "Dev/staging external agent provider for Google Workspace reads via Antigravity/Gemini CLI",
         "tools": ["workspace_external_provider"],

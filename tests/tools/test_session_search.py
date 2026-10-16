@@ -203,7 +203,7 @@ class TestBrowseShape:
         titles = [r.get("title") for r in result["results"]]
         assert any("Modpack" in (t or "") for t in titles)
 
-    def test_gateway_browse_is_limited_to_current_topic(self, db, monkeypatch):
+    def test_gateway_browse_includes_same_profile_topics(self, db, monkeypatch):
         _set_gateway_topic(monkeypatch)
         db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())
         db.append_message("boxmap", role="user", content="boxmap topic status")
@@ -217,7 +217,7 @@ class TestBrowseShape:
         result = json.loads(session_search(db=db))
         sids = [r["session_id"] for r in result["results"]]
         assert "boxmap" in sids
-        assert "other-topic" not in sids
+        assert "other-topic" in sids
 
 
 # =========================================================================
@@ -282,7 +282,7 @@ class TestDiscoveryShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
-    def test_gateway_discovery_is_limited_to_current_topic(self, db, monkeypatch):
+    def test_gateway_discovery_includes_same_profile_chats(self, db, monkeypatch):
         _set_gateway_topic(monkeypatch)
         db.create_session("boxmap", source="telegram", access_scope=_telegram_scope())
         db.append_message("boxmap", role="user", content="sharedtoken boxmap funding issue")
@@ -301,7 +301,7 @@ class TestDiscoveryShape:
 
         result = json.loads(session_search(query="sharedtoken", limit=10, db=db))
         assert result["success"] is True
-        assert [r["session_id"] for r in result["results"]] == ["boxmap"]
+        assert {r["session_id"] for r in result["results"]} == {"boxmap", "homeassistant", "other-chat"}
 
     def test_gateway_discovery_uses_profile_scope_when_topic_isolation_is_off(self, db, monkeypatch):
         _set_gateway_topic(
@@ -361,7 +361,7 @@ class TestDiscoveryShape:
 
         result = json.loads(session_search(query="profiletoken", limit=10, db=db))
         assert result["success"] is True
-        assert {r["session_id"] for r in result["results"]} == {"family-topic-a", "family-topic-b"}
+        assert {r["session_id"] for r in result["results"]} == {"family-topic-a", "family-topic-b", "other-memory"}
 
     def test_gateway_discovery_allows_child_sessions_from_current_topic(self, db, monkeypatch):
         _set_gateway_topic(monkeypatch)
@@ -386,7 +386,7 @@ class TestDiscoveryShape:
 
         result = json.loads(session_search(query="childscope", limit=10, db=db))
         assert result["success"] is True
-        assert [r["session_id"] for r in result["results"]] == ["boxmap-child"]
+        assert {r["session_id"] for r in result["results"]} == {"boxmap-child", "other-child"}
 
     def test_recall_access_one_turn_adds_other_topic_then_expires(self, db, monkeypatch):
         _set_gateway_topic(monkeypatch)
@@ -400,7 +400,7 @@ class TestDiscoveryShape:
         db.append_message("planning", role="user", content="granttoken planning decision")
 
         before = json.loads(session_search(query="granttoken", limit=10, db=db))
-        assert {r["session_id"] for r in before["results"]} == {"boxmap"}
+        assert {r["session_id"] for r in before["results"]} == {"boxmap", "planning"}
 
         grant = json.loads(recall_access_tool(
             reason="Need planning context for this answer",
@@ -418,7 +418,7 @@ class TestDiscoveryShape:
 
         monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "msg-2")
         after = json.loads(session_search(query="granttoken", limit=10, db=db))
-        assert {r["session_id"] for r in after["results"]} == {"boxmap"}
+        assert {r["session_id"] for r in after["results"]} == {"boxmap", "planning"}
 
     def test_recall_access_session_grant_survives_next_message(self, db, monkeypatch):
         _set_gateway_topic(monkeypatch)
@@ -496,7 +496,7 @@ class TestDiscoveryShape:
         db.append_message("other-family-chat", role="user", content="suitcaselink dm")
 
         before = json.loads(session_search(query="suitcaselink", limit=10, db=db))
-        assert {r["session_id"] for r in before["results"]} == {"current-family-topic"}
+        assert {r["session_id"] for r in before["results"]} == {"current-family-topic", "sibling-family-topic", "other-family-chat"}
 
         seen = {}
 
@@ -528,6 +528,7 @@ class TestDiscoveryShape:
         assert {r["session_id"] for r in after["results"]} == {
             "current-family-topic",
             "sibling-family-topic",
+            "other-family-chat",
         }
         assert after["access_scope"]["grants"][0]["mode"] == "chat"
 
@@ -610,7 +611,6 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="globalgrant", limit=10, db=db))
         assert {r["session_id"] for r in result["results"]} == {
             "main-dm",
-            "family-travel",
         }
 
     def test_all_chats_alias_resolves_to_current_platform(self, monkeypatch):
@@ -651,7 +651,7 @@ class TestDiscoveryShape:
         assert grant["granted"] is False
 
         result = json.loads(session_search(query="denytoken", limit=10, db=db))
-        assert {r["session_id"] for r in result["results"]} == {"boxmap"}
+        assert {r["session_id"] for r in result["results"]} == {"boxmap", "planning"}
 
     def test_recall_access_resolves_transliterated_topic_name_in_current_chat(self, monkeypatch):
         _set_gateway_topic(
@@ -968,12 +968,12 @@ class TestScrollShape:
         ))
         assert result["success"] is False
 
-    def test_gateway_scroll_rejects_other_topic(self, db, monkeypatch):
+    def test_gateway_scroll_rejects_other_profile(self, db, monkeypatch):
         _set_gateway_topic(monkeypatch)
         db.create_session(
             "health",
             source="telegram",
-            access_scope=_telegram_scope(thread_id="321"),
+            access_scope=_telegram_scope(thread_id="321", profile_name="health"),
         )
         mid = db.append_message("health", role="user", content="private health issue")
 
@@ -1035,3 +1035,179 @@ class TestShapePrecedence:
         _seed_modpack_sessions(db)
         result = json.loads(session_search(query=None, db=db))  # type: ignore
         assert result["mode"] == "browse"
+
+
+class TestProfileDateSelection:
+    def test_local_day_boundaries_pagination_and_current_session(self, db, monkeypatch):
+        from datetime import datetime
+        _set_gateway_topic(monkeypatch, profile_name="family-chat")
+        for sid, profile in [("family", "family-chat"), ("private", "personal")]:
+            db.create_session(sid, source="telegram", access_scope=_telegram_scope(profile_name=profile))
+            # Session start is unrelated to the requested message date.
+            for at in ["2026-10-14T19:59:59+00:00", "2026-10-14T20:00:00+00:00",
+                       "2026-10-15T19:59:59+00:00", "2026-10-15T20:00:00+00:00"]:
+                mid = db.append_message(sid, role="user", content="historytoken " + at)
+                db._conn.execute("UPDATE messages SET timestamp=? WHERE id=?", (datetime.fromisoformat(at).timestamp(), mid))
+        db._conn.commit()
+        args = dict(db=db, current_session_id="family", start_date="2026-10-15", end_date="2026-10-15", timezone="Asia/Tbilisi", limit=1)
+        first = json.loads(session_search(**args))
+        assert first["success"] and first["has_more"]
+        assert first["messages"][0]["session_id"] == "family"
+        assert first["messages"][0]["datetime"] == "2026-10-15T00:00:00+04:00"
+        second = json.loads(session_search(**args, offset=first["next_offset"]))
+        assert not second["has_more"] and second["next_offset"] is None
+        assert second["messages"][0]["datetime"] == "2026-10-15T23:59:59+04:00"
+        filtered = json.loads(session_search(**args, query='"historytoken 2026-10-15T19:59:59"'))
+        assert filtered["success"] and filtered["count"] == 1
+
+    @pytest.mark.parametrize("params", [dict(start_date="garbage"), dict(timezone="Invalid/Zone"),
+        dict(start_date="2026-10-16", end_date="2026-10-14")])
+    def test_invalid_range_fails_closed(self, db, params):
+        assert not json.loads(session_search(db=db, offset=0, **params))["success"]
+
+    def test_explicit_other_profile_child_and_unattributed_rows_are_hidden(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch, profile_name="family-chat")
+        db.create_session("root", source="telegram", access_scope=_telegram_scope(profile_name="family-chat"))
+        db.create_session("inherited", source="telegram", parent_session_id="root")
+        db.create_session("foreign", source="telegram", parent_session_id="root", access_scope=_telegram_scope(profile_name="personal"))
+        db.create_session("unknown", source="telegram")
+        for sid in ["root", "inherited", "foreign", "unknown"]:
+            db.append_message(sid, role="user", content="boundarytoken")
+        result = json.loads(session_search(db=db, offset=0, limit=100, query="boundarytoken"))
+        assert {m["session_id"] for m in result["messages"]} == {"root", "inherited"}
+        search = json.loads(session_search(db=db, query="boundarytoken", limit=10))
+        assert all(r["session_id"] != "foreign" for r in search["results"])
+        scroll = json.loads(session_search(db=db, session_id="foreign", around_message_id=3))
+        assert not scroll["success"]
+
+    def test_current_gateway_session_is_searchable(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch, profile_name="family-chat")
+        db.create_session("active", source="telegram", access_scope=_telegram_scope(profile_name="family-chat"))
+        mid = db.append_message("active", role="user", content="compressedhistorytoken")
+        result = json.loads(session_search(db=db, query="compressedhistorytoken", current_session_id="active"))
+        assert result["results"][0]["session_id"] == "active"
+        scroll = json.loads(session_search(db=db, session_id="active", around_message_id=mid, current_session_id="active"))
+        assert scroll["success"]
+
+    def test_gateway_without_profile_cannot_read_default_history(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch)
+        monkeypatch.delenv("HERMES_SESSION_PROFILE_NAME")
+        db.create_session("default", source="telegram", access_scope=_telegram_scope())
+        db.append_message("default", role="user", content="unknowntoken")
+        result = json.loads(session_search(db=db, offset=0))
+        assert result["success"] and result["count"] == 0
+
+    def test_dst_day_and_exclusive_datetime_end(self, db):
+        args = dict(db=db, timezone="America/New_York", start_date="2026-11-01")
+        day = json.loads(session_search(**args, end_date="2026-11-01"))
+        assert day["end_timestamp_exclusive"] - day["start_timestamp"] == 25 * 3600
+        interval = json.loads(session_search(**args, end_date="2026-11-01T01:00:00-04:00"))
+        assert interval["end_timestamp_exclusive"] - interval["start_timestamp"] == 3600
+
+    @pytest.mark.parametrize("path", ["invoke", "sequential"])
+    def test_agent_execution_preserves_date_selection(self, db, monkeypatch, path):
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from agent.agent_runtime_helpers import invoke_tool
+        from agent.tool_executor import execute_tool_calls_sequential
+        _set_gateway_topic(monkeypatch, profile_name="family-chat")
+        db.create_session("history", source="telegram", access_scope=_telegram_scope(profile_name="family-chat"))
+        for at in ["2026-10-14T12:00:00+00:00", "2026-10-15T12:00:00+00:00", "2026-10-15T13:00:00+00:00"]:
+            mid = db.append_message("history", role="user", content="dispatchtoken")
+            db._conn.execute("UPDATE messages SET timestamp=? WHERE id=?", (datetime.fromisoformat(at).timestamp(),mid))
+        db._conn.commit()
+        agent = MagicMock(session_id="active", _trusted_memory_blocked_tools=(), _interrupt_requested=False,
+                          quiet_mode=True, verbose_logging=False, tool_delay=0,
+                          tool_progress_callback=None, tool_start_callback=None, tool_complete_callback=None)
+        agent._get_session_db_for_recall.return_value = db
+        agent._should_emit_quiet_tool_messages.return_value = False
+        agent._subdirectory_hints.check_tool_call.return_value = None
+        agent._append_guardrail_observation.side_effect = lambda name,args,result,**kw: result
+        agent._tool_result_content_for_active_model.side_effect = lambda name,result:result
+        args = dict(query="dispatchtoken",start_date="2026-10-15",end_date="2026-10-15",timezone="Asia/Tbilisi",limit=1,offset=1)
+        if path == "invoke":
+            raw = invoke_tool(agent,"session_search",args,"test",pre_tool_block_checked=True)
+        else:
+            call = SimpleNamespace(id="history-call",function=SimpleNamespace(name="session_search",arguments=json.dumps(args)))
+            messages = []
+            execute_tool_calls_sequential(agent,SimpleNamespace(tool_calls=[call]),messages,"test")
+            raw = messages[-1]["content"]
+        result = json.loads(raw)
+        assert result["success"] and result["mode"] == "messages"
+        assert result["count"] == 1
+        assert result["messages"][0]["datetime"] == "2026-10-15T17:00:00+04:00"
+
+
+class TestChatMessageCount:
+    @pytest.fixture
+    def inbox(self, db):
+        from gateway.durable_jobs import DurableJobStore
+        store = DurableJobStore(db.db_path.parent / 'gateway_jobs.sqlite3')
+        yield store
+        store.close()
+
+    def seed(self, inbox, *, message_id='1', chat='family', thread='english', profile='family-chat', at='2026-10-16T07:00:00+00:00', kind='text', lane='a'):
+        from datetime import datetime
+        event, _ = inbox.ingest_event(thread_key=f'{profile}:{chat}:{thread}:{lane}', platform='telegram',
+            source={'platform':'telegram', 'chat_id':chat, 'thread_id':thread, 'profile_name':profile},
+            request_text='original', message_id=message_id, message_type=kind, context_only=True)
+        with inbox._connect() as conn:
+            conn.execute('UPDATE gateway_inbox_events SET created_at=? WHERE event_id=?',
+                         (datetime.fromisoformat(at).timestamp(), event['event_id']))
+
+    @pytest.mark.parametrize('scope,expected',[('topic',2),('chat',3),('profile',4)])
+    def test_counts_original_events_with_profile_and_time_boundaries(self, db, monkeypatch, inbox, scope, expected):
+        _set_gateway_topic(monkeypatch, chat_id='family', thread_id='english', profile_name='family-chat')
+        self.seed(inbox, message_id='1', at='2026-10-15T21:00:00+00:00')
+        self.seed(inbox, message_id='2', kind='photo')
+        self.seed(inbox, message_id='2', kind='photo', lane='duplicate-copy')
+        self.seed(inbox, message_id='3', thread='shopping')
+        self.seed(inbox, message_id='1', chat='other-family-chat')
+        self.seed(inbox, message_id='4', profile='personal')
+        self.seed(inbox, message_id='5', at='2026-10-15T20:59:59+00:00')
+        self.seed(inbox, message_id='6', at='2026-10-16T21:00:00+00:00')
+        # Repeated transcript copies and assistant/tool rows must not affect the count.
+        db.create_session('agent-copy', source='telegram', access_scope=_telegram_scope(profile_name='family-chat'))
+        for _ in range(7):
+            db.append_message('agent-copy', role='user', content='copied context')
+        result=json.loads(session_search(db=db,count_only=True,history_scope=scope,
+            start_date='2026-10-16',end_date='2026-10-16',timezone='Europe/Moscow'))
+        assert result['success'] and result['mode']=='count'
+        assert result['count']==expected
+        assert sum(result['by_type'].values())==expected
+        assert result['source']=='gateway_inbox_events'
+
+    def test_missing_journal_is_an_error_and_never_created(self, db, monkeypatch):
+        _set_gateway_topic(monkeypatch,profile_name='family-chat')
+        path=db.db_path.parent/'gateway_jobs.sqlite3'
+        assert not path.exists()
+        result=json.loads(session_search(db=db,count_only=True))
+        assert not result['success'] and not path.exists()
+
+    @pytest.mark.parametrize('path',['invoke','sequential'])
+    def test_agent_can_count_without_scanning_pages(self, db, monkeypatch, inbox, path):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from agent.agent_runtime_helpers import invoke_tool
+        from agent.tool_executor import execute_tool_calls_sequential
+        _set_gateway_topic(monkeypatch,chat_id='family',thread_id='english',profile_name='family-chat')
+        self.seed(inbox)
+        self.seed(inbox,message_id='2',thread='shopping')
+        agent=MagicMock(session_id='active',_trusted_memory_blocked_tools=(),_interrupt_requested=False,
+            quiet_mode=True,verbose_logging=False,tool_delay=0,tool_progress_callback=None,tool_start_callback=None,tool_complete_callback=None)
+        agent._get_session_db_for_recall.return_value=db
+        agent._should_emit_quiet_tool_messages.return_value=False
+        agent._subdirectory_hints.check_tool_call.return_value=None
+        agent._append_guardrail_observation.side_effect=lambda name,args,result,**kw:result
+        agent._tool_result_content_for_active_model.side_effect=lambda name,result:result
+        args={'count_only':True,'history_scope':'chat','start_date':'2026-10-16','end_date':'2026-10-16','timezone':'Europe/Moscow'}
+        if path=='invoke':
+            raw=invoke_tool(agent,'session_search',args,'test',pre_tool_block_checked=True)
+        else:
+            call=SimpleNamespace(id='count-call',function=SimpleNamespace(name='session_search',arguments=json.dumps(args)))
+            messages=[]
+            execute_tool_calls_sequential(agent,SimpleNamespace(tool_calls=[call]),messages,'test')
+            raw=messages[-1]['content']
+        result=json.loads(raw)
+        assert result['success'] and result['count']==2 and result['history_scope']=='chat'

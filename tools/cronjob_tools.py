@@ -514,7 +514,7 @@ def _validate_requested_toolsets(
     return normalized_requested
 
 
-def cronjob(
+def _cronjob_in_active_store(
     action: str,
     job_id: Optional[str] = None,
     prompt: Optional[str] = None,
@@ -812,6 +812,28 @@ def cronjob(
 
     except Exception as e:
         return tool_error(str(e), success=False)
+
+
+def cronjob(*args, **kwargs) -> str:
+    """Manage routed gateway jobs in the central scheduler-owned store.
+
+    Routed turns use a profile-local Hermes home, but the gateway scheduler can
+    own their jobs in the default store. Access-context checks below still
+    restrict visibility and mutation to the exact chat/topic/profile owner.
+    Local and CLI invocations keep their existing profile-local store.
+    """
+    access_context = current_access_context()
+    # Require the trusted gateway session identity as well as the derived
+    # context. A mocked/requested profile alone must never unlock the central
+    # store.
+    if access_context.get("source") != "gateway" or _origin_from_env() is None:
+        return _cronjob_in_active_store(*args, **kwargs)
+
+    from cron.jobs import cron_store
+    from hermes_constants import get_default_hermes_root
+
+    with cron_store(get_default_hermes_root()):
+        return _cronjob_in_active_store(*args, **kwargs)
 
 
 

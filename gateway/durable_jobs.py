@@ -770,6 +770,7 @@ class DurableJobStore:
         routing_summary: Optional[str] = None,
         confidence: Optional[float] = None,
         reason: Optional[str] = None,
+        execution_session_key: Optional[str] = None,
     ) -> tuple[Dict[str, Any], bool]:
         """Atomically route one inbox event into a new independent job."""
         now = time.time()
@@ -795,7 +796,9 @@ class DurableJobStore:
             resolved_branch = str(branch_id or "").strip() or (
                 str(parent_job_id or "").strip() or job_id
             )
-            execution_key = f"{inbox['thread_key']}:job:{job_id}"
+            # Serialized clients may retain one prepared conversation across
+            # jobs. Other clients keep the default isolated execution session.
+            execution_key = execution_session_key or f"{inbox['thread_key']}:job:{job_id}"
             conn.execute(
                 """
                 INSERT INTO gateway_jobs (

@@ -450,3 +450,78 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
     # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+def test_profile_codex_reads_root_even_with_stale_local_entries(profile_env):
+    """Codex is root-authoritative, unlike ordinary fallback providers."""
+    from hermes_cli.auth import get_provider_auth_state, read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        providers={"openai-codex": {"tokens": {
+            "access_token": "root-access", "refresh_token": "root-refresh",
+        }}},
+        pool={"openai-codex": [{"id": "root-codex", "access_token": "root-access"}]},
+    ))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(
+        providers={"openai-codex": {"tokens": {
+            "access_token": "stale-local", "refresh_token": "stale-local-refresh",
+        }}},
+        pool={"openai-codex": [{"id": "stale-local", "access_token": "stale-local"}]},
+    ))
+
+    assert get_provider_auth_state("openai-codex")["tokens"]["access_token"] == "root-access"
+    assert [entry["id"] for entry in read_credential_pool("openai-codex")] == ["root-codex"]
+    assert [entry["id"] for entry in read_credential_pool()["openai-codex"]] == ["root-codex"]
+
+
+def test_write_codex_pool_updates_root_not_profile(profile_env):
+    from hermes_cli.auth import write_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "old-root", "access_token": "old-root"}],
+    }))
+    local_payload = _make_auth_store(pool={
+        "openai-codex": [{"id": "stale-local", "access_token": "stale-local"}],
+    })
+    _write(profile_env["profile"] / "auth.json", local_payload)
+
+    saved_to = write_credential_pool("openai-codex", [{
+        "id": "new-root", "access_token": "new-root", "source": "device_code",
+    }])
+
+    assert saved_to == profile_env["global"] / "auth.json"
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert root["credential_pool"]["openai-codex"][0]["id"] == "new-root"
+    assert json.loads((profile_env["profile"] / "auth.json").read_text()) == local_payload
+    assert (profile_env["global"] / "auth.lock").exists()
+    assert not (profile_env["profile"] / "auth.lock").exists()
+
+
+def test_save_codex_tokens_updates_root_singleton_and_pool(profile_env):
+    from hermes_cli.auth import _save_codex_tokens
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        providers={"openai-codex": {"tokens": {
+            "access_token": "old-root", "refresh_token": "old-root-refresh",
+        }}},
+        pool={"openai-codex": [{
+            "id": "root-device", "source": "device_code",
+            "access_token": "old-root", "refresh_token": "old-root-refresh",
+        }]},
+    ))
+    local_payload = _make_auth_store(
+        providers={"openai-codex": {"tokens": {"access_token": "stale-local"}}},
+        pool={"openai-codex": [{"id": "stale-local", "access_token": "stale-local"}]},
+    )
+    _write(profile_env["profile"] / "auth.json", local_payload)
+
+    _save_codex_tokens(
+        {"access_token": "fresh-root", "refresh_token": "fresh-root-refresh"},
+        "2026-09-23T12:00:00Z",
+    )
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert root["providers"]["openai-codex"]["tokens"]["access_token"] == "fresh-root"
+    assert root["credential_pool"]["openai-codex"][0]["access_token"] == "fresh-root"
+    assert root["credential_pool"]["openai-codex"][0]["refresh_token"] == "fresh-root-refresh"
+    assert json.loads((profile_env["profile"] / "auth.json").read_text()) == local_payload

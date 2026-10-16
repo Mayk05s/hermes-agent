@@ -3565,6 +3565,28 @@ class GatewayRunner:
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+        # Telegram forum topics may pin a model without changing the profile's
+        # default (and therefore without affecting sibling topics). Keep a
+        # live /model command authoritative by applying its override below.
+        if source is not None and isinstance(user_config, dict):
+            topic = _telegram_topic_binding(user_config, source)
+            topic_model = str(topic.get("model") or "").strip() if topic else ""
+            if topic_model:
+                logger.debug(
+                    "Telegram topic model route: chat=%s thread=%s model=%s",
+                    getattr(source, "chat_id", ""),
+                    getattr(source, "thread_id", ""),
+                    topic_model,
+                )
+                model = topic_model
+        # A voice client can use a faster model while sharing the same
+        # verified profile, memory scope and tools as the chat client.
+        if source is not None and isinstance(user_config, dict):
+            model_cfg = user_config.get("model")
+            platforms = model_cfg.get("platforms", {}) if isinstance(model_cfg, dict) else {}
+            platform_model = platforms.get(_platform_config_key(source.platform), {}) if isinstance(platforms, dict) else {}
+            if isinstance(platform_model, dict) and platform_model.get("model"):
+                model = str(platform_model["model"])
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -4109,6 +4131,14 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        if source is not None:
+            from hermes_constants import parse_reasoning_effort
+            cfg = _load_gateway_runtime_config()
+            model_cfg = cfg.get("model")
+            platforms = model_cfg.get("platforms", {}) if isinstance(model_cfg, dict) else {}
+            platform_model = platforms.get(_platform_config_key(source.platform), {}) if isinstance(platforms, dict) else {}
+            if isinstance(platform_model, dict) and "reasoning_effort" in platform_model:
+                return parse_reasoning_effort(str(platform_model["reasoning_effort"]))
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
@@ -5184,7 +5214,9 @@ class GatewayRunner:
     @staticmethod
     def _durable_event_metadata(event: MessageEvent) -> Dict[str, Any]:
         """Return restart-safe metadata for one durable inbox event."""
+        from gateway.shopping_message_projection import capture_projection_identity
         return {
+            "shopping_projection_identity": capture_projection_identity(event),
             "reply_to_text": getattr(event, "reply_to_text", None),
             "authenticated_memory_admissions": getattr(event, "authenticated_memory_admissions", []),
             "authenticated_memory_identity_receipt": getattr(event, "authenticated_memory_identity_receipt", None),
@@ -5946,6 +5978,9 @@ class GatewayRunner:
         )
         final_text = str(result_text or "").strip()
         reply_metadata = {}
+        if event.outbound_metadata.get("miniapp_start_params"):
+            reply_metadata["miniapp_start_params"] = event.outbound_metadata["miniapp_start_params"]
+            final_text = final_text or "Открыть в миниаппе"
         if event.outbound_metadata.get('credential_deliveries'):
             reply_metadata['credential_deliveries'] = event.outbound_metadata['credential_deliveries']
             final_text = final_text or '🔐 Доступ подготовлен.'
@@ -5969,6 +6004,12 @@ class GatewayRunner:
                 **({"result_metadata": reply_metadata} if reply_metadata else {}),
             )
         if completed:
+            _completion_hook = getattr(getattr(self, "adapters", {}).get(event.source.platform), "notify_job_completed", None)
+            if callable(_completion_hook):
+                try:
+                    _completion_hook(job_id)
+                except Exception:
+                    logger.debug("Optional completion notification failed", exc_info=True)
             getattr(self, "_scheduled_durable_job_ids", set()).discard(job_id)
             getattr(self, "_provider_retry_job_ids", set()).discard(job_id)
             consumed_versions.pop(job_id, None)
@@ -6232,6 +6273,8 @@ class GatewayRunner:
                 reply_metadata = json.loads(current.get("result_metadata_json") or "{}")
             except (TypeError, ValueError):
                 reply_metadata = {}
+            if isinstance(reply_metadata, dict) and isinstance(reply_metadata.get("miniapp_start_params"), list):
+                metadata["miniapp_start_params"] = reply_metadata["miniapp_start_params"]
             if isinstance(reply_metadata, dict) and isinstance(reply_metadata.get('credential_deliveries'), list):
                 metadata['credential_deliveries'] = reply_metadata['credential_deliveries']
             result = await adapter._send_with_retry(
@@ -8485,6 +8528,12 @@ class GatewayRunner:
                         )
                         del self._failed_platforms[platform]
                         continue
+
+                    preserve_pending_updates = getattr(
+                        adapter, "preserve_pending_updates_on_connect", None
+                    )
+                    if callable(preserve_pending_updates):
+                        preserve_pending_updates()
 
                     adapter.set_message_handler(self._handle_message)
                     if hasattr(adapter, "set_durable_job_delivery_handler"):
@@ -11586,6 +11635,8 @@ class GatewayRunner:
                         self._schedule_durable_job_continuation(durable_job_id)
 
             if not result_is_current:
+                event.outbound_metadata.pop("shopping_list_url", None)
+                event.outbound_metadata.pop("miniapp_start_params", None)
                 event.outbound_metadata.pop('credential_deliveries', None)
                 # A semantic scope update arrived after this attempt began and
                 # could not be consumed safely. The combined request is already
@@ -11601,7 +11652,11 @@ class GatewayRunner:
             # Goal continuation is only allowed after the same version that will
             # be delivered has committed. A stale attempt must not enqueue more
             # work based on an answer the user never sees.
-            if result_is_current and durable_result_text.strip():
+            if (
+                result_is_current
+                and durable_result_text.strip()
+                and not getattr(event, "private_disclosure_denied", False)
+            ):
                 try:
                     session_entry = self.session_store.get_or_create_session(
                         source,
@@ -12120,6 +12175,14 @@ class GatewayRunner:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _job_id = str(getattr(event, "durable_job_id", None) or "")
+        from gateway.shopping_message_projection import capture_projection_identity, restore_projection_identity
+        try:
+            if getattr(event,"raw_message",None) is None:
+                restore_projection_identity(self,event)
+            else:
+                capture_projection_identity(event,getattr(self,"adapters",{}).get(source.platform))
+        except Exception as _projection_identity_error:
+            logger.warning("Shopping projection identity unavailable: %s",type(_projection_identity_error).__name__)
         if getattr(event, "raw_message", None) is None and (_job_id or getattr(event, "durable_inbox_id", None)):
             try:
                 from gateway.memory_ingress import restore_authenticated_memory_identity
@@ -12154,8 +12217,20 @@ class GatewayRunner:
             if event.authenticated_user_request_text is not None
             else event.text or ""
         )
+        from gateway.private_memory_disclosure import (
+            disclosure_prompt_block,
+            has_private_disclosure_prefix,
+            private_disclosure_query,
+        )
+        _private_disclosure_prefixed = has_private_disclosure_prefix(
+            _raw_user_message_text
+        )
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = (
+            "[private disclosure request]"
+            if _private_disclosure_prefixed
+            else (event.text or "")[:80].replace("\n", " ")
+        )
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -12183,6 +12258,71 @@ class GatewayRunner:
             event.source = source
         except Exception:
             pass
+        _private_disclosure_prompt = ""
+        _private_disclosure_active = False
+        _private_query = private_disclosure_query(event)
+        if _private_disclosure_prefixed and _private_query is None:
+            event.private_disclosure_denied = True
+            from gateway.private_memory_disclosure import (
+                PRIVATE_DISCLOSURE_DENIED_RESPONSE,
+            )
+
+            return PRIVATE_DISCLOSURE_DENIED_RESPONSE
+        if _private_query is not None and self._get_proxy_url():
+            event.private_disclosure_denied = True
+            from gateway.private_memory_disclosure import (
+                PRIVATE_DISCLOSURE_DENIED_RESPONSE,
+            )
+
+            return PRIVATE_DISCLOSURE_DENIED_RESPONSE
+        if _private_query is not None:
+            _profile_name = str(getattr(source, "profile_name", "") or "default")
+            _profile_config = (
+                self._load_profile_config_for_name(_profile_name)
+                if _profile_name != "default"
+                else _load_gateway_config()
+            )
+            _profile_config = self._profile_config_with_chat_settings(
+                _profile_config, source
+            )
+            _disclosure_route = self._private_disclosure_route_for_source(
+                source,
+                _profile_config,
+                getattr(event, "message_id", None),
+            )
+            if _disclosure_route is None:
+                event.private_disclosure_denied = True
+                from gateway.private_memory_disclosure import (
+                    PRIVATE_DISCLOSURE_DENIED_RESPONSE,
+                )
+
+                return PRIVATE_DISCLOSURE_DENIED_RESPONSE
+            if _disclosure_route is not None:
+                _private_disclosure_active = True
+                try:
+                    from plugins.memory.mempalace import (
+                        MemPalaceMemoryProvider as _MemPalaceFactory,
+                    )
+
+                    _scoped_provider = _MemPalaceFactory().for_access_context(
+                        _disclosure_route.context,
+                        options=_disclosure_route.provider_options,
+                    )
+                    _private_result = await asyncio.to_thread(
+                        _scoped_provider.private_disclosure,
+                        _private_query,
+                    )
+                except Exception as _disclosure_exc:
+                    logger.warning(
+                        "Private memory disclosure recall unavailable (%s)",
+                        type(_disclosure_exc).__name__,
+                    )
+                    _private_result = '{"results": [], "count": 0, "unavailable": true}'
+                event.text = _private_query
+                _raw_user_message_text = _private_query
+                _private_disclosure_prompt = disclosure_prompt_block(
+                    _private_result
+                )
         session_entry = self.session_store.get_or_create_session(
             source,
             session_key_override=(
@@ -12305,6 +12445,10 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        if _private_disclosure_prompt:
+            context_prompt = (
+                f"{context_prompt}\n\n{_private_disclosure_prompt}"
+            )
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -12892,9 +13036,11 @@ class GatewayRunner:
                         "durable_request_text",
                         None,
                     ),
+                    private_disclosure_active=_private_disclosure_active,
                     memory_turn_input=getattr(event, "authenticated_memory_input", None),
                     memory_turn_inputs=getattr(event, "authenticated_memory_inputs", ()),
                     memory_turn_identity=getattr(event, "authenticated_memory_identity", None),
+                    shopping_projection_identity=getattr(event, "shopping_projection_identity", None),
                 )
 
             if (
@@ -13004,6 +13150,51 @@ class GatewayRunner:
                 actual_model=agent_result.get("model"),
             )
 
+            # Native navigation is a postcondition of successful MCP operations.
+            # Prefer execution-time records: transcripts can be truncated and do
+            # not contain tools executed inside delegated specialists.
+            _shopping_projected = False
+            if source.platform == Platform.TELEGRAM:
+                from gateway.miniapp_reply_contract import (
+                    apply_miniapp_reply_contract, miniapp_reply_records,
+                )
+                event.outbound_metadata.pop("shopping_list_url", None)
+                event.outbound_metadata.pop("miniapp_start_params", None)
+                _miniapp_offset = agent_result.get("history_offset", len(history))
+                if not isinstance(_miniapp_offset, int) or _miniapp_offset < 0:
+                    _miniapp_offset = len(history)
+                _miniapp_records = agent_result.get("miniapp_records")
+                if _miniapp_records is None:
+                    _miniapp_records = miniapp_reply_records(agent_messages, _miniapp_offset)
+                response, _miniapp_params = apply_miniapp_reply_contract(response, _miniapp_records)
+                _shopping_projected = False
+                if not agent_result.get("failed") and not agent_result.get("partial") and not agent_result.get("interrupted"):
+                    try:
+                        from gateway.shopping_message_projection import project_shopping_message, projection_event_for_result
+                        _shopping_event = projection_event_for_result(event,agent_result)
+                        if _shopping_event is not None:
+                            _shopping_projected = await project_shopping_message(
+                                _shopping_event, self.adapters.get(source.platform), _miniapp_records,
+                            )
+                    except Exception as _projection_error:
+                        logger.warning("Shopping card handoff failed: %s", type(_projection_error).__name__)
+                        _projection_warning = ("Изменения сохранены, но обновление сообщения списка не подтверждено. Откройте список в приложении."
+                            if any(record.get("mutation") for record in _miniapp_records) else "Новое сообщение списка пока не подтверждено. Предыдущую карточку сохранили.")
+                        response = f"{response}\n\n{_projection_warning}"
+                if _shopping_projected:
+                    response = ("Новая карточка списка готова. Старую карточку пока не удалось удалить."
+                                if isinstance(_shopping_projected,dict) and _shopping_projected.get("partial") else "[[reaction:👌]]")
+                    if _shopping_event is not event and response=="[[reaction:👌]]":
+                        from gateway.platforms.base import parse_agent_control_response
+                        await self.adapters[source.platform].handle_agent_control_response(_shopping_event,parse_agent_control_response(response))
+                        response="[[silent]]"
+                    agent_result["already_sent"] = False
+                    _miniapp_params = []
+                if _miniapp_params:
+                    event.outbound_metadata["miniapp_start_params"] = _miniapp_params
+                    logger.info("miniapp reply contract: chat=%s thread=%s buttons=%d",
+                                source.chat_id, source.thread_id, len(_miniapp_params))
+
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -13024,7 +13215,7 @@ class GatewayRunner:
                 )
             except Exception:
                 _show_reasoning_effective = getattr(self, "_show_reasoning", False)
-            if _show_reasoning_effective and response:
+            if _show_reasoning_effective and response and not _shopping_projected:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -13307,7 +13498,7 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if not _shopping_projected and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -13343,16 +13534,24 @@ class GatewayRunner:
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                # BasePlatformAdapter sees the event-scoped shopping metadata and
+                # emits the one minimal carrier with the native button. Returning
+                # None avoids a duplicate model body.
                 self._complete_durable_job(
                     event,
                     response,
-                    delivered=True,
+                    delivered=not bool(event.outbound_metadata.get("miniapp_start_params")),
                 )
                 return None
 
             return response
             
         except Exception as e:
+            # A later gateway failure must not attach a successful action's
+            # button to the error response. Transport directives are committed
+            # only when this handler completes its success path.
+            event.outbound_metadata.pop("shopping_list_url", None)
+            event.outbound_metadata.pop("miniapp_start_params", None)
             event.outbound_metadata.pop('credential_deliveries', None)
             # Stop typing indicator on error too
             try:
@@ -16022,6 +16221,8 @@ class GatewayRunner:
 
             if send_text:
                 text_content = cleaned.strip()
+                if not text_content and (_thread_meta or {}).get("miniapp_start_params"):
+                    text_content = "Открыть в миниаппе"
                 if text_content:
                     final_text_metadata = dict(_thread_meta or {})
                     final_text_metadata["hermes_turn_final"] = True
@@ -21290,6 +21491,28 @@ class GatewayRunner:
             principal_verified=verified_memory_identity(source, self._pairing_store_for_source(source)),
         )
 
+    def _private_disclosure_route_for_source(
+        self, source, user_config, event_message_id=None
+    ):
+        """Resolve a one-message private-read route from trusted gateway facts."""
+        from dataclasses import replace
+        from gateway.memory_routing import (
+            resolve_private_disclosure_route,
+            verified_memory_identity,
+        )
+
+        trusted_source = replace(
+            source, message_id=source.message_id or event_message_id
+        )
+        return resolve_private_disclosure_route(
+            trusted_source,
+            user_config,
+            request_authorized=self._is_user_authorized(source),
+            principal_verified=verified_memory_identity(
+                source, self._pairing_store_for_source(source)
+            ),
+        )
+
     async def _run_agent(
         self,
         message: str,
@@ -21305,9 +21528,11 @@ class GatewayRunner:
         durable_job_id: Optional[str] = None,
         durable_recovery: bool = False,
         durable_request_text: Optional[str] = None,
+        private_disclosure_active: bool = False,
         memory_turn_input=None,
         memory_turn_inputs=(),
         memory_turn_identity=None,
+        shopping_projection_identity=None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -21321,15 +21546,6 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
-        # Mini App buttons are scoped to one concrete agent turn. Clear any
-        # unconsumed state before work starts (including proxy turns, where
-        # local MCP completions are not observable and therefore must fail
-        # closed).
-        _turn_adapter = self.adapters.get(source.platform)
-        _begin_miniapp_turn = getattr(_turn_adapter, "begin_miniapp_turn", None)
-        if callable(_begin_miniapp_turn):
-            _begin_miniapp_turn(source.chat_id, source.thread_id)
-
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             if durable_recovery:
@@ -21357,7 +21573,9 @@ class GatewayRunner:
 
         from run_agent import AIAgent
         import queue
+        from gateway.miniapp_reply_contract import MiniappReplyCollector
 
+        miniapp_collector = MiniappReplyCollector()
         from gateway.credential_delivery import CredentialReplyCollector
         _credential_adapter = self.adapters.get(source.platform)
         credential_collector = CredentialReplyCollector(
@@ -21388,6 +21606,12 @@ class GatewayRunner:
         from gateway.memory_ingress import matching_input
         memory_source = matching_input(memory_turn_input, source, event_message_id) or matching_input(memory_turn_identity, source, event_message_id) or source
         memory_provider_route = self._memory_provider_route_for_source(memory_source, user_config, event_message_id)
+        if private_disclosure_active:
+            if memory_provider_route is None:
+                raise ValueError("Disclosure turn requires a normal group memory route")
+            from gateway.memory_routing import read_only_group_memory_route
+
+            memory_provider_route = read_only_group_memory_route(memory_provider_route)
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -21510,36 +21734,15 @@ class GatewayRunner:
             if not _run_still_current():
                 return
 
+            if event_type == "tool.completed" and source.platform == Platform.TELEGRAM:
+                miniapp_collector.record(
+                    tool_name, kwargs.get("result"), is_error=bool(kwargs.get("is_error")),
+                )
+
             if event_type == "processing.status":
                 if str(tool_name or "").strip() == "_processing":
                     _mark_processing_work_started_from_agent()
                 return
-
-            if event_type == "tool.completed":
-                # Transport metadata must come from the executed tool, never
-                # from words in the request or answer. Telegram's adapter
-                # filters this to successful, mutating Mini App MCP tools and
-                # queues the corresponding app section for final delivery.
-                adapter = self.adapters.get(source.platform)
-                record_miniapp_completion = getattr(
-                    adapter,
-                    "record_miniapp_tool_completion",
-                    None,
-                )
-                if callable(record_miniapp_completion):
-                    try:
-                        record_miniapp_completion(
-                            source.chat_id,
-                            source.thread_id,
-                            tool_name,
-                            is_error=bool(kwargs.get("is_error", False)),
-                            result=kwargs.get("result"),
-                        )
-                    except Exception as _miniapp_err:
-                        logger.debug(
-                            "Mini App tool-completion tracking failed: %s",
-                            _miniapp_err,
-                        )
 
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
@@ -22134,6 +22337,10 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            _instructions_hook = getattr(self.adapters.get(source.platform), "model_context_instructions", None)
+            if durable_job_id and callable(_instructions_hook):
+                combined_ephemeral = (combined_ephemeral + "\n\n" + _instructions_hook()).strip()
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
             # runtime budget settings bridged into env vars.
@@ -22245,7 +22452,9 @@ class GatewayRunner:
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
-                                    if source.platform == Platform.TELEGRAM and credential_collector.snapshot():
+                                    from gateway.shopping_message_projection import projection_row_ids, projection_show_row_ids
+                                    if source.platform == Platform.TELEGRAM and (credential_collector.snapshot() or projection_row_ids(miniapp_collector.snapshot())
+                                        or projection_show_row_ids(miniapp_collector.snapshot())):
                                         return
                                     _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
@@ -22255,7 +22464,9 @@ class GatewayRunner:
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
-                if source.platform == Platform.TELEGRAM and credential_collector.snapshot():
+                from gateway.shopping_message_projection import projection_row_ids, projection_show_row_ids
+                if source.platform == Platform.TELEGRAM and (credential_collector.snapshot() or projection_row_ids(miniapp_collector.snapshot())
+                    or projection_show_row_ids(miniapp_collector.snapshot())):
                     return
                 if _stream_consumer is not None:
                     if already_streamed:
@@ -22320,6 +22531,7 @@ class GatewayRunner:
                         self._init_cached_agent_for_turn(agent, _interrupt_depth)
                         logger.debug("Reusing cached agent for session %s", session_key)
 
+            _agent_was_cached = agent is not None
             if agent is None:
                 # Config changed or first message — create fresh agent
                 agent = AIAgent(
@@ -22365,6 +22577,13 @@ class GatewayRunner:
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            _ready_hook = getattr(self.adapters.get(source.platform), "record_agent_ready", None)
+            if durable_job_id and callable(_ready_hook):
+                try:
+                    _ready_hook(durable_job_id, _agent_was_cached)
+                except Exception:
+                    logger.debug("Agent preparation timing unavailable", exc_info=True)
+
             if memory_provider_route:
                 agent.set_memory_access_context(memory_provider_route.context)
                 agent._trusted_memory_input = memory_turn_input
@@ -22372,7 +22591,7 @@ class GatewayRunner:
                 agent._trusted_memory_inputs = memory_turn_inputs or ((memory_turn_input,) if memory_turn_input else ())
                 agent._trusted_memory_provider_options = memory_provider_route.provider_options
                 for _memory_provider in getattr(agent._memory_manager, "providers", ()):
-                    if memory_turn_input is not None:
+                    if memory_turn_input is not None and not private_disclosure_active:
                         try:
                             _memory_provider.on_authenticated_event(agent._trusted_memory_inputs)
                         except Exception as exc:
@@ -22383,12 +22602,25 @@ class GatewayRunner:
             agent.tool_progress_callback = progress_callback
             agent._credential_delivery_callback = credential_collector.record if source.platform == Platform.TELEGRAM else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
+            # Durable voice clients can collect text locally without enabling
+            # push delivery or the normal stream consumer for durable jobs.
+            _voice_sink = getattr(self.adapters.get(source.platform), "capture_response_delta", None)
+            if durable_job_id and callable(_voice_sink):
+                def _durable_voice_delta(text):
+                    if _run_still_current():
+                        try:
+                            _voice_sink(durable_job_id, text)
+                        except Exception:
+                            logger.debug("Durable voice text capture failed", exc_info=True)
+                agent.stream_delta_callback = _durable_voice_delta
+            else:
+                agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent._gateway_requested_model = turn_route["model"]
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -22832,7 +23064,37 @@ class GatewayRunner:
                             _attached_native_imgs,
                         )
                     )
+                _voice_adapter = self.adapters.get(source.platform)
+                _history_hook = getattr(_voice_adapter, "prepare_conversation_history", None)
+                if durable_job_id and callable(_history_hook):
+                    _conversation_kwargs["conversation_history"] = _history_hook(durable_job_id, agent_history)
+                _timing_hook = getattr(_voice_adapter, "record_model_timing", None)
+                agent.model_timing_callback = (
+                    (lambda phase: _timing_hook(durable_job_id, phase))
+                    if durable_job_id and callable(_timing_hook) else None
+                )
+                _snapshot_hook = getattr(self.adapters.get(source.platform), "prefetched_context", None)
+                if durable_job_id and callable(_snapshot_hook) and isinstance(_api_run_message, str):
+                    try:
+                        _snapshot = _snapshot_hook(durable_job_id)
+                        if _snapshot:
+                            _api_run_message += "\n\n" + _snapshot
+                            # Keep transient database snapshots out of the durable
+                            # user transcript and the stable cached system prompt.
+                            _conversation_kwargs.setdefault("persist_user_message", _run_message)
+                    except Exception:
+                        logger.debug("Optional voice prefetch unavailable", exc_info=True)
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                _finish_context = getattr(_voice_adapter, "finish_conversation_context", None)
+                if durable_job_id and callable(_finish_context):
+                    _finish_context(durable_job_id, _conversation_kwargs["conversation_history"], result.get("final_response"))
+                # Preserve the full transcript and downstream history offsets;
+                # only the model input uses the adapter's compact working context.
+                if durable_job_id and callable(_history_hook) and result.get("messages"):
+                    _sent_history = _conversation_kwargs["conversation_history"]
+                    if result["messages"][:len(_sent_history)] == _sent_history:
+                        result["messages"] = list(agent_history) + result["messages"][len(_sent_history):]
+
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -22881,7 +23143,10 @@ class GatewayRunner:
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
+                    "miniapp_records": miniapp_collector.snapshot(),
                     "credential_deliveries": credential_collector.snapshot(),
+                    "shopping_projection_event_id": event_message_id,
+                    "shopping_projection_identity": shopping_projection_identity,
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
@@ -23040,7 +23305,10 @@ class GatewayRunner:
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
+                "miniapp_records": miniapp_collector.snapshot(),
                 "credential_deliveries": credential_collector.snapshot(),
+                "shopping_projection_event_id": event_message_id,
+                "shopping_projection_identity": shopping_projection_identity,
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
@@ -23121,6 +23389,14 @@ class GatewayRunner:
                 self._update_runtime_status("draining")
         
         tracking_task = asyncio.create_task(track_agent())
+        _private_cache_evicted = False
+
+        def _evict_private_disclosure_cache() -> None:
+            nonlocal _private_cache_evicted
+            if _private_cache_evicted or not private_disclosure_active or not session_key:
+                return
+            _private_cache_evicted = True
+            self._evict_cached_agent(session_key)
         
         # Monitor for interrupts from the adapter (new messages arriving).
         # This is the PRIMARY interrupt path for regular text messages —
@@ -23293,7 +23569,9 @@ class GatewayRunner:
 
                 token = set_hermes_home_override(profile_home)
                 try:
-                    return run_sync()
+                    from gateway.session_context import override_session_env
+                    with override_session_env("HERMES_SESSION_SHOPPING_RECEIPT", json.dumps(shopping_projection_identity or {})):
+                        return run_sync()
                 finally:
                     reset_hermes_home_override(token)
 
@@ -23469,11 +23747,16 @@ class GatewayRunner:
             _result_for_fb = result_holder[0]
             _run_failed = _result_for_fb.get("failed") if _result_for_fb else False
             if _agent is not None and hasattr(_agent, 'model') and not _run_failed:
-                _cfg_model = _resolve_gateway_model()
+                _cfg_model = getattr(_agent, "_gateway_requested_model", None) or _resolve_gateway_model()
                 if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent.model):
                     # Fallback activated on a successful run — evict cached
                     # agent so the next message retries the primary model.
                     self._evict_cached_agent(session_key)
+
+            # The API-only retrieval payload is held in this agent's ephemeral
+            # system prompt. Drop that cached agent before any queued ordinary
+            # turn can start so the payload cannot survive beyond this call.
+            _evict_private_disclosure_cache()
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
@@ -23596,11 +23879,40 @@ class GatewayRunner:
                     )
                     first_response = result.get("final_response", "")
                     _first_metadata = dict(_status_thread_metadata or {})
-                    if source.platform == Platform.TELEGRAM and result.get('credential_deliveries'):
-                        _first_metadata['credential_deliveries'] = result['credential_deliveries']
-                        _already_streamed = False
-                        first_response = '🔐 Доступ подготовлен.'
-                    if first_response and not _already_streamed:
+                    _first_params = []
+                    if source.platform == Platform.TELEGRAM:
+                        from gateway.miniapp_reply_contract import apply_miniapp_reply_contract
+                        first_response, _first_params = apply_miniapp_reply_contract(
+                            first_response, result.get("miniapp_records") or [],
+                        )
+                        try:
+                            from gateway.shopping_message_projection import project_shopping_message
+                            _projection_event = MessageEvent(source=source,text=message,message_id=event_message_id,
+                                authenticated_memory_input=memory_turn_input)
+                            _projection_event.authenticated_memory_identity = memory_turn_identity
+                            _projection_event.shopping_projection_identity = shopping_projection_identity
+                            _first_projection = None
+                            if not result.get("failed") and not result.get("partial"):
+                                _first_projection = await project_shopping_message(_projection_event, adapter, result.get("miniapp_records") or [])
+                            if _first_projection:
+                                from gateway.platforms.base import parse_agent_control_response
+                                if isinstance(_first_projection,dict) and _first_projection.get("partial"):
+                                    first_response = "Новая карточка списка готова. Старую карточку пока не удалось удалить."
+                                else:
+                                    await adapter.handle_agent_control_response(_projection_event,parse_agent_control_response("[[reaction:👌]]"))
+                                    first_response = ""
+                                _first_params = []
+                        except Exception as _projection_error:
+                            logger.warning("Queued shopping card handoff failed: %s",type(_projection_error).__name__)
+                        if _first_params:
+                            _first_metadata["miniapp_start_params"] = _first_params
+                            if _already_streamed or not first_response:
+                                first_response = "Открыть в миниаппе"
+                        if result.get('credential_deliveries'):
+                            _first_metadata['credential_deliveries'] = result['credential_deliveries']
+                            _already_streamed = False
+                            first_response = '🔐 Доступ подготовлен.'
+                    if (first_response and not _already_streamed) or _first_params:
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response with attachment processing before continuing.",
@@ -23698,6 +24010,7 @@ class GatewayRunner:
                     except Exception:
                         pass
 
+                from gateway.shopping_message_projection import capture_projection_identity
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -23709,9 +24022,11 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    shopping_projection_identity=capture_projection_identity(pending_event,self.adapters.get(next_source.platform)) if pending_event else None,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
+            _evict_private_disclosure_cache()
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
                 progress_task.cancel()

@@ -4855,6 +4855,8 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    allow_fallback: bool = True,
+    no_tools: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -4884,6 +4886,10 @@ def call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if no_tools:
+        tools = []
+        for _tool_field in ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"):
+            effective_extra_body.pop(_tool_field, None)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -5198,7 +5204,7 @@ def call_llm(
         # Capacity errors bypass the explicit-provider gate: the provider
         # literally cannot serve this request regardless of user intent.
         is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
-        if should_fallback and (is_auto or is_capacity_error):
+        if allow_fallback and should_fallback and (is_auto or is_capacity_error):
             if _is_payment_error(first_err):
                 reason = "payment error"
                 # Resolve the actual provider label (resolved_provider may be

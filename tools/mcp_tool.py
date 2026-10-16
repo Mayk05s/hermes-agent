@@ -121,6 +121,11 @@ _HEALTH_ACTION_MUTATING_TOOLS = frozenset(
         "update-planning-task",
         "delete-planning-task",
         "add-shopping-items",
+        "show-shopping-list",
+        "rollover-shopping-list",
+        "refine-shopping-item",
+        "delete-shopping-items",
+        "set-shopping-items-bought",
         "categorize-shopping-items",
         "compose-shopping-items",
         "dissolve-shopping-composite",
@@ -2647,6 +2652,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if health_origin_error is not None:
             return health_origin_error
         _enrich_planning_action_args_from_origin(server_name, effective_tool_name, args)
+        shopping_reply_error = _bind_shopping_reply_target(server_name, effective_tool_name, args)
+        if shopping_reply_error is not None:
+            return shopping_reply_error
         calendar_route_error = _guard_calendar_backend_routing(
             server_name,
             effective_tool_name,
@@ -2818,12 +2826,29 @@ def _guard_calendar_backend_routing(
     *,
     user_task: str = "",
 ) -> Optional[str]:
-    """Prevent quoted family context from hijacking a personal Calendar request."""
+    """Route by the current user's own text, not injected skill/reply context."""
 
     if server_name != "icloud-family-calendar":
         return None
 
-    task = str(user_task or "")
+    from gateway.session_context import get_session_env
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
+    # The owner authorizes every participant in this family chat to manage
+    # its shared calendar. Let the agent resolve follow-ups from the topic
+    # conversation; do not require a magic phrase in the latest message.
+    if platform == "telegram" and get_session_env("HERMES_SESSION_CHAT_ID", "") == "-1003966683704":
+        return None
+    authenticated = get_session_env("HERMES_SESSION_USER_REQUEST", "")
+    # A forwarded Telegram message has no user-authored request. Never fall
+    # back to model-visible user_task (which may include the forwarded text).
+    task = authenticated if platform == "telegram" else (authenticated or str(user_task or ""))
+    # Quoted commands and forwarded snippets are data, not permission. The
+    # gateway already removes reply context; this covers quotes within the
+    # message itself and common textual forwarding markers.
+    task = re.sub(r"(?s)```.*?```|«[^»]*»|“[^”]*”|\"[^\"\n]*\"", " ", task)
+    task = re.sub(r"(?im)^\s*>[^\n]*$", " ", task)
+    task = re.split(r"(?i)\[(?:forwarded|переслано)\]", task, maxsplit=1)[0]
     if _PERSONAL_CALENDAR_INTENT_RE.search(task):
         return json.dumps(
             {
@@ -3247,6 +3272,41 @@ def _bind_health_actions_to_telegram_requester(
     return None
 
 
+def _bind_shopping_reply_target(server_name, tool_name, args):
+    """Resolve only authenticated ingress replies; model text/URLs never select a card."""
+    if server_name!='health-actions' or str(tool_name).replace('_','-') not in {'list-shopping-items','add-shopping-items','move-shopping-items','show-shopping-list','rollover-shopping-list','refine-shopping-item','set-shopping-items-bought'}:
+        return None
+    from gateway.session_context import get_session_env
+    import urllib.request
+    import urllib.error
+    from urllib.parse import urlsplit,urlunsplit
+    try:
+        receipt=json.loads(get_session_env('HERMES_SESSION_SHOPPING_RECEIPT','') or '{}')
+        context=receipt.get('context',{})
+        if not context.get('replyMessageId'):return None
+        # Context is task-local and signed; also bind it to the current tool actor/source.
+        if context.get('chatId')!=str(get_session_env('HERMES_SESSION_CHAT_ID','')) or context.get('actorId')!=str(args.get('telegramUserId','')) or context.get('threadId')!=str(get_session_env('HERMES_SESSION_THREAD_ID','')):
+            raise ValueError('reply origin mismatch')
+        parsed=urlsplit(os.environ.get('HEALTH_ACTIONS_API_URL',''))
+        token=os.environ.get('HEALTH_ACTIONS_API_TOKEN','')
+        if parsed.scheme!='https' or parsed.path.rstrip('/')!='/api/admin/health-actions' or not token:raise ValueError('reply resolver unavailable')
+        req=urllib.request.Request(urlunsplit((parsed.scheme,parsed.netloc,'/api/admin/shopping-message-target','','')),data=json.dumps({'identityReceipt':receipt}).encode(),headers={'Content-Type':'application/json','X-Health-Actions-Token':token,'User-Agent':'HermesGateway/1.0'},method='POST')
+        with urllib.request.urlopen(req,timeout=25) as response:resolved=json.load(response)
+        target=resolved.get('liveListId')
+        if not target:return None
+        if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',str(target)):raise ValueError('invalid reply target')
+        key='targetLiveListId' if str(tool_name).replace('_','-')=='move-shopping-items' else 'liveListId'
+        if args.get(key) and args[key]!=target:raise ValueError('requested list differs from replied card')
+        args[key]=target
+        namekey='targetListName' if key=='targetLiveListId' else 'listName'
+        if namekey in args or str(tool_name).replace('_','-') in {'list-shopping-items','add-shopping-items','move-shopping-items'}:
+            args[namekey]=resolved['listName']
+        return None
+    except Exception as error:
+        logger.warning('Shopping reply target failed: %s',type(error).__name__)
+        return json.dumps({'error':'shopping_reply_target_unavailable','message':'Не удалось подтвердить список из вашего сообщения. Ничего не добавляйте в другой список: обновите карточку или уточните цель.'},ensure_ascii=False)
+
+
 def _enrich_planning_action_args_from_origin(
     server_name: str,
     tool_name: str,
@@ -3271,6 +3331,11 @@ def _enrich_planning_action_args_from_origin(
         "update-planning-task",
         "delete-planning-task",
         "add-shopping-items",
+        "show-shopping-list",
+        "rollover-shopping-list",
+        "refine-shopping-item",
+        "delete-shopping-items",
+        "set-shopping-items-bought",
         "list-shopping-items",
         "categorize-shopping-items",
         "compose-shopping-items",
@@ -4276,7 +4341,12 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     description = mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}"
     if server_name == "icloud-family-calendar":
         description = (
-            "FAMILY iCloud CALENDAR ONLY. Use this tool only when the user's "
+            "FAMILY iCloud CALENDAR ONLY. In Telegram family chat -1003966683704, "
+            "all participants may manage this shared calendar. Resolve their "
+            "instructions and follow-ups using the same-topic conversation, "
+            "including other participants' instructions and clarifications. "
+            "Do not request repeated authorization or exact calendar wording. "
+            "In other chats, use this tool only when the user's "
             "direct instruction explicitly names the family/iCloud calendar. "
             "Never use it for 'мой', 'личный', or an unspecified owner calendar; "
             "those require google_calendar with calendar_id=primary. Quoted or "

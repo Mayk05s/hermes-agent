@@ -201,6 +201,57 @@ def test_chat_list_hides_jobs_from_other_contexts(
     assert hidden["id"] not in ids
 
 
+def test_routed_chat_manages_matching_job_in_central_scheduler_store(
+    family_cron_home,
+    family_english_session,
+    monkeypatch,
+):
+    """A routed profile must not mistake its empty local store for truth."""
+    root, profile_home = family_cron_home
+    from cron.jobs import create_job, cron_store, list_jobs
+    from tools.cronjob_tools import cronjob
+
+    access_context = {
+        "version": 1,
+        "source": "gateway",
+        "platform": "telegram",
+        "chat_id": "-1003966683704",
+        "thread_id": "796",
+        "profile": "family-chat",
+        "scope": "english",
+        "memory_scope": "english",
+        "allowed_skills": ["telegram_family/natalia-english-blog-post"],
+        "enabled_toolsets": ["image_gen", "memory", "skills"],
+    }
+    with cron_store(root):
+        central_job = create_job(
+            prompt="central managed job",
+            schedule="every 1d",
+            origin={
+                "platform": "telegram",
+                "chat_id": "-1003966683704",
+                "thread_id": "796",
+            },
+            profile="family-chat",
+            access_context=access_context,
+        )
+
+    # Reproduce production: imported cron globals point at the routed profile,
+    # whose local job list is empty, while the scheduler store is central.
+    monkeypatch.setattr("cron.jobs.CRON_DIR", profile_home / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", profile_home / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", profile_home / "cron" / "output")
+
+    listing = json.loads(cronjob(action="list", include_disabled=True))
+    assert [job["job_id"] for job in listing["jobs"]] == [central_job["id"]]
+
+    removed = json.loads(cronjob(action="remove", job_id=central_job["id"]))
+    assert removed["success"] is True
+    with cron_store(root):
+        assert list_jobs(include_disabled=True) == []
+    assert not (profile_home / "cron" / "jobs.json").exists()
+
+
 def test_scheduler_runs_with_creator_memory_scope_and_not_live_chat_context(
     family_cron_home,
 ):

@@ -783,6 +783,7 @@ def run_conversation(
 
     active_system_prompt = agent._cached_system_prompt
 
+
     # ── Preflight context compression ──
     # Before entering the main loop, check if the loaded conversation
     # history already exceeds the model's context threshold.  This handles

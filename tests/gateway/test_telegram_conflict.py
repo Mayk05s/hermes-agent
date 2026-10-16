@@ -47,6 +47,57 @@ def _no_auto_discovery(monkeypatch):
     monkeypatch.setattr("gateway.platforms.telegram.HTTPXRequest", lambda **kwargs: MagicMock())
 
 
+async def _connect_with_mock_polling(monkeypatch, adapter):
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    updater = SimpleNamespace(
+        start_polling=AsyncMock(),
+        stop=AsyncMock(),
+        running=True,
+    )
+    bot = SimpleNamespace(set_my_commands=AsyncMock(), delete_webhook=AsyncMock())
+    app = SimpleNamespace(
+        bot=bot,
+        updater=updater,
+        add_handler=MagicMock(),
+        initialize=AsyncMock(),
+        start=AsyncMock(),
+    )
+    builder = MagicMock()
+    builder.token.return_value = builder
+    builder.request.return_value = builder
+    builder.get_updates_request.return_value = builder
+    builder.build.return_value = app
+    monkeypatch.setattr(
+        "gateway.platforms.telegram.Application",
+        SimpleNamespace(builder=MagicMock(return_value=builder)),
+    )
+
+    assert await adapter.connect() is True
+    return updater
+
+
+@pytest.mark.asyncio
+async def test_cold_start_keeps_drop_pending_updates_policy(monkeypatch):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+
+    updater = await _connect_with_mock_polling(monkeypatch, adapter)
+
+    assert updater.start_polling.await_args.kwargs["drop_pending_updates"] is True
+
+
+@pytest.mark.asyncio
+async def test_replacement_adapter_preserves_pending_updates(monkeypatch):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.preserve_pending_updates_on_connect()
+
+    updater = await _connect_with_mock_polling(monkeypatch, adapter)
+
+    assert updater.start_polling.await_args.kwargs["drop_pending_updates"] is False
+
+
 @pytest.mark.asyncio
 async def test_connect_rejects_same_host_token_lock(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="secret-token"))

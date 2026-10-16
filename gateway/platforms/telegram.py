@@ -283,53 +283,6 @@ def _normalize_legacy_shopping_start_links(content: str) -> str:
         return f"https://t.me/{match.group('bot')}?startapp={start_param}"
 
     return _LEGACY_SHOPPING_START_LINK_RE.sub(_replace, content or "")
-_MINIAPP_WORD_MARKERS: tuple[str, ...] = (
-    "miniapp",
-    "mini app",
-    "mini-app",
-    "миниап",
-    "миниапп",
-    "мини ап",
-    "мини апп",
-    "мини-ап",
-    "мини-апп",
-    "миниприлож",
-    "мини прилож",
-    "мини-прилож",
-    "приложение",
-)
-_MINIAPP_OPEN_MARKERS: tuple[str, ...] = (
-    "открой",
-    "открыть",
-    "покажи",
-    "показать",
-    "дай",
-    "скинь",
-    "пришли",
-    "ссылка",
-    "ссылку",
-    "линк",
-    "кнопк",
-    "запусти",
-    "button",
-    "launch",
-    "open",
-    "show",
-    "link",
-)
-_MINIAPP_EDIT_MARKERS: tuple[str, ...] = (
-    "исправ",
-    "почин",
-    "измени",
-    "изменить",
-    "обнов",
-    "добав",
-    "сделай",
-    "настрой",
-    "deploy",
-    "деплой",
-    "проверь",
-)
 _SUPPORTED_INLINE_MINIAPP_PARAMS: tuple[str, ...] = (
     "health",
     "fitness",
@@ -395,29 +348,6 @@ _MINIAPP_BUTTON_LABELS: dict[str, str] = {
     "social": "Открыть публикации",
     "posts": "Открыть публикации",
     "publishing": "Открыть публикации",
-}
-# Mini App tools should return the generic mutation contract
-# `_miniapp: {changed: true, start_param: "..."}`.  Keep this legacy mapping
-# for the already-deployed health-actions server while older processes drain;
-# read tools and unrelated integrations must always fail closed.
-_MINIAPP_MUTATING_MCP_TOOL_PARAMS: dict[str, str] = {
-    "mcp_health_actions_create_workout_slots": "fitness",
-    "mcp_health_actions_materialize_gtg_day": "fitness",
-    "mcp_health_actions_record_completed_set": "fitness",
-    "mcp_health_actions_restore_cancelled_workout_slot": "fitness",
-    "mcp_health_actions_repair_workout_history_facts": "fitness",
-    "mcp_health_actions_move_workout_slot": "fitness",
-    "mcp_health_actions_cancel_workout_slot": "fitness",
-    "mcp_health_actions_cleanup_cancelled_workout_slots": "fitness",
-    "mcp_health_actions_create_planning_task": "planning",
-    "mcp_health_actions_update_planning_task": "planning",
-    "mcp_health_actions_delete_planning_task": "planning",
-    "mcp_health_actions_add_shopping_items": "shopping",
-    "mcp_health_actions_add_menu_entries": "menu",
-    "mcp_health_actions_replace_menu_entries": "menu",
-    "mcp_health_actions_add_wishlist_items": "wishlist",
-    "mcp_health_actions_update_wishlist_items": "wishlist",
-    "mcp_health_actions_archive_wishlist_items": "wishlist",
 }
 _MINIAPP_WEBAPP_BASE_URL = "https://miniapp.mayk05.pro/"
 
@@ -768,15 +698,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # assembled as one request. They are never dispatched on their own.
         self._held_forward_events: Dict[str, MessageEvent] = {}
         self._held_forward_tasks: Dict[str, asyncio.Task] = {}
-        # Successful Mini App MCP writes register the sections that must be
-        # attached to the final response. This is deliberately tool-driven:
-        # user/assistant text never guesses that a Mini App was changed.
-        self._pending_miniapp_buttons: Dict[tuple[str, str], list[str]] = {}
         self._processing_reaction_visible: Set[tuple[str, str]] = set()
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # A cold start intentionally discards stale updates. The gateway
+        # reconnect watcher flips this for replacement adapters so messages
+        # accumulated during an outage survive automatic recovery.
+        self._drop_pending_updates_on_connect: bool = True
         # After sustained reconnect storms the PTB httpx pool can return
         # SendResult(success=True) for sends that never actually transmit.
         # _handle_polling_network_error sets this; _verify_polling_after_reconnect
@@ -1942,6 +1872,10 @@ class TelegramAdapter(BasePlatformAdapter):
                             self.name, topic_name, seed_err,
                         )
 
+    def preserve_pending_updates_on_connect(self) -> None:
+        """Keep Telegram's queued updates when this adapter is a replacement."""
+        self._drop_pending_updates_on_connect = False
+
     async def connect(self) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -2172,7 +2106,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
+                    drop_pending_updates=self._drop_pending_updates_on_connect,
                     error_callback=_polling_error_callback,
                 )
             
@@ -2454,39 +2388,28 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             thread_id = self._metadata_thread_id(metadata)
-            pending_key = self._miniapp_pending_key(chat_id, thread_id)
-            pending_buttons = getattr(self, "_pending_miniapp_buttons", {})
             inline_miniapp_buttons_enabled = self._inline_miniapp_buttons_enabled_for_chat(chat_id)
-            pending_miniapp_params = (
-                self._coerce_pending_miniapp_params(pending_buttons.get(pending_key))
-                if inline_miniapp_buttons_enabled
-                else []
-            )
-            if not inline_miniapp_buttons_enabled and isinstance(pending_buttons, dict):
-                # Do not carry a stale Mini App action into a later reply if this chat
-                # deliberately suppresses inline buttons.
-                pending_buttons.pop(pending_key, None)
-            is_progress_message = self._is_miniapp_progress_message(content)
-            is_turn_final = bool(
-                (metadata or {}).get("hermes_turn_final")
-                or (metadata or {}).get("notify")
-            )
-            miniapp_reply_markup = None
-            fulfills_pending_miniapp = False
-            if inline_miniapp_buttons_enabled:
+            miniapp_reply_markup = self._mandatory_miniapp_keyboard(metadata)
+            shopping_list_url = str((metadata or {}).get("shopping_list_url") or "").strip()
+            if miniapp_reply_markup is not None:
+                pass
+            elif re.fullmatch(
+                r"https://t\.me/TripiooBot\?startapp=shopping_(?:buy|take)_[A-Za-z0-9_-]+",
+                shopping_list_url,
+                flags=re.IGNORECASE,
+            ):
+                # Hard transport contract: structured shopping operations bypass
+                # text parsing and per-chat shortcut preferences.
+                miniapp_reply_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Открыть список", url=shopping_list_url)
+                ]])
+            elif inline_miniapp_buttons_enabled:
+                # Transport-only behavior for ordinary model-authored Mini App
+                # links remains configurable and separately validated.
                 content, miniapp_reply_markup = self._extract_miniapp_buttons_from_content(
                     content,
                     use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
                 )
-                if pending_miniapp_params and is_turn_final and not is_progress_message:
-                    # A verified MCP mutation is authoritative. Even if the
-                    # model emitted another Mini App link, show only the app
-                    # section(s) that the completed tool actually changed.
-                    miniapp_reply_markup = self._miniapp_keyboard(
-                        pending_miniapp_params,
-                        use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
-                    )
-                    fulfills_pending_miniapp = miniapp_reply_markup is not None
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(
@@ -2565,7 +2488,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
                 reply_markup_kwargs = (
                     {"reply_markup": miniapp_reply_markup}
-                    if miniapp_reply_markup is not None and i == 0
+                    if miniapp_reply_markup is not None and i == len(chunks) - 1
                     else {}
                 )
 
@@ -2726,11 +2649,6 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass  # Typing failures are non-fatal
 
-            if fulfills_pending_miniapp:
-                current = getattr(self, "_pending_miniapp_buttons", {}).get(pending_key)
-                if self._coerce_pending_miniapp_params(current) == pending_miniapp_params:
-                    self._pending_miniapp_buttons.pop(pending_key, None)
-
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -2829,38 +2747,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
-        pending_key = None
-        pending_miniapp_params: list[str] = []
-        miniapp_reply_markup = None
-        fulfills_pending_miniapp = False
+        miniapp_reply_markup = self._mandatory_miniapp_keyboard(metadata) if finalize else None
         if finalize and (metadata or {}).get("hermes_turn_final"):
-            thread_id = self._metadata_thread_id(metadata)
-            pending_key = self._miniapp_pending_key(chat_id, thread_id)
-            pending_buttons = getattr(self, "_pending_miniapp_buttons", {})
-            inline_miniapp_buttons_enabled = self._inline_miniapp_buttons_enabled_for_chat(chat_id)
-            if inline_miniapp_buttons_enabled:
-                pending_miniapp_params = self._coerce_pending_miniapp_params(
-                    pending_buttons.get(pending_key)
-                )
+            if miniapp_reply_markup is None and self._inline_miniapp_buttons_enabled_for_chat(chat_id):
+                # Streaming finalization follows the same explicit outbound
+                # contract as send(): no tool-name or request-text inference.
                 content, miniapp_reply_markup = self._extract_miniapp_buttons_from_content(
                     content,
                     use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
                 )
-                if pending_miniapp_params:
-                    miniapp_reply_markup = self._miniapp_keyboard(
-                        pending_miniapp_params,
-                        use_web_app=self._miniapp_supports_web_app_button_for_chat_id(chat_id),
-                    )
-                    fulfills_pending_miniapp = miniapp_reply_markup is not None
-            elif isinstance(pending_buttons, dict):
-                pending_buttons.pop(pending_key, None)
-
-        def _consume_pending_miniapp() -> None:
-            if not fulfills_pending_miniapp or pending_key is None:
-                return
-            current = getattr(self, "_pending_miniapp_buttons", {}).get(pending_key)
-            if self._coerce_pending_miniapp_params(current) == pending_miniapp_params:
-                self._pending_miniapp_buttons.pop(pending_key, None)
 
         reply_markup_kwargs = (
             {"reply_markup": miniapp_reply_markup}
@@ -2879,8 +2774,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata=metadata,
                 reply_markup=miniapp_reply_markup,
             )
-            if result.success:
-                _consume_pending_miniapp()
             return result
 
         try:
@@ -2904,7 +2797,6 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
-                    _consume_pending_miniapp()
                     return SendResult(success=True, message_id=message_id)
                 # Fallback: retry without markdown formatting
                 await self._bot.edit_message_text(
@@ -2913,13 +2805,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     text=content,
                     **reply_markup_kwargs,
                 )
-            _consume_pending_miniapp()
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
             # "Message is not modified" — content identical, treat as success
             if "not modified" in err_str:
-                _consume_pending_miniapp()
                 return SendResult(success=True, message_id=message_id)
             # Reactive split-and-deliver: parse_mode formatting can inflate
             # the payload past the limit even when the raw text was under
@@ -2937,8 +2827,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     metadata=metadata,
                     reply_markup=miniapp_reply_markup,
                 )
-                if result.success:
-                    _consume_pending_miniapp()
                 return result
             # Flood control / RetryAfter — short waits are retried inline,
             # long waits return a failure immediately so streaming can fall back
@@ -2960,7 +2848,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         text=content,
                         **reply_markup_kwargs,
                     )
-                    _consume_pending_miniapp()
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     logger.error(
@@ -7049,6 +6936,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 event,
                 source=self._telegram_route_participant_source(event.source),
             )
+        # Preserve the authenticated current sender and exact raw trigger text
+        # for the exceptional private-disclosure gate.  Shared observation
+        # attribution intentionally erases ``user_id`` and prepends a sender
+        # label; either transformation would make a genuine owner request
+        # indistinguishable from quoted/observed group context.  The runner
+        # still performs every authorization, original-message, and ACL check.
+        if event.message_type == MessageType.TEXT:
+            from gateway.private_memory_disclosure import (
+                has_private_disclosure_prefix,
+            )
+
+            if has_private_disclosure_prefix(event.text):
+                return event
         if not self._telegram_observe_unmentioned_for_chat(chat_id):
             return event
         shared_source = self._telegram_group_observe_shared_source(event.source)
@@ -7457,6 +7357,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _miniapp_label_key(self, start_param: str) -> Optional[str]:
         param = str(start_param or "").strip().lower()
+        if re.fullmatch(r"(?:planning|tasks|todo|menu|dishes|shopping)_c[1-9]\d{0,18}", param):
+            param = param.rsplit("_c", 1)[0]
         if not param:
             return None
         if param.startswith("fitness_day_"):
@@ -7525,6 +7427,31 @@ class TelegramAdapter(BasePlatformAdapter):
         if label_key == "stats":
             return "Открой статистику в миниаппе."
         return "Открой миниапп."
+
+    def _mandatory_miniapp_keyboard(self, metadata) -> Optional[InlineKeyboardMarkup]:
+        """Render validated event-scoped destinations, regardless of shortcuts."""
+        params = (metadata or {}).get("miniapp_start_params")
+        if not isinstance(params, list):
+            return None
+        params = [param for param in params if isinstance(param, str)
+                  and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", param)
+                  and self._is_supported_inline_miniapp_param(param)]
+        params = list(dict.fromkeys(params))
+        shopping_count = sum(param.startswith(("shopping_buy_", "shopping_take_")) for param in params)
+        rows = []
+        for param in params:
+            label = self._miniapp_button_label(param)
+            if shopping_count > 1 and param.startswith(("shopping_buy_", "shopping_take_")):
+                encoded = param.split("_", 2)[2]
+                try:
+                    name = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+                    name = re.sub(r"\s+", " ", name).strip()
+                    if name and name.isprintable():
+                        label = f"Открыть «{name[:40]}»"
+                except (ValueError, UnicodeError):
+                    pass
+            rows.append([InlineKeyboardButton(label, url=self._miniapp_start_url(param))])
+        return InlineKeyboardMarkup(rows) if rows else None
 
     def _miniapp_keyboard(
         self,
@@ -7601,637 +7528,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if not cleaned:
             cleaned = self._miniapp_shortcut_text(start_params[0])
         return cleaned, keyboard
-
-    @staticmethod
-    def _miniapp_pending_key(chat_id: Any, thread_id: Any = None) -> tuple[str, str]:
-        normalized_chat_id = str(chat_id or "").strip()
-        normalized_thread_id = (
-            str(thread_id).strip()
-            if thread_id is not None and str(thread_id).strip()
-            else TelegramAdapter._GENERAL_TOPIC_THREAD_ID
-        )
-        return normalized_chat_id, normalized_thread_id
-
-    @staticmethod
-    def _coerce_pending_miniapp_params(value: Any) -> list[str]:
-        raw_values = value if isinstance(value, (list, tuple, set)) else [value]
-        params: list[str] = []
-        for raw in raw_values:
-            param = str(raw or "").strip()
-            if param and param not in params:
-                params.append(param)
-        return params
-
-    @staticmethod
-    def _miniapp_param_for_mutating_mcp_tool(tool_name: Any) -> Optional[str]:
-        normalized = re.sub(
-            r"[^a-z0-9]+",
-            "_",
-            str(tool_name or "").strip().lower(),
-        ).strip("_")
-        return _MINIAPP_MUTATING_MCP_TOOL_PARAMS.get(normalized)
-
-    @staticmethod
-    def _tool_may_report_miniapp_mutation(tool_name: Any) -> bool:
-        normalized = re.sub(
-            r"[^a-z0-9]+",
-            "_",
-            str(tool_name or "").strip().lower(),
-        ).strip("_")
-        # MCP tools are namespaced by Hermes. social_post is the one native
-        # tool that writes the Social Mini App through its private API.
-        return normalized.startswith("mcp_") or normalized == "social_post"
-
-    @classmethod
-    def _miniapp_contract_from_tool_result(
-        cls,
-        result: Any,
-        *,
-        _depth: int = 0,
-    ) -> tuple[bool, list[str]]:
-        """Read the fail-closed Mini App action marker from a tool result."""
-        if _depth > 5 or result is None:
-            return False, []
-
-        if isinstance(result, str):
-            text = result.strip()
-            if not text or text[0] not in "[{":
-                return False, []
-            try:
-                decoded = json.loads(text)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return False, []
-            return cls._miniapp_contract_from_tool_result(decoded, _depth=_depth + 1)
-
-        if isinstance(result, (list, tuple)):
-            marker_seen = False
-            params: list[str] = []
-            for item in result:
-                seen, item_params = cls._miniapp_contract_from_tool_result(
-                    item,
-                    _depth=_depth + 1,
-                )
-                marker_seen = marker_seen or seen
-                for param in item_params:
-                    if param not in params:
-                        params.append(param)
-            return marker_seen, params
-
-        if not isinstance(result, dict):
-            return False, []
-
-        marker = result.get("_miniapp")
-        if isinstance(marker, dict):
-            should_attach = (
-                marker.get("changed") is True
-                or marker.get("open") is True
-            )
-            raw_params = marker.get("start_params")
-            if raw_params is None:
-                raw_params = [marker.get("start_param")]
-            elif not isinstance(raw_params, (list, tuple, set)):
-                raw_params = [raw_params]
-            params = (
-                [
-                    str(param).strip()
-                    for param in raw_params
-                    if str(param or "").strip()
-                ]
-                if should_attach
-                else []
-            )
-            return True, list(dict.fromkeys(params))
-
-        marker_seen = False
-        params: list[str] = []
-        # MCP results are normally wrapped in these fields by mcp_tool.py.
-        for key in ("structuredContent", "structured_content", "result"):
-            if key not in result:
-                continue
-            seen, nested_params = cls._miniapp_contract_from_tool_result(
-                result[key],
-                _depth=_depth + 1,
-            )
-            marker_seen = marker_seen or seen
-            for param in nested_params:
-                if param not in params:
-                    params.append(param)
-        return marker_seen, params
-
-    def begin_miniapp_turn(self, chat_id: Any, thread_id: Any = None) -> None:
-        """Clear tool-derived buttons before a new agent turn starts."""
-        pending = getattr(self, "_pending_miniapp_buttons", None)
-        if isinstance(pending, dict):
-            pending.pop(self._miniapp_pending_key(chat_id, thread_id), None)
-
-    def record_miniapp_tool_completion(
-        self,
-        chat_id: Any,
-        thread_id: Any,
-        tool_name: Any,
-        *,
-        is_error: bool = False,
-        result: Any = None,
-    ) -> Optional[str]:
-        """Queue a button only for an explicit successful Mini App MCP action."""
-        if is_error:
-            return None
-
-        contract_seen, start_params = self._miniapp_contract_from_tool_result(result)
-        if contract_seen and not self._tool_may_report_miniapp_mutation(tool_name):
-            return None
-        if not contract_seen:
-            legacy_param = self._miniapp_param_for_mutating_mcp_tool(tool_name)
-            start_params = [legacy_param] if legacy_param else []
-        start_params = [
-            param
-            for param in start_params
-            if param and self._is_supported_inline_miniapp_param(param)
-        ]
-        if not start_params:
-            return None
-
-        key = self._miniapp_pending_key(chat_id, thread_id)
-        pending = getattr(self, "_pending_miniapp_buttons", None)
-        if not isinstance(pending, dict):
-            pending = {}
-            self._pending_miniapp_buttons = pending
-        params = self._coerce_pending_miniapp_params(pending.get(key))
-        for start_param in start_params:
-            if start_param not in params:
-                params.append(start_param)
-        pending[key] = params
-        return start_params[0]
-
-    @staticmethod
-    def _is_miniapp_progress_message(content: str) -> bool:
-        text = str(content or "").strip().lower().replace("ё", "е")
-        if not text:
-            return False
-        if text.startswith(("⏳", "⌛")):
-            return True
-        progress_prefixes = (
-            "загружаю ",
-            "проверяю ",
-            "добавляю ",
-            "обновляю ",
-            "изменяю ",
-            "удаляю ",
-            "сохраняю ",
-            "выполняю ",
-            "обрабатываю ",
-        )
-        return len(text) <= 160 and text.startswith(progress_prefixes) and text.endswith(("...", "…"))
-
-    def _configured_group_topic_name_for_message(self, message: Message) -> Optional[str]:
-        chat = getattr(message, "chat", None)
-        chat_id = str(getattr(chat, "id", "") or "")
-        if not chat_id:
-            return None
-        thread_id = getattr(message, "message_thread_id", None)
-        thread_id_str = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
-        group_topics = self.config.extra.get("group_topics") if getattr(self.config, "extra", None) else None
-        if not isinstance(group_topics, list):
-            return None
-        for group in group_topics:
-            if not isinstance(group, dict) or str(group.get("chat_id", "")) != chat_id:
-                continue
-            topics = group.get("topics")
-            if not isinstance(topics, list):
-                continue
-            for topic in topics:
-                if not isinstance(topic, dict) or str(topic.get("thread_id", "")) != thread_id_str:
-                    continue
-                name = str(topic.get("name") or "").strip().lower()
-                skill = str(topic.get("skill") or "").strip().lower()
-                if name:
-                    return name
-                if "telegram_health" in skill:
-                    return "health"
-                if "telegram_planning" in skill:
-                    return "planning"
-        return None
-
-    def _miniapp_start_param_for_request(self, message: Message) -> Optional[str]:
-        text = str(getattr(message, "text", None) or "").strip().lower().replace("ё", "е")
-        if not text:
-            return None
-        wants_miniapp = any(marker in text for marker in _MINIAPP_WORD_MARKERS)
-        wants_open = any(marker in text for marker in _MINIAPP_OPEN_MARKERS)
-        data_action_markers = (
-            "добав",
-            "созда",
-            "запиш",
-            "измени",
-            "редакт",
-            "обнови",
-            "удал",
-            "убер",
-            "отмет",
-            "выполн",
-            "перенес",
-            "сохрани",
-            "залог",
-            "выпил",
-            "принял",
-            "пропуст",
-            "съел",
-            "приготов",
-            "купил",
-            "сделай",
-            "сделал",
-            "сделала",
-        )
-        data_read_markers = (
-            "покаж",
-            "открой",
-            "открыть",
-            "вывед",
-            "посмотр",
-            "какие",
-            "какой",
-            "какая",
-            "что у меня",
-            "сколько",
-            "список",
-            "истор",
-            "статус",
-            "сегодня",
-            "завтра",
-            "недел",
-        )
-        wants_data_action = any(marker in text for marker in data_action_markers)
-        wants_data_read = any(marker in text for marker in data_read_markers)
-        engineering_request = any(
-            marker in text
-            for marker in (
-                "почин",
-                "исправ",
-                "настрой",
-                "deploy",
-                "деплой",
-                "сломал",
-                "ошибк",
-                "код ",
-                "форма ",
-            )
-        )
-        planning_markers = (
-            "план",
-            "planning",
-            "задач",
-            "событи",
-            "встреч",
-            "календар",
-            "расписан",
-            "todo",
-            "tasks",
-        )
-        menu_markers = (
-            "меню",
-            "menu",
-            "meal",
-            "meals",
-            "блюд",
-            "рецепт",
-            "завтрак",
-            "обед",
-            "ужин",
-            "прием пищи",
-            "приём пищи",
-        )
-        shopping_markers = (
-            "покуп",
-            "shopping",
-            "grocer",
-            "список продуктов",
-            "продукт",
-        )
-        wishlist_markers = (
-            "хочух",
-            "желани",
-            "wishlist",
-            "wish list",
-            "вишлист",
-            "подарок",
-        )
-        mentions_menu = any(marker in text for marker in menu_markers)
-        mentions_shopping = any(marker in text for marker in shopping_markers)
-        mentions_planning = any(marker in text for marker in planning_markers)
-        mentions_wishlist = any(marker in text for marker in wishlist_markers)
-        topic_name = self._configured_group_topic_name_for_message(message)
-        profile: Optional[str] = None
-        topic_name_text = topic_name or ""
-        is_family_surface = topic_name_text == "family" or topic_name_text.startswith("family-")
-        is_wishlist_surface = (
-            topic_name_text == "wishlist"
-            or topic_name_text.startswith("wishlist-")
-            or topic_name_text.startswith("family-wishlist-")
-        )
-        is_health_surface = topic_name == "health"
-        is_planning_surface = topic_name == "planning"
-        is_boxmap_surface = topic_name_text == "boxmap" or topic_name_text.startswith("boxmap-")
-        if not (
-            is_family_surface
-            or is_wishlist_surface
-            or is_health_surface
-            or is_planning_surface
-            or is_boxmap_surface
-        ):
-            profile = self._command_surface_profile_for_message(message)
-            is_family_surface = profile == "family-chat"
-            is_planning_surface = profile in {"telegram_planning", "planning"}
-            is_health_surface = profile in {"telegram_health", "health"}
-            is_boxmap_surface = profile in {"telegram_boxmap", "boxmap"}
-
-        health_markers = (
-            "здоров",
-            "health",
-            "медиц",
-            "лекар",
-            "таблет",
-            "трен",
-            "фитнес",
-            "fitness",
-            "подход",
-            "повтор",
-            "отжим",
-            "подтяг",
-            "присед",
-            "пресс",
-            "упражнен",
-            "питан",
-            "nutrition",
-            "статист",
-        )
-        mentions_health = any(marker in text for marker in health_markers)
-        mentions_boxmap = any(
-            marker in text for marker in ("boxmap", "боксмап", "сценар")
-        )
-        mentions_social = any(
-            marker in text
-            for marker in (
-                "social",
-                "instagram",
-                "tiktok",
-                "публикац",
-                "черновик",
-                "посты",
-            )
-        )
-        has_data_intent = wants_miniapp or wants_open or wants_data_action or wants_data_read
-        has_app_surface = (
-            is_family_surface
-            or is_wishlist_surface
-            or is_health_surface
-            or is_planning_surface
-            or is_boxmap_surface
-        )
-        has_domain_reference = (
-            mentions_menu
-            or mentions_shopping
-            or mentions_planning
-            or mentions_health
-            or mentions_boxmap
-            or mentions_social
-            or mentions_wishlist
-        )
-        if engineering_request and not wants_data_action:
-            return None
-        if not has_data_intent or not (has_app_surface or has_domain_reference):
-            return None
-
-        if is_family_surface and mentions_menu:
-            return "menu"
-        if mentions_wishlist or is_wishlist_surface:
-            return "wishlist"
-        if mentions_shopping:
-            return "shopping"
-        if is_family_surface and wants_miniapp:
-            return "menu"
-        if is_boxmap_surface and (mentions_boxmap or wants_miniapp or wants_open):
-            return "boxmap"
-        if mentions_social:
-            return "social"
-        if (
-            "питан" in text
-            or "nutrition" in text
-            or "съел" in text
-            or "поел" in text
-            or ((mentions_menu or "еда" in text) and is_health_surface)
-        ):
-            return "nutrition_history" if "истор" in text or "history" in text else "nutrition"
-        if (
-            "лекар" in text
-            or "таблет" in text
-            or "препарат" in text
-            or "med" in text
-            or (is_health_surface and any(marker in text for marker in ("выпил", "принял", "пропуст")))
-        ):
-            return "meds"
-        if "статист" in text or "stats" in text:
-            return "stats"
-        if any(
-            marker in text
-            for marker in (
-                "трен",
-                "фитнес",
-                "fitness",
-                "подход",
-                "повтор",
-                "отжим",
-                "подтяг",
-                "присед",
-                "пресс",
-                "упражнен",
-            )
-        ):
-            if "недел" in text or "week" in text:
-                return "fitness_week"
-            if "истор" in text or "history" in text or "лог" in text:
-                return "fitness_history"
-            if "план" in text or "planning" in text:
-                return "fitness_planning"
-            return "fitness"
-        if mentions_menu:
-            return "menu"
-        if mentions_planning:
-            return "planning"
-        if mentions_health:
-            return "health"
-
-        if is_health_surface:
-            return "health"
-        if is_planning_surface:
-            return "planning"
-        if is_family_surface:
-            return "menu"
-        if is_boxmap_surface:
-            return "boxmap"
-        return None
-
-    @staticmethod
-    def _miniapp_request_is_direct_open(message: Message) -> bool:
-        text = str(getattr(message, "text", None) or "").strip().lower().replace("ё", "е")
-        if not text:
-            return False
-        data_action_markers = (
-            "добав",
-            "созда",
-            "запиш",
-            "измени",
-            "редакт",
-            "обнови",
-            "удал",
-            "убер",
-            "отмет",
-            "выполн",
-            "перенес",
-            "сохрани",
-        )
-        if any(marker in text for marker in data_action_markers):
-            return False
-        direct_markers = ("открой", "открыть", "запусти", "launch", "open")
-        if any(marker in text for marker in direct_markers):
-            return True
-        mentions_miniapp = any(marker in text for marker in _MINIAPP_WORD_MARKERS)
-        return mentions_miniapp and any(
-            marker in text
-            for marker in ("покажи", "показать", "дай", "скинь", "пришли", "ссыл", "линк", "кнопк")
-        )
-
-    def _is_boxmap_miniapp_request(self, message: Message) -> bool:
-        text_parts = [str(getattr(message, "text", None) or "")]
-        reply = getattr(message, "reply_to_message", None)
-        if reply is not None:
-            text_parts.extend([
-                str(getattr(reply, "text", None) or ""),
-                str(getattr(reply, "caption", None) or ""),
-            ])
-        text = "\n".join(part for part in text_parts if part).strip().lower().replace("ё", "е")
-        if not text:
-            return False
-
-        wants_scenarios = "сценар" in text or "scenario" in text
-        wants_miniapp = any(marker in text for marker in _MINIAPP_WORD_MARKERS)
-        if not (wants_scenarios and wants_miniapp):
-            return False
-
-        if "boxmap" in text or "боксмап" in text:
-            return True
-
-        return self._command_surface_profile_for_message(message) == "boxmap"
-
-    async def _send_miniapp_shortcut(self, message: Message, start_param: str) -> bool:
-        if not self._bot or not self._is_supported_inline_miniapp_param(start_param):
-            return False
-
-        chat = getattr(message, "chat", None)
-        chat_id = getattr(chat, "id", None)
-        if chat_id is None:
-            return False
-
-        thread_id = getattr(message, "message_thread_id", None)
-        thread_kwargs = self._thread_kwargs_for_send(
-            str(chat_id),
-            str(thread_id) if thread_id is not None else None,
-            None,
-        )
-        reply_to_id = getattr(message, "message_id", None)
-        use_web_app = not self._is_group_chat(message)
-        keyboard = self._miniapp_keyboard([start_param], use_web_app=use_web_app)
-        if keyboard is None:
-            return False
-        text = self._miniapp_shortcut_text(start_param)
-
-        try:
-            await self._send_message_with_thread_fallback(
-                chat_id=int(chat_id),
-                text=text,
-                parse_mode=None,
-                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
-                reply_markup=keyboard,
-                **thread_kwargs,
-                **self._notification_kwargs({"notify": True}),
-            )
-            return True
-        except Exception as exc:
-            logger.warning(
-                "[%s] Miniapp button send failed, retrying with plain link: %s",
-                self.name,
-                exc,
-                exc_info=True,
-            )
-
-        fallback_text = f"{text}\n{self._miniapp_start_url(start_param)}"
-        try:
-            await self._send_message_with_thread_fallback(
-                chat_id=int(chat_id),
-                text=fallback_text,
-                parse_mode=None,
-                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
-                **thread_kwargs,
-                **self._notification_kwargs({"notify": True}),
-            )
-            return True
-        except Exception:
-            logger.warning("[%s] Miniapp plain-link fallback failed", self.name, exc_info=True)
-            return False
-
-    async def _send_boxmap_miniapp_shortcut(self, message: Message) -> bool:
-        if not self._bot:
-            return False
-
-        chat = getattr(message, "chat", None)
-        chat_id = getattr(chat, "id", None)
-        if chat_id is None:
-            return False
-
-        thread_id = getattr(message, "message_thread_id", None)
-        thread_kwargs = self._thread_kwargs_for_send(
-            str(chat_id),
-            str(thread_id) if thread_id is not None else None,
-            None,
-        )
-        reply_to_id = getattr(message, "message_id", None)
-        keyboard = self._miniapp_keyboard(["boxmap"], use_web_app=False)
-        if keyboard is None:
-            return False
-        text = self._miniapp_shortcut_text("boxmap")
-
-        try:
-            await self._send_message_with_thread_fallback(
-                chat_id=int(chat_id),
-                text=text,
-                parse_mode=None,
-                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
-                reply_markup=keyboard,
-                **thread_kwargs,
-                **self._notification_kwargs({"notify": True}),
-            )
-            return True
-        except Exception as exc:
-            logger.warning(
-                "[%s] BoxMap miniapp button send failed, retrying with plain link: %s",
-                self.name,
-                exc,
-                exc_info=True,
-            )
-
-        fallback_text = f"{text}\n{self._boxmap_miniapp_start_url()}"
-        try:
-            await self._send_message_with_thread_fallback(
-                chat_id=int(chat_id),
-                text=fallback_text,
-                parse_mode=None,
-                reply_to_message_id=int(reply_to_id) if reply_to_id is not None else None,
-                **thread_kwargs,
-                **self._notification_kwargs({"notify": True}),
-            )
-            return True
-        except Exception:
-            logger.warning("[%s] BoxMap miniapp plain-link fallback failed", self.name, exc_info=True)
-            return False
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register chat-scoped bot commands where Telegram needs them.
@@ -8380,25 +7676,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if await self._handle_pairing_profile_name_reply(msg):
             return
         await self._ensure_forum_commands(update.message)
-        # A reply such as "where is the link/button?" carries the BoxMap
-        # surface in the quoted bot message, not necessarily in the new text.
-        # Keep that deterministic shortcut out of the agent lane as intended.
-        if self._is_boxmap_miniapp_request(msg):
-            miniapp_start_param = "boxmap"
-        else:
-            miniapp_start_param = (
-                self._miniapp_start_param_for_request(msg)
-                if self._miniapp_request_is_direct_open(msg)
-                else None
-            )
-        if miniapp_start_param:
-            if miniapp_start_param == "boxmap":
-                sent = await self._send_boxmap_miniapp_shortcut(msg)
-            else:
-                sent = await self._send_miniapp_shortcut(msg, miniapp_start_param)
-            if sent:
-                return
 
+        # Natural-language intent belongs to the agent. The gateway only
+        # materializes an explicit outbound Mini App startapp link selected by
+        # the agent; it must not infer a surface or short-circuit this turn.
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._attach_replied_image(msg, event)

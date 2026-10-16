@@ -3217,6 +3217,8 @@ def _call_history_llm(
         temperature=0.1,
         max_tokens=max_tokens,
         timeout=timeout,
+        allow_fallback=False,
+        no_tools=True,
     )
     return _llm_response_content(response)
 
@@ -3333,11 +3335,14 @@ def _profile_sessions(
     default_profile: str,
     routes: dict[tuple[str, str], str],
     session_lookup: dict[str, dict[str, Any]],
+    legacy_policy: Optional[dict[str, Any]] = None,
 ) -> list[sqlite3.Row]:
+    columns = {item[1] for item in conn.execute("PRAGMA table_info(sessions)")}
+    parent_column = "parent_session_id" if "parent_session_id" in columns else "NULL AS parent_session_id"
     rows = conn.execute(
-        """
+        f"""
         SELECT id, source, user_id, access_scope, title, started_at, ended_at,
-               message_count, cwd
+               message_count, cwd, {parent_column}
         FROM sessions
         WHERE COALESCE(message_count, 0) > 0
         ORDER BY started_at ASC
@@ -3353,7 +3358,129 @@ def _profile_sessions(
             session_lookup=session_lookup,
         )
         == profile
+        and _legacy_session_allowed(row, profile, session_lookup, legacy_policy)
     ]
+
+
+def _legacy_refresh_policy(profile_home: Path) -> dict[str, Any]:
+    """Read the explicit compatibility boundary before opening legacy writers.
+
+    Unconfigured installations retain their previous behavior. A malformed or
+    unreadable configured boundary never falls back to legacy extraction.
+    """
+    import yaml
+
+    config_path = profile_home / "config.yaml"
+    if not config_path.exists():
+        return {"mode": "legacy", "routes": []}
+    if config_path.is_symlink():
+        raise ValueError("legacy_extraction_config_must_be_regular")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError("invalid_legacy_extraction_config")
+    memory = config.get("memory", {})
+    if memory is None:
+        memory = {}
+    if not isinstance(memory, dict):
+        raise ValueError("invalid_legacy_extraction_config")
+    raw = memory.get("legacy_extraction", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid_legacy_extraction_config")
+    mode = raw.get("mode", "legacy")
+    if mode not in {"legacy", "retired", "default_dm_only"}:
+        raise ValueError("invalid_legacy_extraction_mode")
+    routes = memory.get("trusted_provider_routes", [])
+    if routes is None:
+        routes = []
+    if not isinstance(routes, list):
+        raise ValueError("invalid_legacy_extraction_routes")
+    routes = list(routes)
+    single_route = memory.get("trusted_provider_route")
+    if single_route is not None:
+        if not isinstance(single_route, dict):
+            raise ValueError("invalid_legacy_extraction_routes")
+        routes.append(single_route)
+    if any(not isinstance(item, dict) for item in routes):
+        raise ValueError("invalid_legacy_extraction_routes")
+    return {"mode": mode, "routes": routes}
+
+
+def _legacy_session_allowed(row, profile, session_lookup, policy) -> bool:
+    """Exclude migrated, delegated and ambiguous sources before LLM input.
+
+    The remaining default-profile compatibility writer admits only original
+    root DM sessions with explicit actor/destination metadata. A missing scope
+    is not evidence of a default DM; in particular it cannot smuggle a child
+    specialist or a group session through the historical profile fallback.
+    """
+    if not policy or policy["mode"] == "legacy":
+        return True
+    if policy["mode"] == "retired" or profile != "default":
+        return False
+    if row["parent_session_id"]:
+        return False
+    parsed = _parse_access_scope(row["access_scope"] or "")
+    indexed = (session_lookup or {}).get(str(row["id"])) or {}
+    for key in ("platform", "chat_type", "chat_id", "thread_id", "user_id", "memory_scope"):
+        if parsed.get(key) not in (None, "") and indexed.get(key) not in (None, ""):
+            if str(parsed[key]) != str(indexed[key]):
+                return False
+    parsed_profile = parsed.get("profile")
+    indexed_profile = indexed.get("profile_name")
+    if parsed_profile and indexed_profile and parsed_profile != indexed_profile:
+        return False
+    origin = _origin_for_history_session(row, session_lookup)
+    platform = str(origin.get("platform") or "")
+    chat_id = str(origin.get("chat_id") or "")
+    user_id = str(origin.get("user_id") or "")
+    if (
+        origin.get("profile_name") != "default"
+        or platform != "telegram"
+        or str(row["source"] or "") != platform
+        or origin.get("chat_type") not in {"dm", "private"}
+        or not re.fullmatch(r"[1-9][0-9]{2,31}", user_id)
+        or chat_id != user_id
+        or origin.get("thread_id") not in (None, "")
+        or origin.get("memory_scope") not in (None, "", "default")
+        or origin.get("scope_name") not in (None, "", "default")
+    ):
+        return False
+    actual = {
+        "platform": platform, "user_id": user_id, "chat_id": chat_id,
+        "chat_type": "dm", "profile_name": "default", "thread_id": "",
+    }
+    for route in policy["routes"]:
+        if route.get("enabled") is not True:
+            continue
+        match = route.get("match")
+        if not isinstance(match, dict):
+            return False
+        if route.get("destination_kind") == "group":
+            continue
+        if all(str(actual.get(key, "")) == str(value) for key, value in match.items()):
+            return False
+    return True
+
+
+def _legacy_message_allowed(message, policy) -> bool:
+    if policy["mode"] != "default_dm_only":
+        return True
+    if message["role"] != "user" or message["tool_name"]:
+        return False
+    text = str(message["content"] or "")
+    if _is_secretish(text) or re.search(r"парол[ья]|токен\w*\s+доступ|апи\s*ключ", text, re.IGNORECASE):
+        return False
+    # These are framework/delegation/recall envelopes, not original DM facts.
+    return not re.search(
+        r"<\s*/?\s*memory-context\b|\[System note:|\[Additional user instruction\]|"
+        r"\[Replying to:|\[A Telegram|\[The user sent|\[HERMES_|"
+        r"<\s*(?:system|developer|tool)(?:\s|>)",
+        text, re.IGNORECASE,
+    )
 
 
 def _chunked(values: list[str], size: int = 700) -> Iterable[list[str]]:
@@ -3699,6 +3826,7 @@ def consolidator_status(
     state_db_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     paths = palace_paths(profile, profile_home=profile_home)
+    legacy_policy = _legacy_refresh_policy(paths.profile_home)
     state = _read_refresh_state(paths)
     cstate = _consolidator_state(state)
     lock_path = paths.profile_home / "mempalace" / "refresh.lock"
@@ -3752,11 +3880,13 @@ def consolidator_status(
         "task": LLM_CONSOLIDATOR_TASK,
         "adapter": LLM_CONSOLIDATOR_ADAPTER,
         "cursor_message_id": cursor,
-        "auto_enabled": bool(cstate.get("auto_enabled", False)),
+        "auto_enabled": bool(cstate.get("auto_enabled", False)) and legacy_policy["mode"] != "retired",
+        "legacy_extraction_mode": legacy_policy["mode"],
         "paused": bool(cstate.get("paused", False)),
         "running": running,
         "stale": bool(cstate.get("stale", False)),
-        "phase": cstate.get("phase", ""),
+        "phase": "retired" if legacy_policy["mode"] == "retired" else cstate.get("phase", ""),
+        "legacy_error_is_historical": legacy_policy["mode"] == "retired",
         "current": cstate.get("current", {}),
         "events": cstate.get("events", []),
         "last_started_at": cstate.get("last_started_at", ""),
@@ -3800,6 +3930,7 @@ def consolidator_status(
                 default_profile=default_profile,
                 routes=routes,
                 session_lookup=session_lookup,
+                legacy_policy=legacy_policy,
             )
             session_ids = [str(row["id"]) for row in sessions]
             total = _profile_message_counts(conn, session_ids, after_id=0)
@@ -3880,6 +4011,13 @@ def consolidate_profile(
     llm_call: Optional[Callable[..., str]] = None,
 ) -> dict[str, Any]:
     paths = palace_paths(profile, profile_home=profile_home)
+    legacy_policy = _legacy_refresh_policy(paths.profile_home)
+    if legacy_policy["mode"] == "retired":
+        return {
+            "profile": paths.profile, "dry_run": dry_run,
+            "processed_messages": 0, "skipped": True,
+            "reason": "migrated_to_scoped_memory",
+        }
     limit = max(1, min(int(limit or LLM_CONSOLIDATOR_BATCH_SIZE), LLM_CONSOLIDATOR_MAX_BATCH_SIZE))
     max_batches = max(1, min(int(max_batches or 1), LLM_CONSOLIDATOR_MAX_BATCHES))
     workers = max(1, min(int(workers or 1), LLM_CONSOLIDATOR_MAX_WORKERS))
@@ -4017,6 +4155,7 @@ def consolidate_profile(
                 default_profile=default_profile,
                 routes=routes,
                 session_lookup=session_lookup,
+                legacy_policy=legacy_policy,
             )
             session_by_id = {str(row["id"]): row for row in sessions}
             session_ids = list(session_by_id)
@@ -4057,6 +4196,9 @@ def consolidate_profile(
                     if not session:
                         continue
                     max_row_id = max(max_row_id, int(row["id"]))
+                    if not _legacy_message_allowed(row, legacy_policy):
+                        skipped_items += 1
+                        continue
                     origin = _origin_for_history_session(session, session_lookup)
                     palace = _history_palace_for_session(session, origin)
                     payload = _batch_message_payload(row, session, origin)
@@ -4066,6 +4208,8 @@ def consolidate_profile(
 
                 if not grouped:
                     local_cursor = max_row_id
+                    if not dry_run:
+                        _set_consolidator_state(paths, {"cursor_message_id": local_cursor})
                     report("skipping_empty_batch", batch_index=_batch_index + 1, cursor=max_row_id)
                     continue
 
@@ -5291,6 +5435,12 @@ def refresh_if_due(
     include_markdown: bool = True,
 ) -> dict[str, Any]:
     paths = palace_paths(profile, profile_home=profile_home)
+    legacy_policy = _legacy_refresh_policy(paths.profile_home)
+    if legacy_policy["mode"] == "retired":
+        return {
+            "profile": paths.profile, "refreshed": False, "skipped": True,
+            "reason": "migrated_to_scoped_memory",
+        }
     interval_seconds = max(60, int(interval_seconds or AUTO_REFRESH_INTERVAL_SECONDS))
     now = time.time()
     state = _read_refresh_state(paths)
@@ -5325,11 +5475,13 @@ def refresh_if_due(
             "reason": "paused",
         }
 
-    sources = _markdown_sources(paths.profile_home)
+    # Compatibility mode is limited to proved original DM messages. Profile
+    # files lack event ownership and may contain formerly scoped specialist data.
+    sources = _markdown_sources(paths.profile_home) if legacy_policy["mode"] == "legacy" else []
     markdown_signature = _source_signature(sources)
     previous_markdown = str(state.get("markdown_signature") or state.get("source_signature") or "")
     markdown_result = None
-    markdown_changed = include_markdown and (force or previous_markdown != markdown_signature)
+    markdown_changed = include_markdown and legacy_policy["mode"] == "legacy" and (force or previous_markdown != markdown_signature)
     if markdown_changed:
         markdown_result = generate_from_markdown(
             profile=paths.profile,
@@ -5359,10 +5511,11 @@ def refresh_if_due(
             "profile": paths.profile,
             "last_checked_at": utc_now(),
             "last_checked_epoch": time.time(),
-            "source_kind": "history_llm+markdown",
-            "source_signature": _combined_source_signature(
-                paths,
-                state_db_path=state_db_path,
+            "source_kind": "history_llm+markdown" if legacy_policy["mode"] == "legacy" else "history_llm_proven_dm",
+            "source_signature": (
+                _combined_source_signature(paths, state_db_path=state_db_path)
+                if legacy_policy["mode"] == "legacy"
+                else _history_signature(profile=paths.profile, state_db_path=state_db_path)
             ),
             "markdown_signature": markdown_signature,
             "files": len(sources),

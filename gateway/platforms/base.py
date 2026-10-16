@@ -4446,6 +4446,11 @@ class BasePlatformAdapter(ABC):
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
 
+            # Validate action-only completions through the same delivery fences
+            # as text replies, including streamed and durable-job results.
+            if not response and (event.outbound_metadata.get("shopping_list_url") or event.outbound_metadata.get("miniapp_start_params")):
+                response = "Открыть список" if event.outbound_metadata.get("shopping_list_url") else "Открыть в миниаппе"
+
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
             # when the message was queued behind an active agent.  Log at
@@ -4465,6 +4470,11 @@ class BasePlatformAdapter(ABC):
                     session_key,
                 )
                 response = None
+                # Delivery directives belong to the suppressed turn too. Never
+                # turn an interrupted shopping operation into a stale action-only
+                # message.
+                event.outbound_metadata.pop("shopping_list_url", None)
+                event.outbound_metadata.pop("miniapp_start_params", None)
             if response and getattr(event, "durable_job_id", None):
                 validator = getattr(self, "_durable_job_delivery_validator", None)
                 if callable(validator):
@@ -4479,6 +4489,8 @@ class BasePlatformAdapter(ABC):
                                 event.durable_job_id,
                             )
                             response = None
+                            event.outbound_metadata.pop("shopping_list_url", None)
+                            event.outbound_metadata.pop("miniapp_start_params", None)
                     except Exception:
                         # Delivery fences fail closed: recovery can safely retry a
                         # committed job, while an unchecked stale answer cannot be
@@ -4489,6 +4501,8 @@ class BasePlatformAdapter(ABC):
                             event.durable_job_id,
                         )
                         response = None
+                        event.outbound_metadata.pop("shopping_list_url", None)
+                        event.outbound_metadata.pop("miniapp_start_params", None)
             if response:
                 if self.platform == Platform.TELEGRAM:
                     (
@@ -4538,6 +4552,13 @@ class BasePlatformAdapter(ABC):
                     )
                     _record_delivery(control_result)
                     response = None
+
+            # Streaming may already have delivered the prose, while the native
+            # shopping action still needs normal retry/thread handling. Keep the
+            # exact URL in trusted metadata and materialize only a minimal carrier;
+            # TelegramAdapter renders the native inline keyboard.
+            if not response and (event.outbound_metadata.get("shopping_list_url") or event.outbound_metadata.get("miniapp_start_params")):
+                response = "Открыть список" if event.outbound_metadata.get("shopping_list_url") else "Открыть в миниаппе"
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
@@ -4593,6 +4614,8 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+                if (event.outbound_metadata.get("shopping_list_url") or event.outbound_metadata.get("miniapp_start_params")) and not text_content:
+                    text_content = "Открыть список" if event.outbound_metadata.get("shopping_list_url") else "Открыть в миниаппе"
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -4626,6 +4649,7 @@ class BasePlatformAdapter(ABC):
                         if (
                             self.platform == Platform.TELEGRAM
                             and text_content
+                            and not (event.outbound_metadata.get("shopping_list_url") or event.outbound_metadata.get("miniapp_start_params"))
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
@@ -4935,13 +4959,24 @@ class BasePlatformAdapter(ABC):
                 "_hermes_run_generation",
                 None,
             )
+            # Durable intake may assign ``job_execution_key`` inside the
+            # message handler, after handle_message() already chose the public
+            # thread key for this background task. GatewayRunner registers
+            # run-scoped callbacks (including progress cleanup) against that
+            # private job key, so resolve the callback key again after the
+            # handler has returned instead of always using the stale public key.
+            _post_delivery_key = str(
+                getattr(event, "job_execution_key", None) or session_key
+            )
             if hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
-                    session_key,
+                    _post_delivery_key,
                     generation=_callback_generation,
                 )
             else:
-                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
+                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(
+                    _post_delivery_key, None
+                )
             if callable(_post_cb):
                 try:
                     _post_result = _post_cb()

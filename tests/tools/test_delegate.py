@@ -61,6 +61,25 @@ def _make_mock_parent(depth=0):
 
 
 class TestDelegateRequirements(unittest.TestCase):
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_github_specialist_never_inherits_shell_or_mcp_tools(self, mock_cfg):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        tokens = set_session_vars(platform="telegram", profile_name="family-chat", chat_id="-1003966683704", thread_id="359")
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "memory", "mcp-health-db", "codex_calendar", "github-issue-specialist"]
+        try:
+            with patch("run_agent.AIAgent") as MockAgent:
+                MockAgent.return_value = MagicMock()
+                child = _build_child_agent(task_index=0, goal="Issue intake", context=None,
+                    toolsets=["terminal", "memory", "github-issues", "vision"], model=None,
+                    max_iterations=10, task_count=1, parent_agent=parent,
+                    specialist="github_issues", specialist_required_toolsets=["github-issues", "vision"])
+                self.assertEqual(MockAgent.call_args.kwargs["enabled_toolsets"], ["github-issues", "vision"])
+                self.assertTrue(MockAgent.call_args.kwargs["skip_memory"])
+                self.assertEqual(child._delegate_missing_required_toolsets, [])
+        finally:
+            clear_session_vars(tokens)
+
     def test_always_available(self):
         self.assertTrue(check_delegate_requirements())
 
@@ -74,12 +93,12 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("specialist", props)
         self.assertEqual(
             props["specialist"]["enum"],
-            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder", "sidense_video_prompt"],
+            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder", "sidense_video_prompt", "github_issues"],
         )
         self.assertIn("specialist", props["tasks"]["items"]["properties"])
         self.assertEqual(
             props["tasks"]["items"]["properties"]["specialist"]["enum"],
-            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder", "sidense_video_prompt"],
+            ["fitness", "nutrition", "medical", "miniapp", "miniapp_builder", "sidense_video_prompt", "github_issues"],
         )
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
@@ -204,7 +223,8 @@ class TestSpecialistContracts(unittest.TestCase):
             task["_specialist_memory_scope"],
             "hudeem-tripio-user-222333444",
         )
-        self.assertIn("private nutrition memory is already", task["goal"])
+        self.assertIn("use its available search/read tools", task["goal"])
+        self.assertIn("Never reopen legacy files", task["goal"])
         self.assertIn("do not call a nonexistent memory read action", task["goal"])
         self.assertNotIn('memory(action="read")', task["goal"])
         self.assertNotIn("222333444", task["goal"])

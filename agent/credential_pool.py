@@ -594,8 +594,9 @@ class CredentialPool:
         if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            auth_file = auth_mod._codex_auth_file_path()
+            with _auth_store_lock(auth_file=auth_file):
+                auth_store = _load_auth_store(auth_file)
                 state = _load_provider_state(auth_store, "openai-codex")
             if not isinstance(state, dict):
                 return entry
@@ -796,8 +797,13 @@ class CredentialPool:
         if entry.source not in {"device_code", "loopback_pkce"}:
             return
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            auth_file = (
+                auth_mod._codex_auth_file_path()
+                if self.provider == "openai-codex"
+                else auth_mod._auth_file_path()
+            )
+            with _auth_store_lock(auth_file=auth_file):
+                auth_store = _load_auth_store(auth_file)
                 if self.provider == "nous":
                     state = _load_provider_state(auth_store, "nous")
                     if state is None:
@@ -852,7 +858,7 @@ class CredentialPool:
                 else:
                     return
 
-                _save_auth_store(auth_store)
+                _save_auth_store(auth_store, auth_file)
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
@@ -1078,8 +1084,9 @@ class CredentialPool:
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        auth_file = auth_mod._codex_auth_file_path()
+                        with _auth_store_lock(auth_file=auth_file):
+                            auth_store = _load_auth_store(auth_file)
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1099,7 +1106,7 @@ class CredentialPool:
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
                                         _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        _save_auth_store(auth_store, auth_file)
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc

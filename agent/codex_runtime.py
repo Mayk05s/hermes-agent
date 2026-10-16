@@ -435,7 +435,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
+    def _timing(phase):
+        callback = getattr(agent, "model_timing_callback", None)
+        if callable(callback):
+            try:
+                callback(phase)
+            except Exception:
+                logger.debug("Optional model timing callback failed", exc_info=True)
+
+    _timing("request_started")
+    first_text_seen = False
+
     def _on_text_delta(text: str) -> None:
+        nonlocal first_text_seen
+        if text and not first_text_seen:
+            first_text_seen = True
+            _timing("first_text")
         agent._codex_streamed_text_parts.append(text)
         agent._fire_stream_delta(text)
 

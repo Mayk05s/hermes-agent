@@ -727,6 +727,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     around_message_id=function_args.get("around_message_id"),
                     window=function_args.get("window", 5),
                     sort=function_args.get("sort"),
+                    start_date=function_args.get("start_date"),
+                    end_date=function_args.get("end_date"),
+                    timezone=function_args.get("timezone", "UTC"),
+                    offset=function_args.get("offset"),
+                    count_only=function_args.get("count_only", False),
+                    history_scope=function_args.get("history_scope", "topic"),
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
@@ -792,7 +798,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('recall_access', function_args, tool_duration, result=function_result)}")
-        elif function_name == "delegate_task":
+        elif function_name in {"delegate_task", "github_issue_specialist"}:
+            if function_name == "github_issue_specialist":
+                from tools.github_issue_intake_tool import specialist_task
+                function_args = specialist_task(function_args)
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):
                 spinner_label = f"🔀 delegating {len(tasks_arg)} tasks · (/agents to monitor)"

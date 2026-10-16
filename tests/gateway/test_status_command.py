@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -63,7 +63,7 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
     runner._fallback_model = None
     runner._show_reasoning = False
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, **_kwargs: None
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
@@ -633,3 +633,55 @@ async def test_post_delivery_callback_generation_snapshot_happens_after_bind():
     assert fired == []
     assert session_key in adapter._post_delivery_callbacks
     assert adapter._post_delivery_callbacks[session_key][0] == 2
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_callback_uses_job_key_assigned_inside_handler():
+    """Durable intake resolves its private job key after adapter dispatch starts.
+
+    Progress cleanup is registered under that job key and must still fire after
+    the final response is delivered; looking only under the original public
+    thread key leaves the Telegram tool-progress bubble behind.
+    """
+    import asyncio
+    from gateway.platforms.base import BasePlatformAdapter
+
+    source = _make_source()
+    public_key = build_session_key(source)
+    job_key = f"{public_key}:job:gw_test"
+    fired = []
+
+    class _ConcreteAdapter(BasePlatformAdapter):
+        platform = Platform.TELEGRAM
+
+        async def connect(self): return True
+        async def disconnect(self): pass
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True, message_id="final")
+        async def get_chat_info(self, chat_id): return {}
+
+    adapter = _ConcreteAdapter(
+        PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM
+    )
+
+    async def fake_handler(event):
+        # Mirrors _ensure_durable_job_route(): the adapter background task was
+        # started on public_key before the runner materialized job_execution_key.
+        event.job_execution_key = job_key
+        adapter.register_post_delivery_callback(
+            job_key,
+            lambda: fired.append("cleanup"),
+            generation=1,
+        )
+        return "done"
+
+    adapter.set_message_handler(fake_handler)
+    event = MessageEvent(text="hello", source=source, message_id="m1")
+
+    await adapter.handle_message(event)
+    tasks = list(adapter._background_tasks)
+    assert tasks, "expected background task to be created"
+    await asyncio.gather(*tasks)
+
+    assert fired == ["cleanup"]
+    assert job_key not in adapter._post_delivery_callbacks

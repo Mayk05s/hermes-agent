@@ -1577,6 +1577,16 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Optional exact verified-DM override; disabled leaves all routes intact.
+        "trusted_provider_route": None,
+        "trusted_provider_routes": [],
+        # Optional trusted provider/policy template: unregistered shared
+        # Telegram destinations receive an empty boundary, never legacy memory.
+        "trusted_shared_deny_route": None,
+        # Explicit opt-in retirement avoids legacy extraction from migrated
+        # scopes; absent/legacy preserves the upstream file-memory behavior.
+        "legacy_extraction": {"mode": "legacy"},
+        "specialist_routes": {},
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

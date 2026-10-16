@@ -114,6 +114,27 @@ async def test_actual_gateway_group_prompt_and_native_dispatch(group_setup,monke
         assert blocked.isdisjoint(agent.valid_tool_names)
         assert 'session_search' in agent.valid_tool_names
         assert 'session_search' not in agent._trusted_memory_blocked_tools
+        # Exercise the actual group-memory agent, not just config/schema resolution.
+        from hermes_state import SessionDB
+        from gateway.session_context import set_session_vars, clear_session_vars
+        history_db = SessionDB(tmp_path / 'state.db')
+        try:
+            for sid, profile in [('same-profile', 'personal'), ('private-other-profile', 'other')]:
+                history_db.create_session(sid, source='telegram', access_scope=json.dumps({'origin': {
+                    'platform': 'telegram', 'chat_id': '-other-chat', 'thread_id': '999', 'profile_name': profile}}))
+                if not history_db.get_messages(sid):
+                    history_db.append_message(sid, role='user', content='profilehistorytoken')
+            agent._session_db = history_db
+            tokens = set_session_vars(platform='telegram', chat_id='-100123', thread_id='313', profile_name='personal')
+            try:
+                found = json.loads(agent._invoke_tool('session_search', {'query': 'profilehistorytoken', 'offset': 0}, 'synthetic', pre_tool_block_checked=True))
+                assert found['success']
+                assert {m['session_id'] for m in found['messages']} == {'same-profile'}
+            finally:
+                clear_session_vars(tokens)
+                agent._session_db = None
+        finally:
+            history_db.close()
         prompt=agent._build_system_prompt()
         assert 'PRIVATE_PROMPT_CANARY_NEVER_SHARE' not in prompt
         assert 'mempalace_add_drawer' in agent.valid_tool_names

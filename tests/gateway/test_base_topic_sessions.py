@@ -476,6 +476,44 @@ class TestTelegramAutoTtsCaptionDelivery:
         ]
 
     @pytest.mark.asyncio
+    async def test_shopping_button_forces_text_send_instead_of_tts_caption(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+        adapter._keep_typing = self._hold_typing()
+        adapter._should_auto_tts_for_chat = lambda _chat_id: True
+        adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
+        url = "https://t.me/TripiooBot?startapp=shopping_buy_exact-list"
+
+        async def handler(event):
+            event.outbound_metadata["shopping_list_url"] = url
+            return "Список обновлён."
+
+        adapter.set_message_handler(handler)
+        tts_path = tmp_path / "reply.ogg"
+        tts_path.write_text("audio", encoding="utf-8")
+        event = self._make_voice_event()
+
+        with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value=json.dumps({"file_path": str(tts_path)}),
+        ):
+            await adapter._process_message_background(event, build_session_key(event.source))
+
+        adapter.play_tts.assert_awaited_once()
+        assert adapter.play_tts.await_args.kwargs["caption"] is None
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "Список обновлён.",
+                "reply_to": None,
+                "metadata": {
+                    "thread_id": "17585",
+                    "shopping_list_url": url,
+                    "notify": True,
+                },
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_telegram_auto_tts_send_failure_keeps_followup_text(self, tmp_path):
         adapter = DummyTelegramAdapter()
         adapter._keep_typing = self._hold_typing()

@@ -365,3 +365,57 @@ async def test_process_message_plain_string_behaves_unchanged():
     adapter._send_with_retry.assert_called_once()
     assert adapter._send_with_retry.call_args.kwargs["content"] == "plain reply"
     assert adapter.deleted == []  # no auto-delete for plain replies
+
+
+@pytest.mark.asyncio
+async def test_process_message_merges_event_scoped_outbound_metadata():
+    adapter = _delete_adapter()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="sent-1")
+    )
+    url = "https://t.me/TripiooBot?startapp=shopping_take_0J3QsCDQvNC-0YDQtdC1"
+
+    async def _handler(evt):
+        evt.outbound_metadata["shopping_list_url"] = url
+        return "Создал список."
+
+    adapter.set_message_handler(_handler)
+    event = _make_event()
+    session_key = "agent:main:telegram:private:42"
+    with patch("gateway.platforms.base.asyncio.sleep", AsyncMock()), patch.object(
+        adapter, "_keep_typing", new=AsyncMock()
+    ):
+        await adapter._process_message_background(event, session_key)
+
+    metadata = adapter._send_with_retry.call_args.kwargs["metadata"]
+    assert metadata["shopping_list_url"] == url
+    assert metadata["notify"] is True
+
+
+@pytest.mark.asyncio
+async def test_process_message_streaming_none_sends_one_native_button_carrier():
+    """Already-sent text still traverses base-to-Telegram metadata dispatch once."""
+    adapter = _delete_adapter()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="button-1")
+    )
+    url = "https://t.me/TripiooBot?startapp=shopping_buy_exact-list"
+
+    async def _streaming_handler(evt):
+        evt.outbound_metadata["shopping_list_url"] = url
+        return None
+
+    adapter.set_message_handler(_streaming_handler)
+    event = _make_event()
+    session_key = "agent:main:telegram:private:42"
+    with patch("gateway.platforms.base.asyncio.sleep", AsyncMock()), patch.object(
+        adapter, "_keep_typing", new=AsyncMock()
+    ):
+        await adapter._process_message_background(event, session_key)
+
+    adapter._send_with_retry.assert_awaited_once()
+    sent = adapter._send_with_retry.call_args.kwargs
+    assert sent["content"] == "Открыть список"
+    assert sent["metadata"]["shopping_list_url"] == url
+    assert sent["metadata"]["notify"] is True
+    assert url not in sent["content"]

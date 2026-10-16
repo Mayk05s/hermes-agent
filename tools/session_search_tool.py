@@ -50,9 +50,8 @@ def _truthy(value: Any) -> bool:
 def _current_gateway_access_filter() -> Optional[Dict[str, str]]:
     """Return the active gateway recall boundary.
 
-    CLI/local sessions intentionally remain global. Gateway sessions carry a
-    concrete platform + chat id; topic-isolated sessions stay in the current
-    topic, while non-isolated topics search within the resolved profile scope.
+    CLI/local sessions intentionally remain global. Every gateway profile may
+    recall all of its own chats, independently of topic or memory isolation.
     """
     try:
         from gateway.session_context import get_session_env
@@ -61,15 +60,14 @@ def _current_gateway_access_filter() -> Optional[Dict[str, str]]:
 
     platform = _clean(get_session_env("HERMES_SESSION_PLATFORM", ""))
     chat_id = _clean(get_session_env("HERMES_SESSION_CHAT_ID", ""))
-    if not platform or not chat_id or platform in {"local", "cli"}:
+    if not platform or platform in {"local", "cli"}:
         return None
 
     thread_id = _clean(get_session_env("HERMES_SESSION_THREAD_ID", ""))
-    profile_name = _clean(get_session_env("HERMES_SESSION_PROFILE_NAME", "")) or "default"
+    profile_name = _clean(get_session_env("HERMES_SESSION_PROFILE_NAME", "")) or "__unresolved_profile__"
     scope_name = _clean(get_session_env("HERMES_SESSION_SCOPE_NAME", "")) or "default"
     memory_scope = _clean(get_session_env("HERMES_SESSION_MEMORY_SCOPE", "")) or scope_name
-    topic_isolation = _truthy(get_session_env("HERMES_SESSION_TOPIC_ISOLATION", ""))
-    mode = "topic" if thread_id and topic_isolation else "profile"
+    mode = "profile"
     return {
         "mode": mode,
         "platform": platform,
@@ -105,7 +103,7 @@ def _current_gateway_access_filters() -> Optional[List[Dict[str, str]]]:
             _clean(item.get("profile_name")),
             _clean(item.get("memory_scope")),
         )
-        if not key[1] or not key[2] or key in seen:
+        if not key[1] or (not key[2] and key[0] != "profile") or key in seen:
             continue
         seen.add(key)
         unique.append(item)
@@ -136,9 +134,7 @@ def _origin_matches_filter(origin: Dict[str, Any], access_filter: Dict[str, str]
         origin_profile = _clean(origin.get("profile_name")) or "default"
         if origin_profile != wanted_profile:
             return False
-        wanted_memory = access_filter.get("memory_scope") or access_filter.get("scope_name") or "default"
-        origin_memory = _clean(origin.get("memory_scope")) or _clean(origin.get("scope_name")) or "default"
-        return origin_memory == wanted_memory
+        return True
 
     if access_filter.get("mode") == "chat":
         if _clean(origin.get("platform")) != access_filter.get("platform", ""):
@@ -166,6 +162,11 @@ def _access_scope_matches_any_filter(raw_scope: Any, access_filters: Optional[Li
         return True
     scope = _parse_access_scope(raw_scope)
     origin = scope.get("origin") if isinstance(scope, dict) else None
+    # A recall grant can never cross the server-attributed profile boundary.
+    if not isinstance(origin, dict) or not _clean(origin.get("profile_name")):
+        return False
+    if _clean(origin.get("profile_name")) != access_filters[0].get("profile_name"):
+        return False
     return any(_origin_matches_filter(origin, item) for item in access_filters)
 
 
@@ -199,11 +200,14 @@ def _allowed_session_ids(db, access_filter: Optional[List[Dict[str, str]]]) -> O
         return set()
 
     children: Dict[str, List[str]] = {}
+    explicit_scopes = set()
     allowed: Set[str] = set()
     for row in rows:
         data = dict(row)
         sid = _clean(data.get("id"))
         parent = _clean(data.get("parent_session_id"))
+        if data.get("access_scope"):
+            explicit_scopes.add(sid)
         if parent:
             children.setdefault(parent, []).append(sid)
         if sid and _access_scope_matches_any_filter(data.get("access_scope"), access_filter):
@@ -213,7 +217,7 @@ def _allowed_session_ids(db, access_filter: Optional[List[Dict[str, str]]]) -> O
     while queue:
         parent = queue.pop()
         for child in children.get(parent, []):
-            if child not in allowed:
+            if child not in allowed and child not in explicit_scopes:
                 allowed.add(child)
                 queue.append(child)
 
@@ -310,20 +314,18 @@ def _list_recent_sessions(
             limit=fetch_limit,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
-        )  # fetch extra so we can skip current
+            **({"project_compression_tips": False} if access_filter else {}),
+        )  # Do not project a permitted root onto an explicitly foreign child.
 
         current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
 
         results = []
         for s in sessions:
             sid = s.get("id", "")
-            if current_root and (sid == current_root or sid == current_session_id):
+            if not access_filter and current_root and (sid == current_root or sid == current_session_id):
                 continue
             lineage_root = s.get("_lineage_root_id") or sid
-            if not (
-                _session_allowed(sid, allowed_session_ids)
-                or _session_allowed(lineage_root, allowed_session_ids)
-            ):
+            if not _session_allowed(sid, allowed_session_ids):
                 continue
             # Skip child / delegation sessions
             if s.get("parent_session_id"):
@@ -388,7 +390,7 @@ def _scroll(
 
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
-    if current_session_id:
+    if current_session_id and not access_filter:
         a_root = _resolve_to_parent(db, session_id)
         c_root = _resolve_to_parent(db, current_session_id)
         if a_root and c_root and a_root == c_root:
@@ -549,15 +551,17 @@ def _discover(
     for r in raw_results:
         raw_sid = r["session_id"]
         resolved_sid = _resolve_to_parent(db, raw_sid)
+        if not _session_allowed(resolved_sid, allowed_session_ids):
+            resolved_sid = raw_sid
         if not (
             _session_allowed(raw_sid, allowed_session_ids)
             or _session_allowed(resolved_sid, allowed_session_ids)
         ):
             continue
         # Skip the current session lineage
-        if current_lineage_root and resolved_sid == current_lineage_root:
+        if not access_filter and current_lineage_root and resolved_sid == current_lineage_root:
             continue
-        if current_session_id and raw_sid == current_session_id:
+        if not access_filter and current_session_id and raw_sid == current_session_id:
             continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
@@ -577,7 +581,7 @@ def _discover(
             continue
 
         try:
-            session_meta = db.get_session(lineage_root) or {}
+            session_meta = db.get_session(lineage_root if _session_allowed(lineage_root, allowed_session_ids) else hit_sid) or {}
         except Exception:
             session_meta = {}
 
@@ -615,6 +619,145 @@ def _discover(
     return json.dumps(response, ensure_ascii=False)
 
 
+def _date_bounds(start_date, end_date, timezone):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo(timezone)
+    def boundary(value, end=False):
+        if value is None:
+            return None
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if len(value) == 10 and end:
+            dt += timedelta(days=1)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=zone)
+        return dt.timestamp()
+    start, end = boundary(start_date), boundary(end_date, True)
+    if start is not None and end is not None and start >= end:
+        raise ValueError("start_date must precede end_date")
+    return zone, start, end
+
+
+def _count_chat_messages(db, access_filter, start_date, end_date, timezone, history_scope, query):
+    """Count original inbox events, not repeatedly seeded agent transcripts."""
+    from datetime import datetime
+    from pathlib import Path
+    import sqlite3
+    from contextlib import closing
+    try:
+        if not access_filter:
+            raise ValueError("Message counting requires a server-attributed gateway profile")
+        base = access_filter[0]
+        if history_scope not in {"topic", "chat", "profile"}:
+            raise ValueError("history_scope must be topic, chat, or profile")
+        if history_scope != "profile" and not base.get("chat_id"):
+            raise ValueError("Current chat is unknown")
+        if query:
+            raise ValueError("count_only counts incoming messages; omit query")
+        zone, start, end = _date_bounds(start_date, end_date, timezone)
+        # The gateway stores its shared inbox beside the actual SessionDB.
+        # Opening read-only must never silently create an empty journal.
+        path = Path(db.db_path).parent / "gateway_jobs.sqlite3"
+        clauses = ["json_valid(source_json)",
+                   "json_extract(source_json, '$.profile_name') = ?"]
+        params = [base["profile_name"]]
+        if history_scope != "profile":
+            clauses += ["platform = ?", "json_extract(source_json, '$.chat_id') = ?"]
+            params += [base["platform"], base["chat_id"]]
+        if history_scope == "topic":
+            clauses.append("COALESCE(json_extract(source_json, '$.thread_id'), '') = ?")
+            params.append(base.get("thread_id") or "")
+        where = " AND ".join(clauses)
+        dated = list(clauses)
+        dated_params = list(params)
+        if start is not None:
+            dated.append("created_at >= ?")
+            dated_params.append(start)
+        if end is not None:
+            dated.append("created_at < ?")
+            dated_params.append(end)
+        # The same original message can have multiple delivery/routing rows.
+        # Telegram message IDs are chat-local, not topic- or profile-global.
+        sql = ("SELECT platform, json_extract(source_json, '$.chat_id') AS chat_id, "
+               "COALESCE(json_extract(source_json, '$.thread_id'), '') AS thread_id, "
+               "COALESCE(NULLIF(request_message_id,''),event_id) AS message_id, "
+               "MIN(created_at) AS received_at, message_type "
+               "FROM gateway_inbox_events WHERE " + " AND ".join(dated) +
+               " GROUP BY platform, chat_id, message_id")
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = [dict(row) for row in conn.execute(sql, dated_params)]
+            first = conn.execute("SELECT MIN(created_at) FROM gateway_inbox_events WHERE " + where, params).fetchone()[0]
+        types = {}
+        for row in rows:
+            kind = row["message_type"]
+            types[kind] = types.get(kind, 0) + 1
+        return json.dumps({"success": True, "mode": "count", "count": len(rows),
+                           "source": "gateway_inbox_events", "unit": "recorded_incoming_messages",
+                           "history_scope": history_scope, "profile_name": base["profile_name"],
+                           "chat_id": base.get("chat_id") if history_scope != "profile" else None,
+                           "thread_id": base.get("thread_id") if history_scope == "topic" else None,
+                           "timezone": timezone, "start_timestamp": start, "end_timestamp_exclusive": end,
+                           "by_type": types,
+                           "earliest_recorded_at": datetime.fromtimestamp(first, zone).isoformat() if first is not None else None,
+                           "note": "Counts stored incoming message events, including passive observations. Bot replies and copied agent context are excluded. Batched events may contain several Telegram messages; this is not an independent Telegram server total."}, ensure_ascii=False)
+    except Exception as exc:
+        return tool_error(f"Message count failed: {exc}", success=False)
+
+
+def _read_messages(db, access_filter, query, role_filter, limit, sort,
+                   session_id, start_date, end_date, timezone, offset):
+    """Read a half-open interval of message timestamps, never session dates."""
+    from datetime import datetime
+    try:
+        zone, start, end = _date_bounds(start_date, end_date, timezone)
+        page_size = max(1, min(int(limit), 100))
+        page_offset = max(0, int(offset or 0))
+        allowed = _allowed_session_ids(db, access_filter)
+        clauses = ["m.active = 1", "s.source != 'tool'"]
+        params = []
+        if allowed is not None:
+            clauses.append("m.session_id IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(sorted(allowed)))
+        if session_id:
+            clauses.append("m.session_id = ?")
+            params.append(session_id)
+        if start is not None:
+            clauses.append("m.timestamp >= ?")
+            params.append(start)
+        if end is not None:
+            clauses.append("m.timestamp < ?")
+            params.append(end)
+        roles = [r.strip() for r in (role_filter or "user,assistant").split(",") if r.strip()]
+        clauses.append("m.role IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(roles))
+        if query and query.strip():
+            sanitized = db._sanitize_fts5_query(query.strip())
+            if not sanitized:
+                raise ValueError("Empty search query")
+            clauses.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+            params.append(sanitized)
+        direction = "DESC" if sort == "newest" else "ASC"
+        sql = ("SELECT m.id, m.session_id, m.role, m.content, m.timestamp, s.access_scope "
+               "FROM messages m JOIN sessions s ON s.id = m.session_id WHERE "
+               + " AND ".join(clauses) + f" ORDER BY m.timestamp {direction}, m.id {direction} LIMIT ? OFFSET ?")
+        with db._lock:
+            rows = [dict(row) for row in db._conn.execute(sql, params + [page_size + 1, page_offset]).fetchall()]
+        more = len(rows) > page_size
+        messages = []
+        for row in rows[:page_size]:
+            origin = _parse_access_scope(row.pop("access_scope")).get("origin", {})
+            row["origin"] = origin
+            row["datetime"] = datetime.fromtimestamp(row["timestamp"], zone).isoformat()
+            messages.append(row)
+        return json.dumps({"success": True, "mode": "messages", "timezone": timezone,
+                           "start_timestamp": start, "end_timestamp_exclusive": end,
+                           "messages": messages, "count": len(messages), "has_more": more,
+                           "next_offset": page_offset + len(messages) if more else None}, ensure_ascii=False)
+    except Exception as exc:
+        return tool_error(f"History selection failed: {exc}", success=False)
+
+
 def session_search(
     query: str = "",
     role_filter: str = None,
@@ -627,6 +770,12 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    timezone: str = "UTC",
+    offset: int = None,
+    count_only: bool = False,
+    history_scope: str = "topic",
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -647,6 +796,14 @@ def session_search(
             return tool_error(format_session_db_unavailable(), success=False)
 
     access_filter = _current_gateway_access_filters()
+    if count_only:
+        return _count_chat_messages(db, access_filter, start_date, end_date, timezone, history_scope, query)
+
+    # Date/message selection includes the current session: old messages may
+    # have disappeared from the model context after compression.
+    if start_date is not None or end_date is not None or offset is not None or (session_id and around_message_id is None):
+        return _read_messages(db, access_filter, query, role_filter, limit, sort,
+                              session_id, start_date, end_date, timezone, offset)
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -709,7 +866,16 @@ SESSION_SEARCH_SCHEMA = {
         "Search past sessions stored in the local session DB, or scroll inside one. "
         "FTS5-backed retrieval over the SQLite message store. No LLM calls — every "
         "shape returns actual messages from the DB.\n\n"
-        "THREE CALLING SHAPES\n\n"
+        "COUNT MESSAGES — for how many messages today/this morning, use count_only=true "
+        "with start_date/end_date and timezone. Counts original stored incoming events "
+        "without copied transcript duplicates. history_scope defaults to current topic; "
+        "use chat for the whole current chat or profile for all chats of this profile. "
+        "Report the returned unit/coverage honestly; do not count transcript rows. "
+        "Always try the tool before claiming history/counting is unavailable.\n\n"
+        "DATE/MESSAGE SELECTION — pass start_date/end_date and timezone, or offset=0. "
+        "Returns messages in timestamp order, including current-session history. "
+        "Use limit up to 100 and next_offset to read every page. Query is optional.\n\n"
+        "THREE OTHER CALLING SHAPES\n\n"
         "  1) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
@@ -750,17 +916,13 @@ SESSION_SEARCH_SCHEMA = {
         "inspection. The session DB carries what was said when; external tools show "
         "current world state.\n\n"
         "ACCESS BOUNDARY\n\n"
-        "  In gateway chats, results are automatically limited to the active "
-        "boundary: the current topic when topic isolation is enabled, otherwise "
-        "the current profile/memory scope. A question about a previously shared "
-        "link, decision, or message must be searched here before claiming it is "
-        "unavailable. If the local topic has no result and a sibling topic may "
-        "contain it, call recall_access(target='other_topics') to ask permission; "
-        "after a grant, immediately retry the same session_search query. For any "
-        "other context outside the boundary, call recall_access first and wait "
-        "for the user's explicit grant. Do not treat this as global recall unless "
-        "the active surface is "
-        "CLI/local or the user explicitly moves to a global surface."
+        "  Gateway history is limited by the server to the current profile across "
+        "all its chats and topics. Other profiles are never readable, even with "
+        "a recall grant. Use start_date/end_date with timezone to read actual "
+        "messages by their timestamps, optionally combined with query. Date-only "
+        "end_date includes that entire local day; datetime end is exclusive. "
+        "Pass offset=0 to read/paginate messages without dates, including the "
+        "current session. Continue with next_offset until has_more is false."
     ),
     "parameters": {
         "type": "object",
@@ -770,14 +932,14 @@ SESSION_SEARCH_SCHEMA = {
                 "description": (
                     "Search query (discovery shape). Keywords, phrases, or boolean "
                     "expressions to find in past sessions. Omit to browse recent "
-                    "sessions. Ignored when session_id + around_message_id are set "
+                    "sessions. With dates or offset, searches messages within that range. Ignored when session_id + around_message_id are set "
                     "(scroll shape)."
                 ),
             },
             "limit": {
                 "type": "integer",
                 "description": (
-                    "Discovery shape only. Max sessions to return (default 3, max 10). "
+                    "Max sessions (default 3, max 10), or messages in date/pagination mode (max 100). "
                     "Bump to 5–10 when the topic likely spans several sessions and you "
                     "want to pick the right one to scroll into."
                 ),
@@ -798,7 +960,7 @@ SESSION_SEARCH_SCHEMA = {
             "session_id": {
                 "type": "string",
                 "description": (
-                    "Scroll shape. Session to read inside. Use the session_id returned "
+                    "Session to read inside; without an anchor returns paginated messages. Use the session_id returned "
                     "from a prior discovery call. Must be paired with "
                     "around_message_id."
                 ),
@@ -835,6 +997,16 @@ SESSION_SEARCH_SCHEMA = {
 }
 
 
+SESSION_SEARCH_SCHEMA["parameters"]["properties"].update({
+    "count_only": {"type": "boolean", "description": "Count original recorded incoming messages without loading transcripts. Use for message count questions."},
+    "history_scope": {"type": "string", "enum": ["topic", "chat", "profile"], "description": "Count scope: current topic (default), whole current chat, or all chats of the current profile. Server enforces profile ownership."},
+    "start_date": {"type": "string", "description": "Inclusive ISO date or datetime of messages."},
+    "end_date": {"type": "string", "description": "ISO date (entire local day included) or exclusive datetime."},
+    "timezone": {"type": "string", "description": "IANA timezone for naive dates and returned times, e.g. Asia/Tbilisi. Default UTC."},
+    "offset": {"type": "integer", "minimum": 0, "description": "Message pagination offset. Set 0 for all-history message search without dates."},
+})
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -850,6 +1022,12 @@ registry.register(
         around_message_id=args.get("around_message_id"),
         window=args.get("window", 5),
         sort=args.get("sort"),
+        start_date=args.get("start_date"),
+        end_date=args.get("end_date"),
+        timezone=args.get("timezone", "UTC"),
+        offset=args.get("offset"),
+        count_only=args.get("count_only", False),
+        history_scope=args.get("history_scope", "topic"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),

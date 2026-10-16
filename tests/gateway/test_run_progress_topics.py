@@ -268,7 +268,7 @@ class MiniappCompletionAgent:
             "mcp_health_actions_create_planning_task",
             duration=0.1,
             is_error=False,
-            result='{"result":"{\\"ok\\":true}"}',
+            result='{"ok":true,"action":"create-planning-task"}',
         )
         cb(
             "tool.completed",
@@ -316,6 +316,7 @@ def _make_runner(adapter):
     runner._session_db = None
     runner._running_agents = {}
     runner._session_run_generation = {}
+    runner._cleanup_progress_ids_by_run = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
@@ -873,7 +874,8 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_run_agent_forwards_completed_tools_to_miniapp_tracker(monkeypatch, tmp_path):
+async def test_run_agent_captures_miniapp_results_without_adapter_state(monkeypatch, tmp_path):
+    """Navigation survives absent transcripts and disabled progress messages."""
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -884,23 +886,10 @@ async def test_run_agent_forwards_completed_tools_to_miniapp_tracker(monkeypatch
     )
 
     assert result["final_response"] == "done"
-    assert adapter.miniapp_turns == [("-1001", "17585")]
-    assert adapter.miniapp_completions == [
-        {
-            "chat_id": "-1001",
-            "thread_id": "17585",
-            "tool_name": "mcp_health_actions_create_planning_task",
-            "is_error": False,
-            "result": '{"result":"{\\"ok\\":true}"}',
-        },
-        {
-            "chat_id": "-1001",
-            "thread_id": "17585",
-            "tool_name": "mcp_google_calendar_create_event",
-            "is_error": True,
-            "result": '{"error":"unavailable"}',
-        },
-    ]
+    assert adapter.miniapp_turns == []
+    assert adapter.miniapp_completions == []
+    from gateway.miniapp_reply_contract import miniapp_reply_params
+    assert miniapp_reply_params(result["miniapp_records"]) == ["planning"]
 
 
 @pytest.mark.asyncio

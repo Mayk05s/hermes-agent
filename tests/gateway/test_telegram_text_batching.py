@@ -148,17 +148,45 @@ class TestTextBatching:
         adapter._enqueue_text_event(instruction)
 
         forwarded = _make_group_event("180 лари за ночь", user_id="179555559")
+        forwarded.raw_message.forward_origin = object()
         assert adapter._merge_pending_forwarded_text(forwarded) is True
 
         await asyncio.sleep(0.2)
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args[0][0]
         assert dispatched.text == "@TripiooBot переведи в доллар\n180 лари за ночь"
+        assert (
+            dispatched.authenticated_user_request_text
+            == "@TripiooBot переведи в доллар"
+        )
+
+    @pytest.mark.asyncio
+    async def test_calendar_correction_keeps_direct_command_separate_from_forward(self):
+        """A short correction may use forwarded details without trusting them."""
+        adapter = _make_adapter()
+        instruction = _make_group_event(
+            "@TripiooBot исправь", user_id="179555559"
+        )
+        instruction._await_forward_followup = True
+        adapter._enqueue_text_event(instruction)
+
+        forwarded = _make_group_event(
+            "Перенеси «Интервью» с 15:30 на 14:30 по Грузии",
+            user_id="179555559",
+        )
+        forwarded.raw_message.forward_origin = object()
+        assert adapter._merge_pending_forwarded_text(forwarded) is True
+
+        await asyncio.sleep(0.2)
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert "Интервью" in dispatched.text
+        assert dispatched.authenticated_user_request_text == "@TripiooBot исправь"
 
     @pytest.mark.asyncio
     async def test_reverse_update_order_forward_then_instruction_is_one_request(self):
         adapter = _make_adapter()
         forwarded = _make_group_event("180 лари за ночь", user_id="179555559")
+        forwarded.raw_message.forward_origin = object()
         adapter._hold_forward_for_instruction(forwarded)
 
         instruction = _make_group_event(

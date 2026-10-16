@@ -222,17 +222,20 @@ def _remove_hermes_pkce(provider: str, removed) -> RemovalResult:
 def _clear_auth_store_provider(provider: str) -> bool:
     """Delete auth_store.providers[provider].  Returns True if deleted."""
     from hermes_cli.auth import (
+        _auth_file_path,
         _auth_store_lock,
+        _codex_auth_file_path,
         _load_auth_store,
         _save_auth_store,
     )
 
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    auth_file = _codex_auth_file_path() if provider == "openai-codex" else _auth_file_path()
+    with _auth_store_lock(auth_file=auth_file):
+        auth_store = _load_auth_store(auth_file)
         providers_dict = auth_store.get("providers")
         if isinstance(providers_dict, dict) and provider in providers_dict:
             del providers_dict[provider]
-            _save_auth_store(auth_store)
+            _save_auth_store(auth_store, auth_file)
             return True
     return False
 

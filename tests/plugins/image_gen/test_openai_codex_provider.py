@@ -142,7 +142,9 @@ class TestGenerate:
         result = provider.generate("a cat", aspect_ratio="portrait")
         assert result["success"] is True
 
-        assert captured["model"] == "gpt-5.4"
+        # Regression: gpt-5.4 is rejected by the Codex ChatGPT-account
+        # endpoint before the image_generation tool can run.
+        assert captured["model"] == "gpt-5.5"
         assert captured["store"] is False
         assert captured["input"][0]["type"] == "message"
         assert captured["input"][0]["role"] == "user"

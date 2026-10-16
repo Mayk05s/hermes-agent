@@ -396,6 +396,64 @@ def test_explicit_current_calendar_write_is_still_authorized():
         clear_session_vars(tokens)
 
 
+def test_contextual_calendar_correction_is_explicit_write_intent():
+    """Short direct command authorizes details resolved from safe context."""
+    assert calendar._has_explicit_user_write_intent("@TripiooBot исправь")
+    assert calendar._has_explicit_user_write_intent("Нужно исправить время")
+
+
+def test_forwarded_write_words_do_not_replace_direct_authorization():
+    """The gateway-proven direct part remains non-writing despite the payload."""
+    direct_request = "@TripiooBot проверь пересланное сообщение"
+    forwarded_payload = "Перенеси «Интервью» на 14:30"
+
+    assert not calendar._has_explicit_user_write_intent(direct_request)
+    assert calendar._has_explicit_user_write_intent(forwarded_payload)
+
+
+def test_short_correction_command_allows_context_resolved_write(monkeypatch, tmp_path):
+    _configure_home(monkeypatch, tmp_path)
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["prompt"] = command[-1]
+        stdout = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": (
+                        "CALENDAR_WRITE_CONFIRMED\n"
+                        "«Интервью» перенесено на 14:30 по Грузии."
+                    ),
+                },
+            }
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(calendar.subprocess, "run", fake_run)
+    tokens = _session(user_request="@TripiooBot исправь")
+    try:
+        result = json.loads(
+            calendar.google_calendar_tool(
+                {
+                    "task": (
+                        "По переданному контексту перенеси «Интервью» "
+                        "с 15:30–15:40 на 14:30–14:40 по Грузии"
+                    ),
+                    "read_only": False,
+                }
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["success"] is True
+    assert result["outcome"] == "changed"
+    assert "14:30" in result["answer"]
+    assert "Интервью" in captured["prompt"]
+
+
 def test_calendar_recognizes_explicit_russian_infinitive_write(monkeypatch, tmp_path):
     _configure_home(monkeypatch, tmp_path)
     captured = {}

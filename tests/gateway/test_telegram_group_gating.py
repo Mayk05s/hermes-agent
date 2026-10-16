@@ -1796,7 +1796,7 @@ def test_unmentioned_voice_with_matching_transcription_rule_dispatches_for_runne
     asyncio.run(_run())
 
 
-def test_boxmap_miniapp_scenario_request_sends_button_without_agent():
+def test_boxmap_miniapp_scenario_request_reaches_agent():
     async def _run():
         adapter = _make_adapter(require_mention=False)
         adapter._command_surface_profile_for_message = Mock(return_value="boxmap")
@@ -1811,28 +1811,14 @@ def test_boxmap_miniapp_scenario_request_sends_button_without_agent():
 
         await adapter._handle_text_message(update, SimpleNamespace())
 
-        adapter._enqueue_text_event.assert_not_called()
-        adapter._bot.send_message.assert_awaited_once()
-        kwargs = adapter._bot.send_message.await_args.kwargs
-        assert kwargs["chat_id"] == -100
-        assert kwargs["message_thread_id"] == 35
-        assert kwargs["reply_markup"] is not None
-        assert "BoxMap" in kwargs["text"]
+        adapter._enqueue_text_event.assert_called_once()
+        adapter._bot.send_message.assert_not_awaited()
 
     asyncio.run(_run())
 
 
-def test_boxmap_link_complaint_reply_sends_scenario_button_without_agent():
+def test_boxmap_link_complaint_reply_reaches_agent():
     async def _run():
-        class _Button:
-            def __init__(self, text, **kwargs):
-                self.text = text
-                self.kwargs = kwargs
-
-        class _Markup:
-            def __init__(self, rows):
-                self.inline_keyboard = rows
-
         adapter = _make_adapter(require_mention=False)
         adapter._command_surface_profile_for_message = Mock(return_value="boxmap")
         adapter._ensure_forum_commands = AsyncMock()
@@ -1846,19 +1832,10 @@ def test_boxmap_link_complaint_reply_sends_scenario_button_without_agent():
             effective_message=None,
         )
 
-        with (
-            patch("gateway.platforms.telegram.InlineKeyboardButton", _Button),
-            patch("gateway.platforms.telegram.InlineKeyboardMarkup", _Markup),
-        ):
-            await adapter._handle_text_message(update, SimpleNamespace())
+        await adapter._handle_text_message(update, SimpleNamespace())
 
-        adapter._enqueue_text_event.assert_not_called()
-        adapter._bot.send_message.assert_awaited_once()
-        kwargs = adapter._bot.send_message.await_args.kwargs
-        assert kwargs["message_thread_id"] == 35
-        button = kwargs["reply_markup"].inline_keyboard[0][0]
-        assert button.text == "Открыть сценарии"
-        assert button.kwargs.get("url") == "https://t.me/hermes_bot?startapp=boxmap"
+        adapter._enqueue_text_event.assert_called_once()
+        adapter._bot.send_message.assert_not_awaited()
 
     asyncio.run(_run())
 

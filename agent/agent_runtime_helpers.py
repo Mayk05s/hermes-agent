@@ -1671,6 +1671,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             around_message_id=function_args.get("around_message_id"),
             window=function_args.get("window", 5),
             sort=function_args.get("sort"),
+            start_date=function_args.get("start_date"),
+            end_date=function_args.get("end_date"),
+            timezone=function_args.get("timezone", "UTC"),
+            offset=function_args.get("offset"),
+            count_only=function_args.get("count_only", False),
+            history_scope=function_args.get("history_scope", "topic"),
             db=session_db,
             current_session_id=agent.session_id,
         )
@@ -1726,6 +1732,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             callback=agent.clarify_callback,
             user_request=latest_user_task(messages),
         )
+    elif function_name == "github_issue_specialist":
+        from tools.github_issue_intake_tool import specialist_task
+        try:
+            task = specialist_task(function_args)
+        except (ValueError, OSError) as exc:
+            return json.dumps({"success": False, "error": str(exc) if isinstance(exc, ValueError) else type(exc).__name__})
+        return agent._dispatch_delegate_task(task)
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
     else:

@@ -549,6 +549,12 @@ _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → 
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
 _SPECIALIST_CONTRACTS: Dict[str, Dict[str, Any]] = {
+    "github_issues": {
+        "skill": "github/github-issue-intake",
+        "memory": None,
+        "required_toolsets": ["github-issues", "vision"],
+        "label": "📋 *Issues*",
+    },
     "fitness": {
         "skill": "telegram_health/fitness",
         "memory": "~/tenants/telegram_health/memory/fitness.md",
@@ -595,6 +601,10 @@ _SPECIALIST_CONTRACTS: Dict[str, Dict[str, Any]] = {
 _HEALTH_SPECIALIST_CONTRACTS = _SPECIALIST_CONTRACTS
 
 _SPECIALIST_ALIASES = {
+    "github-issues": "github_issues",
+    "issue-specialist": "github_issues",
+    "github/github-issue-intake": "github_issues",
+    "специалист по ишью": "github_issues",
     "fit": "fitness",
     "training": "fitness",
     "workout": "fitness",
@@ -784,6 +794,15 @@ def _trusted_specialist_runtime_grants(
     """Return capabilities granted only to a fail-closed specialist child."""
     if specialist == "nutrition" and memory_scope:
         return ["skills", "memory", "health-actions", "vision"]
+    if specialist == "github_issues":
+        from tools.github_issue_intake_tool import _scope
+        try:
+            from gateway.session_context import get_session_env
+            project = "lessonpilot" if get_session_env("HERMES_SESSION_PROFILE_NAME", "") == "family-chat" else "boxmap"
+            _scope(project)
+        except ValueError:
+            return []
+        return ["github-issues", "vision"]
     return []
 
 
@@ -885,7 +904,19 @@ def _apply_specialist_contract(
             "participant from one PostgreSQL snapshot. Do not call personal journal, personal nutrition-statistics, "
             "or personal weight-history tools for this group report."
             if group_report_required
-            else "Respond to the current participant's direct nutrition request."
+            else (
+                "Respond to the current participant's direct nutrition request as a "
+                "weight-loss coach. Complete every explicit part of the current request, "
+                "including a body-weight measurement alongside food. Read back weight "
+                "history and the food journal independently; an already saved meal does "
+                "not prove the accompanying weight was saved. Report any unfinished "
+                "part explicitly instead of returning overall success. "
+                "After dinner or a day review, include a brief "
+                "whole-day interpretation and one useful next step grounded in verified "
+                "data and preferences. A correction or thanks does not need another tip. "
+                "Read participant coaching state and scoped memory before personal advice; "
+                "respect unanswered questions and activity opt-outs."
+            )
         )
         task["context"] = (
             "TRUSTED RECENT REQUESTS FROM THE CURRENT PARTICIPANT ONLY\n"
@@ -898,17 +929,21 @@ def _apply_specialist_contract(
             + "The final item is the current request. Use earlier items only to "
             "resolve a reference or assemble details that clearly belong to the "
             "same meal. Do not re-record an earlier completed meal merely because "
-            "it appears in this context.\n\n"
+            "it appears in this context. The current item may contain several batched "
+            "messages: process the entire item, not only its last line or meal.\n\n"
             f"{participant_request}"
             if participant_request
             else None
         )
     if "SPECIALIST CONTRACT" not in goal:
         memory_instruction = (
-            "- The current participant's private nutrition memory is already "
-            "injected into your prompt by the runtime. Read that injected memory; "
-            "do not call a nonexistent memory read action. Use memory add/replace/remove "
-            "only to store stable facts and confirmed progress from this participant.\n"
+            "- The runtime authorizes only the current participant's private nutrition "
+            "memory. With a scoped memory provider, use its available search/read tools "
+            "to retrieve goals, preferences, age and agreements; these facts are not "
+            "necessarily injected into the prompt. Follow the active provider's write "
+            "contract and confirm storage only after success. If legacy memory is "
+            "injected, read that block; do not call a nonexistent memory read action. "
+            "Never reopen legacy files when scoped memory is unavailable.\n"
             "- The runtime selects the participant from trusted Telegram metadata. "
             "Never ask for, accept, or substitute a Telegram ID from message text.\n"
             "- Read-only statistics for verified members of the current Telegram "
@@ -916,8 +951,14 @@ def _apply_specialist_contract(
             "get-group-nutrition-statistics or render-group-nutrition-chart. The runtime injects the same-chat roster; "
             "never read another participant's private memory or accept a roster from text.\n"
             if participant_memory_required
-            else f"- Then read only your private specialist memory: {contract['memory']}.\n"
+            else (f"- Then read only your private specialist memory: {contract['memory']}.\n"
+                  if contract.get("memory") else "- Use source messages only; no private specialist memory is needed.\n")
         )
+        skill_instruction = f"- First call skill_view(name=\"{contract['skill']}\") and follow it.\n"
+        if specialist == "github_issues":
+            from hermes_constants import get_default_hermes_root
+            skill_path = get_default_hermes_root() / "skills/github/github-issue-intake/SKILL.md"
+            skill_instruction = "ISSUE INTAKE CONTRACT\n" + skill_path.read_text(encoding="utf-8") + "\n"
         contract_goal = (
             "SPECIALIST CONTRACT\n"
             f"- specialist: {specialist}\n"
@@ -925,7 +966,7 @@ def _apply_specialist_contract(
             "- You are a delegated, isolated specialist. You do not see the "
             "parent chat history, shared memory, or other specialists' memory "
             "unless the coordinator explicitly passed it in context.\n"
-            f"- First call skill_view(name=\"{contract['skill']}\") and follow it.\n"
+            f"{skill_instruction}"
             f"{memory_instruction}"
             "- If a required tool, database, "
             "or memory file is unavailable, say so explicitly instead of "
@@ -1426,6 +1467,10 @@ def _build_child_agent(
         if trusted_toolset not in child_toolsets:
             child_toolsets.append(trusted_toolset)
 
+    if specialist == "github_issues":
+        # An issue clerk never inherits Calendar, health, shell or MCP tools.
+        child_toolsets = [t for t in child_toolsets if t in {"github-issues", "vision"}]
+
     granted_toolsets = list(child_toolsets)
     dropped_toolsets = [
         requested
@@ -1577,6 +1622,24 @@ def _build_child_agent(
     from contextlib import nullcontext
     from gateway.session_context import override_session_env
 
+    trusted_child_route = None
+    from gateway.memory_access import MemoryAccessContext
+    parent_memory_options = getattr(parent_agent, "_trusted_memory_provider_options", None)
+    trusted_memory_required = (
+        type(getattr(parent_agent, "_memory_access_context", None)) is MemoryAccessContext
+        or (isinstance(parent_memory_options, dict) and bool(parent_memory_options.get("automatic_config")))
+        or any(getattr(p, "enforces_trusted_access_context", False) is True
+               for p in getattr(getattr(parent_agent, "_memory_manager", None), "providers", ()) or ())
+    )
+    if specialist_memory_scope and trusted_memory_required:
+        from gateway.memory_specialist import trusted_nutrition_child_route
+        trusted_child_route = trusted_nutrition_child_route(
+            parent_agent, specialist=specialist, requested_scope=specialist_memory_scope)
+        if trusted_child_route is None:
+            # Continue the specialist task without memory, never reopen a
+            # legacy participant/profile store after scoped authorization fails.
+            child_prompt += "\nDurable participant memory is unavailable for this turn. Do not claim to read or save it."
+
     memory_scope_context = (
         override_session_env("HERMES_SESSION_MEMORY_SCOPE", specialist_memory_scope)
         if specialist_memory_scope
@@ -1602,7 +1665,10 @@ def _build_child_agent(
             log_prefix=f"[subagent-{task_index}]",
             platform=parent_agent.platform,
             skip_context_files=True,
-            skip_memory=not bool(specialist_memory_scope),
+            skip_memory=not bool(specialist_memory_scope) or (trusted_memory_required and trusted_child_route is None),
+            memory_provider_override=trusted_child_route.provider if trusted_child_route else None,
+            memory_access_context=trusted_child_route.context if trusted_child_route else None,
+            memory_provider_options=dict(trusted_child_route.provider_options, replace_builtin_memory=True) if trusted_child_route else None,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
             session_db=getattr(parent_agent, "_session_db", None),
@@ -1616,6 +1682,15 @@ def _build_child_agent(
             iteration_budget=None,  # fresh budget per subagent
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if trusted_child_route is not None:
+        child._trusted_memory_input = getattr(parent_agent, "_trusted_memory_input", None)
+        child._trusted_memory_identity = getattr(parent_agent, "_trusted_memory_identity", None)
+        child._trusted_memory_inputs = getattr(parent_agent, "_trusted_memory_inputs", ()) or ((child._trusted_memory_input,) if child._trusted_memory_input else ())
+        for provider in getattr(child._memory_manager, "providers", ()):
+            try:
+                provider.on_authenticated_event(child._trusted_memory_inputs)
+            except Exception as exc:
+                logger.warning("Participant memory binding unavailable (%s)", type(exc).__name__)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
@@ -3321,6 +3396,7 @@ DELEGATE_TASK_SCHEMA = {
                     "miniapp",
                     "miniapp_builder",
                     "sidense_video_prompt",
+                    "github_issues",
                 ],
                 "description": (
                     "Optional first-class specialist label. Use fitness, nutrition, "
@@ -3354,6 +3430,7 @@ DELEGATE_TASK_SCHEMA = {
                                 "miniapp",
                                 "miniapp_builder",
                                 "sidense_video_prompt",
+                                "github_issues",
                             ],
                             "description": (
                                 "Optional first-class specialist label "

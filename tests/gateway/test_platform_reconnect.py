@@ -26,6 +26,10 @@ class StubAdapter(BasePlatformAdapter):
         self._succeed = succeed
         self._fatal_error = fatal_error
         self._fatal_retryable = fatal_retryable
+        self.preserve_pending_updates_calls = 0
+
+    def preserve_pending_updates_on_connect(self):
+        self.preserve_pending_updates_calls += 1
 
     async def connect(self):
         if self._fatal_error:
@@ -216,6 +220,7 @@ class TestPlatformReconnectWatcher:
 
         assert Platform.TELEGRAM not in runner._failed_platforms
         assert Platform.TELEGRAM in runner.adapters
+        assert succeed_adapter.preserve_pending_updates_calls == 1
 
     @pytest.mark.asyncio
     async def test_reconnect_nonretryable_removed_from_queue(self):
