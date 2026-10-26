@@ -3360,6 +3360,8 @@ def _enrich_planning_action_args_from_origin(
         return
 
     platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    if normalized_tool_name in {"delete-shopping-items", "move-shopping-items"}:
+        args["_shoppingAuditSource"] = platform if platform in {"alice", "telegram"} else "agent"
     if platform != "telegram":
         return
 

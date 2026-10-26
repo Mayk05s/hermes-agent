@@ -4515,7 +4515,7 @@ def test_shopping_action_origin_forces_family_group_source(monkeypatch, tool_nam
     finally:
         clear_session_vars(tokens)
 
-    assert args == {
+    expected = {
         "telegramUserId": "179555559",
         "scope": "shared",
         "telegramChatId": "-1003966683704",
@@ -4523,6 +4523,10 @@ def test_shopping_action_origin_forces_family_group_source(monkeypatch, tool_nam
         "chatType": "supergroup",
         "actorName": "Mikhail",
     }
+
+    if tool_name in {"delete-shopping-items", "move-shopping-items"}:
+        expected["_shoppingAuditSource"] = "telegram"
+    assert args == expected
 
 
 def test_health_actions_bind_to_verified_telegram_requester():
@@ -5269,3 +5273,17 @@ def test_new_shopping_tools_bind_verified_family_origin_in_actual_mcp_handler(mo
     assert arguments["telegramUserId"]=="179555559" and arguments["telegramChatId"]=="-1003966683704" and arguments["scope"]=="shared"
     assert "chatId" not in arguments and "telegramChatInstance" not in arguments
     assert arguments["liveListId"]=="11111111-1111-1111-1111-111111111111"
+
+
+@pytest.mark.parametrize("platform,expected", [("alice", "alice"), ("telegram", "telegram"), ("cli", "agent")])
+def test_shopping_deletion_audit_source_comes_from_trusted_transport(platform, expected):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.mcp_tool import _enrich_planning_action_args_from_origin
+    tokens = set_session_vars(platform=platform, chat_id="-1003966683704", user_id="179555559", user_name="Mikhail")
+    try:
+        for name in ("delete-shopping-items", "move-shopping-items"):
+            args = {"_shoppingAuditSource": "forged", "telegramUserId": "179555559"}
+            _enrich_planning_action_args_from_origin("health-actions", name, args)
+            assert args["_shoppingAuditSource"] == expected
+    finally:
+        clear_session_vars(tokens)
