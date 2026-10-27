@@ -13,7 +13,7 @@ def origin(receipt):
         with override_session_env('HERMES_SESSION_SHOPPING_RECEIPT',json.dumps(receipt)):yield
     finally:clear_session_vars(tokens)
 
-@pytest.mark.parametrize('action,key',[('add-shopping-items','liveListId'),('list-shopping-items','liveListId'),('move-shopping-items','targetLiveListId')])
+@pytest.mark.parametrize('action,key',[('add-shopping-items','liveListId'),('list-shopping-items','liveListId')])
 def test_reply_resolver_controls_exact_tool_target(monkeypatch,action,key):
     import urllib.request
     monkeypatch.setenv('HEALTH_ACTIONS_API_URL','https://example.test/api/admin/health-actions');monkeypatch.setenv('HEALTH_ACTIONS_API_TOKEN','test')
@@ -39,3 +39,37 @@ def test_no_reply_never_uses_model_supplied_card_or_calls_network():
     with origin({}),patch.object(urllib.request,'urlopen') as call:
         assert _bind_shopping_reply_target('health-actions','add-shopping-items',{'replyMessageId':'999','telegramUserId':'42'}) is None
         call.assert_not_called()
+
+
+def test_move_destination_is_never_replaced_by_replied_source_card():
+    import urllib.request
+    receipt={'context':{'chatId':'-100','threadId':'7','actorId':'42','replyMessageId':'9'},'signature':'sealed'}
+    args={'telegramUserId':'42','targetListName':'Для дома','itemIds':[356,357]}
+    with origin(receipt),patch.object(urllib.request,'urlopen') as lookup:
+        assert _bind_shopping_reply_target('health-actions','move-shopping-items',args) is None
+        assert args['targetListName']=='Для дома'
+        assert 'targetLiveListId' not in args
+        lookup.assert_not_called()
+
+@pytest.mark.parametrize('args',[{'liveListId':'old-main'}, {'listName':'Основной'}, {}])
+def test_explicit_home_list_rejects_default_or_omitted_model_destination(args):
+    from tools.mcp_tool import _guard_explicit_shopping_destination
+    tokens=set_session_vars(platform='telegram',user_request='@TripiooBot добавь в список для дома')
+    try:
+        error=_guard_explicit_shopping_destination('health-actions','add-shopping-items',args)
+        assert json.loads(error)['error']=='shopping_explicit_destination_required'
+        assert _guard_explicit_shopping_destination('health-actions','add-shopping-items',{'listName':'Для дома'}) is None
+    finally:clear_session_vars(tokens)
+
+def test_named_add_destination_wins_over_replied_card(monkeypatch):
+    import urllib.request
+    monkeypatch.setenv('HEALTH_ACTIONS_API_URL','https://example.test/api/admin/health-actions');monkeypatch.setenv('HEALTH_ACTIONS_API_TOKEN','test')
+    receipt={'context':{'chatId':'-100','threadId':'7','actorId':'42','replyMessageId':'9'},'signature':'sealed'}
+    class Response:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def read(self):return json.dumps({'ok':True,'liveListId':'11111111-1111-4111-8111-111111111111','listName':'Основной'}).encode()
+    with origin(receipt),patch.object(urllib.request,'urlopen',return_value=Response()):
+        args={'telegramUserId':'42','listName':'Для дома'}
+        assert _bind_shopping_reply_target('health-actions','add-shopping-items',args) is None
+        assert args=={'telegramUserId':'42','listName':'Для дома'}

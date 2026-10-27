@@ -2652,6 +2652,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if health_origin_error is not None:
             return health_origin_error
         _enrich_planning_action_args_from_origin(server_name, effective_tool_name, args)
+        explicit_destination_error = _guard_explicit_shopping_destination(server_name, effective_tool_name, args)
+        if explicit_destination_error is not None:
+            return explicit_destination_error
         shopping_reply_error = _bind_shopping_reply_target(server_name, effective_tool_name, args)
         if shopping_reply_error is not None:
             return shopping_reply_error
@@ -3272,9 +3275,36 @@ def _bind_health_actions_to_telegram_requester(
     return None
 
 
+def _guard_explicit_shopping_destination(server_name, tool_name, args):
+    """Reject a missing/mismatched destination before a model can write elsewhere."""
+    if server_name != "health-actions" or str(tool_name).replace("_", "-") != "add-shopping-items":
+        return None
+    from gateway.session_context import get_session_env
+    request = get_session_env("HERMES_SESSION_USER_REQUEST", "") or ""
+    # This is only a constraint from the authenticated current request, never
+    # an inferred destination or permission from quoted/forwarded material.
+    request = re.sub(r"(?m)^\s*>[^\n]*$", "", request)
+    match = re.search(r"(?i)\bв\s+список\s+(?:покупок\s+)?([^\n.!?]+)", request)
+    if not match:
+        return None
+    candidate = match.group(1).strip().strip('«»"“” ,:;')
+    if candidate.casefold() in {"покупок", "продуктов", "пожалуйста"} or not candidate:
+        return None
+    name = str(args.get("listName") or "").strip()
+    normalized = candidate.casefold()
+    named = name.casefold()
+    if named and (normalized == named or re.match(re.escape(named) + r'(?:[\s,«»"“”:]|$)', normalized)):
+        return None
+    return json.dumps({"error": "shopping_explicit_destination_required", "message":
+        "В текущей просьбе явно указан список. Передайте его точное название в listName; не подменяйте Основным, ID другой карточки или категорией. Если список отсутствует, уточните создание либо создайте его при явном разрешении пользователя. Ничего не добавлено."}, ensure_ascii=False)
+
+
 def _bind_shopping_reply_target(server_name, tool_name, args):
     """Resolve only authenticated ingress replies; model text/URLs never select a card."""
     if server_name!='health-actions' or str(tool_name).replace('_','-') not in {'list-shopping-items','add-shopping-items','move-shopping-items','show-shopping-list','rollover-shopping-list','refine-shopping-item','set-shopping-items-bought'}:
+        return None
+    # The replied card identifies the source of a move, never its destination.
+    if str(tool_name).replace('_','-') == 'move-shopping-items':
         return None
     from gateway.session_context import get_session_env
     import urllib.request
@@ -3295,7 +3325,10 @@ def _bind_shopping_reply_target(server_name, tool_name, args):
         target=resolved.get('liveListId')
         if not target:return None
         if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',str(target)):raise ValueError('invalid reply target')
-        key='targetLiveListId' if str(tool_name).replace('_','-')=='move-shopping-items' else 'liveListId'
+        # An explicitly named destination wins over the replied card.
+        if args.get('createNewList') is True or (args.get('listName') and str(args['listName']).strip().casefold()!=str(resolved['listName']).strip().casefold()):
+            return None
+        key='liveListId'
         if args.get(key) and args[key]!=target:raise ValueError('requested list differs from replied card')
         args[key]=target
         namekey='targetListName' if key=='targetLiveListId' else 'listName'
