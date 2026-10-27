@@ -73,3 +73,10 @@ def test_named_add_destination_wins_over_replied_card(monkeypatch):
         args={'telegramUserId':'42','listName':'Для дома'}
         assert _bind_shopping_reply_target('health-actions','add-shopping-items',args) is None
         assert args=={'telegramUserId':'42','listName':'Для дома'}
+
+
+def test_generic_shopping_request_is_not_mistaken_for_a_named_list():
+    from tools.mcp_tool import _guard_explicit_shopping_destination
+    tokens=set_session_vars(platform='telegram',user_request='Добавь молоко в список покупок и хлеб')
+    try:assert _guard_explicit_shopping_destination('health-actions','add-shopping-items',{}) is None
+    finally:clear_session_vars(tokens)

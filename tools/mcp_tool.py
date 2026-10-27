@@ -3284,10 +3284,16 @@ def _guard_explicit_shopping_destination(server_name, tool_name, args):
     # This is only a constraint from the authenticated current request, never
     # an inferred destination or permission from quoted/forwarded material.
     request = re.sub(r"(?m)^\s*>[^\n]*$", "", request)
-    match = re.search(r"(?i)\bв\s+список\s+(?:покупок\s+)?([^\n.!?]+)", request)
+    match = re.search(r"(?i)\bв\s+список\s+([^\n.!?]+)", request)
     if not match:
         return None
-    candidate = match.group(1).strip().strip('«»"“” ,:;')
+    candidate = match.group(1).strip()
+    if candidate.casefold().startswith('покупок '):
+        remainder = candidate[len('покупок '):].lstrip()
+        if not remainder.startswith(('«', '"', '“')):
+            return None
+        candidate = remainder
+    candidate = candidate.strip('«»"“” ,:;')
     if candidate.casefold() in {"покупок", "продуктов", "пожалуйста"} or not candidate:
         return None
     name = str(args.get("listName") or "").strip()
