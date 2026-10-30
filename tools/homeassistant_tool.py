@@ -89,6 +89,8 @@ def _filter_and_summarize(
             s for s in states
             if area_lower in (s.get("attributes", {}).get("friendly_name", "") or "").lower()
             or area_lower in (s.get("attributes", {}).get("area", "") or "").lower()
+            or area_lower in {a.casefold() for a in s.get('logical_areas', [])}
+            or area_lower == (s.get('physical_area') or '').casefold()
         ]
 
     entities = []
@@ -97,6 +99,7 @@ def _filter_and_summarize(
             "entity_id": s["entity_id"],
             "state": s["state"],
             "friendly_name": s.get("attributes", {}).get("friendly_name", ""),
+            **{k:s[k] for k in ('physical_area','logical_areas','canonical_group','shared_scope_source','scope_blocked') if k in s},
         })
 
     return {"count": len(entities), "entities": entities}
@@ -115,8 +118,33 @@ async def _async_list_entities(
         async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
             resp.raise_for_status()
             states = await resp.json()
+        async with asyncio.timeout(15):
+            metadata=await _async_scope_metadata(session,hass_url,hass_token,states)
+        states=[{**state,**metadata.get(state['entity_id'],{})} for state in states]
 
     return _filter_and_summarize(states, domain, area)
+
+
+async def _async_scope_metadata(session, hass_url, hass_token, states):
+    from tools.ha_shared_scope import label_registry, resolve
+    async with session.ws_connect(hass_url.replace('http','ws',1)+'/api/websocket') as ws:
+        await ws.receive_json()
+        await ws.send_json({'type':'auth','access_token':hass_token})
+        if (await ws.receive_json()).get('type') != 'auth_ok':
+            raise ValueError('HA authentication failed')
+        async def registry(identifier, kind):
+            await ws.send_json({'id':identifier,'type':kind})
+            while True:
+                value=await ws.receive_json()
+                if value.get('id')==identifier:
+                    if not value.get('success'):raise ValueError('HA registry unavailable')
+                    return value['result']
+        areas=await registry(1,'config/area_registry/list')
+        entities=await registry(2,'config/entity_registry/list')
+        devices=await registry(3,'config/device_registry/list')
+        labels=await label_registry(ws)
+    metadata=resolve(areas,entities,devices,states,labels)
+    return metadata
 
 
 async def _async_get_state(entity_id: str) -> Dict[str, Any]:
@@ -129,8 +157,16 @@ async def _async_get_state(entity_id: str) -> Dict[str, Any]:
         async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
             data = await resp.json()
+        metadata={}
+        if entity_id.startswith('cover.'):
+            async with session.get(hass_url+'/api/states',headers=_get_headers(hass_token),timeout=aiohttp.ClientTimeout(total=15)) as response:
+                response.raise_for_status()
+                states=await response.json()
+            async with asyncio.timeout(15):
+                metadata=(await _async_scope_metadata(session,hass_url,hass_token,states)).get(entity_id,{})
 
     return {
+        **metadata,
         "entity_id": data["entity_id"],
         "state": data["state"],
         "attributes": data.get("attributes", {}),
