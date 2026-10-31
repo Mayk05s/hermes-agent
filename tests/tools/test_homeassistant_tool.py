@@ -516,3 +516,15 @@ class TestRegistration:
         invalidate_check_fn_cache()
         defs = registry.get_definitions({"ha_list_entities", "ha_get_state", "ha_call_service"})
         assert len(defs) == 3
+
+
+class TestHomeToolsResponse:
+    def test_receipt_is_returned(self):
+        result = _parse_service_response(
+            "home_tools", "submit", {"changed_states": [], "service_response": {"receipt": {"state": "accepted"}}}
+        )
+        assert result["response"]["receipt"]["state"] == "accepted"
+
+    def test_other_domains_keep_changed_entities(self):
+        result = _parse_service_response("light", "turn_on", [{"entity_id": "light.a", "state": "on"}])
+        assert result["affected_entities"] == [{"entity_id": "light.a", "state": "on"}]

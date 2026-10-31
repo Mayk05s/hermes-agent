@@ -195,6 +195,13 @@ def _parse_service_response(
     result: Any,
 ) -> Dict[str, Any]:
     """Parse HA service call response into a structured result."""
+    if domain == "home_tools" and isinstance(result, dict):
+        return {
+            "success": True,
+            "service": f"{domain}.{service}",
+            "response": result.get("service_response"),
+        }
+
     affected = []
     if isinstance(result, list):
         for s in result:
@@ -221,6 +228,9 @@ async def _async_call_service(
 
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/services/{domain}/{service}"
+    # home_tools actions answer with a receipt; HA returns 400 for ?return_response on most others.
+    if domain == "home_tools":
+        url += "?return_response"
     payload = _build_service_payload(entity_id, data)
 
     async with aiohttp.ClientSession() as session:
@@ -464,7 +474,14 @@ HA_CALL_SERVICE_SCHEMA = {
     "name": "ha_call_service",
     "description": (
         "Call a Home Assistant service to control a device. Use ha_list_services "
-        "to discover available services and their parameters for each domain."
+        "to discover available services and their parameters for each domain. "
+        "To change a device, go through HA's own command path: call home_tools.template_match "
+        "with data {text}; if coverage is full, call home_tools.submit with data {request: "
+        "{request_id, idempotency_key, inventory_revision, source: 'telegram', steps}} using the "
+        "returned steps and inventory_revision; otherwise take them from home_tools.inventory. "
+        "state=accepted means queued, not done; read home_tools.queue_status for the outcome. "
+        "Call light, cover or switch services directly only for diagnostics or when home_tools "
+        "does not cover the device."
     ),
     "parameters": {
         "type": "object",
