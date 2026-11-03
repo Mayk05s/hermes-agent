@@ -232,7 +232,9 @@ def _messages(scope, ids=None, limit=60):
                        "missing_media": not media and str(row["message_type"]) in {"photo", "image", "video", "audio", "voice", "document", "animation"},
                        "url": f"https://t.me/c/{chat.removeprefix('-100')}/{mid}"})
     if ids is not None and set(ids) != seen:
-        raise ValueError("Source messages unavailable in this exact chat/topic/profile")
+        missing = sorted(set(ids)-seen, key=int)
+        available = sorted(seen, key=int)
+        raise ValueError(f"Source messages unavailable in this exact chat/topic/profile. Missing IDs: {', '.join(missing)}; available selected IDs: {', '.join(available) or 'none'}. Use sources to find original user message IDs; bot transcription replies have different IDs.")
     return sorted(result, key=lambda x: (x["created_at"], int(x["message_id"])))
 
 
@@ -286,13 +288,36 @@ class GitHub:
             "GH_HOST", "GH_DEBUG", "GH_FORCE_TTY"}}
         env["GH_CONFIG_DIR"] = str(_root().parent / ".config/gh")
         env["GH_PROMPT_DISABLED"] = "1"
-        completed = subprocess.run(command, input=None if payload is None else json.dumps(payload),
-                                   text=True, capture_output=True, timeout=60, env=env, check=False)
-        match = re.match(r"HTTP/\S+\s+(\d{3})", completed.stdout)
-        status = int(match.group(1)) if match else 0
+        # Reads (including attachment read-back) are safe to repeat after a
+        # dropped connection. Never replay writes: an EOF may follow a saved
+        # issue and repeating POST would create a duplicate.
+        attempts = 3 if method == "GET" else 1
+        for attempt in range(attempts):
+            try:
+                completed = subprocess.run(command, input=None if payload is None else json.dumps(payload),
+                                           text=True, capture_output=True, timeout=60, env=env, check=False)
+            except subprocess.TimeoutExpired:
+                if attempt + 1 < attempts:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise ValueError("GitHub connection timed out; read the existing issue before retrying a write") from None
+            match = re.match(r"HTTP/\S+\s+(\d{3})", completed.stdout)
+            status = int(match.group(1)) if match else 0
+            transport_failure = status == 0 and bool(re.search(
+                r"\bEOF\b|connection reset|connection refused|TLS handshake timeout|"
+                r"i/o timeout|context deadline exceeded|temporary failure in name resolution|"
+                r"no such host|network is unreachable|unexpected end of JSON input",
+                completed.stderr or "", re.I))
+            if attempt + 1 < attempts and (transport_failure or status in {502, 503, 504}):
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            break
         if status == 404 and missing_ok:
             return None
         if completed.returncode or not 200 <= status < 300:
+            if transport_failure:
+                detail = "after 3 read attempts" if method == "GET" else "write outcome uncertain; read the existing issue before retrying"
+                raise ValueError(f"GitHub connection interrupted ({detail})")
             raise ValueError(f"Server GitHub CLI returned HTTP {status or 'unknown'} for this repository operation")
         _, separator, body = completed.stdout.partition("\n\n")
         if not separator:

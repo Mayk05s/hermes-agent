@@ -451,3 +451,75 @@ def test_specialist_runs_through_agent_dispatch(source, monkeypatch, mode):
     assert task["specialist"] == "github_issues"
     assert task["toolsets"] == ["github-issues", "vision"]
     assert "Создай ишью" in task["context"]
+
+
+def _cli_transport(monkeypatch, responses):
+    api = object.__new__(intake.GitHub)
+    api.cli, api.repo = '/usr/bin/gh', 'Mayk05s/LessonPilot'
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    monkeypatch.setattr(intake.subprocess, 'run', run)
+    monkeypatch.setattr(intake.time, 'sleep', lambda _: None)
+    return api, calls
+
+
+def _http(status, body):
+    return SimpleNamespace(returncode=0 if status < 400 else 1,
+                           stdout=f'HTTP/2.0 {status} Response\n\n'+json.dumps(body), stderr='')
+
+
+def test_upload_survives_eof_during_readback_without_repeating_write(source, monkeypatch):
+    _add_screens(source)
+    files = intake._attachments(intake._draft(args(), intake._scope('lessonpilot')))[:1]
+    content = files[0]['content']
+    sha = hashlib.sha1(b'blob '+str(len(content)).encode()+b'\0'+content).hexdigest()
+    api, calls = _cli_transport(monkeypatch, iter([
+        _http(200, {'object': {'sha': 'existing-branch'}}),
+        _http(404, {'message': 'Not Found'}),
+        _http(201, {'content': {'sha': sha}}),
+        SimpleNamespace(returncode=1, stdout='', stderr='Get "https://api.github.com/...": EOF'),
+        _http(200, {'sha': sha}),
+    ]))
+    result = intake._upload(api, files)
+    assert len(result) == 1
+    assert sum(command[command.index('--method')+1] == 'PUT' for command in calls) == 1
+    assert calls[-2] == calls[-1]
+
+
+@pytest.mark.parametrize('failure', [
+    SimpleNamespace(returncode=1, stdout='', stderr='unexpected EOF'),
+    _http(503, {'message': 'unavailable'}),
+    intake.subprocess.TimeoutExpired('gh', 60),
+])
+def test_cli_read_transient_failure_retries_are_bounded(source, monkeypatch, failure):
+    api, calls = _cli_transport(monkeypatch, iter([failure]*3))
+    with pytest.raises(ValueError):
+        api.call('GET', 'issues/56')
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize('method', ['POST', 'PATCH', 'PUT'])
+def test_cli_never_replays_an_uncertain_write(source, monkeypatch, method):
+    failure = SimpleNamespace(returncode=1, stdout='', stderr='unexpected EOF sensitive-debug-data')
+    api, calls = _cli_transport(monkeypatch, iter([failure]))
+    with pytest.raises(ValueError, match='write outcome uncertain') as error:
+        api.call(method, 'issues', {'body': 'feedback'})
+    assert len(calls) == 1
+    assert 'sensitive-debug-data' not in str(error.value)
+
+
+@pytest.mark.parametrize('failure', [
+    _http(401, {'message': 'Bad credentials'}),
+    _http(403, {'message': 'Forbidden'}),
+    SimpleNamespace(returncode=1, stdout='', stderr='authentication required'),
+])
+def test_cli_does_not_retry_auth_errors(source, monkeypatch, failure):
+    api, calls = _cli_transport(monkeypatch, iter([failure]))
+    with pytest.raises(ValueError):
+        api.call('GET', 'issues')
+    assert len(calls) == 1
