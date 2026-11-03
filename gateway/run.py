@@ -9284,6 +9284,11 @@ class GatewayRunner:
             self._profile_pairing_stores = stores
         if profile in stores:
             return stores[profile]
+        from hermes_cli.profiles import _PROFILE_ID_RE
+        if not _PROFILE_ID_RE.match(profile):
+            # Never build a directory from an unvalidated name (a mock repr or
+            # "../x" would create a stray dir or escape profiles/). Fail closed.
+            raise ValueError(f"Invalid profile name for pairing store: {profile!r}")
         profile_home = get_default_hermes_root() / "profiles" / profile
         store = PairingStore(hermes_home=profile_home)
         stores[profile] = store
