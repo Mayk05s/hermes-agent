@@ -47,3 +47,13 @@ def test_native_generated_drawer_id_fits_bounded_semantic_surface(tool):
     assert validate_tool_arguments(tool, {'drawer_id': 'a' * 512, **extra})
     with pytest.raises(MemPalaceClientError):
         validate_tool_arguments(tool, {'drawer_id': 'a' * 513, **extra})
+
+
+@pytest.mark.parametrize('query',['батарейки ААА','батарейки AАA','батарейки AAA'])
+def test_chat_and_worker_share_identifier_normalization_in_scoped_client(query):
+    transport=RecordingTransport()
+    client=MemPalaceCapabilityClient(environ=fixture_vector()['environment'],transport=transport)
+    client.mcp_call(vector_context(),'mempalace_search',{'query':query,'limit':5},operation='read')
+    request=json.loads(transport.calls[-1]['body'])
+    assert request['params']['arguments']['query']=='батарейки AAA'
+    assert query in ['батарейки ААА','батарейки AАA','батарейки AAA']

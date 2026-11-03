@@ -230,3 +230,21 @@ def test_legacy_repair_exact_signed_plan_preserves_budget_and_is_idempotent(pipe
     assert run(pipeline, job, ctx, remote, lambda value: [fact(value, "bad-key")])["status"] == "blocked"
     assert pipeline.db.execute("SELECT count(*) FROM extraction_failures").fetchone()[0] == 3
     assert pipeline.db.execute("SELECT payload FROM jobs").fetchone()[0] == canonical(original).decode()
+
+
+def test_context_supported_fact_remains_valid_for_signed_revision(pipeline):
+    prior=evidence(context('m_prior'),'Это аккумуляторы AAA.',at=50)
+    signed(pipeline,prior)
+    ctx=context('m_current');remote=Client()
+    item=evidence(ctx,'Они стоят в машинках сейчас.',at=100)
+    value=fact(item['text'],key='aaa.location')
+    value['context_evidence']=[{'source_ref':'m_prior','evidence':'Это аккумуляторы AAA.'}]
+    original=signed(pipeline,item)
+    from plugins.memory.mempalace.fact_context import ContextArchive
+    row=pipeline.db.execute('SELECT * FROM jobs WHERE id=?',(original['job_id'],)).fetchone()
+    archive=ContextArchive(pipeline,row,item,lambda _:None)
+    archive.lookup({'kind':'history_search','query':'AAA'})
+    assert run(pipeline,original,ctx,remote,lambda _:[value])['committed']
+    revised=signed(pipeline,evidence(ctx,item['text'],at=200))
+    assert run(pipeline,revised,ctx,remote,lambda _:pytest.fail('source-supported output is reusable'))['committed']
+    assert 'Это аккумуляторы AAA.' in next(iter(remote.pages.values()))

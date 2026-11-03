@@ -180,3 +180,80 @@ def test_tampered_ledger_does_not_suppress_write(pipeline):
     receipt = pipeline.enqueue(evidence(new, "I now prefer coffee.", 2))
     result = run(pipeline, receipt, new, client, lambda text: [fact(text)])
     assert result["status"] == "blocked" and not result["committed"]
+
+
+def test_contextual_fact_keeps_current_assertion_and_exact_original_support(pipeline, monkeypatch):
+    pipeline.config['extractor']={'provider':'fixture','model':'fixture'}
+    prior = evidence(context('m_prior'), 'Это аккумуляторы ААА можно их перевозить в багаже?', at=100)
+    pipeline.enqueue(prior)
+    ctx = context('m_now')
+    current = evidence(ctx, 'Они в машинках стоят сейчас, по три в каждой.', at=120)
+    receipt = pipeline.enqueue(current)
+    seen = []
+    def llm(**kwargs):
+        packet = json.loads(kwargs['messages'][-1]['content'])
+        if 'context_lookup_result' not in packet:
+            output={'context_lookup':{'kind':'history_search','query':'аккумуляторы','offset':0}}
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(output),tool_calls=[]))])
+        seen.append(packet['context_lookup_result'])
+        output = {'facts':[{'key':'aaa.location','text':'invented paraphrase is ignored',
+            'evidence':current['text'],'action':'set',
+            'context_evidence':[{'source_ref':'m_prior','evidence':'Это аккумуляторы ААА'}]}]}
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(output),tool_calls=[]))])
+    monkeypatch.setattr('agent.auxiliary_client.call_llm', llm)
+    client = Client()
+    result = pipeline.process_one(receipt['job_id'], route_resolver=lambda _:SimpleNamespace(context=ctx),client_factory=lambda _:client)
+    assert result['committed'] and result['facts'] == 1
+    assert seen[0]['entries'][0]['source_ref']=='m_prior'
+    assert seen[0]['entries'][0]['text']==prior['text']
+    saved = next(iter(client.pages.values()))
+    assert 'Они в машинках стоят сейчас' in saved and 'Это аккумуляторы ААА' in saved
+    assert 'invented paraphrase' not in saved
+
+
+def test_archive_has_no_age_cutoff_and_excludes_foreign_destination_and_future(pipeline):
+    from plugins.memory.mempalace.fact_context import ContextArchive
+    for ctx,text,at in [
+        (context('m_ok'),'Это аккумуляторы ААА.',100),
+        (context('m_other',actor='a_bob'),'Same shared conversation participant.',101),
+        (context('m_elsewhere',wing='group.telegram.c_other.root.shared'),'OTHER_CHAT',102),
+        (context('m_future'),'FUTURE',9000001),
+        (context('m_old'),'Very old original assertion.',1),
+    ]:pipeline.enqueue(evidence(ctx,text,at=at))
+    current=evidence(context('m_current'),'Они в машинках стоят сейчас.',at=9000000)
+    receipt=pipeline.enqueue(current)
+    row=pipeline.db.execute('SELECT * FROM jobs WHERE id=?',(receipt['job_id'],)).fetchone()
+    assert pipeline.conversation_context(row,current,lambda _:None)==[]
+    archive=ContextArchive(pipeline,row,current,lambda _:None)
+    result=archive.lookup({'kind':'history_page','offset':0})
+    refs={r['source_ref'] for r in result['entries']}
+    assert refs=={'m_ok','m_other','m_old'}
+    assert pipeline.conversation_context(pipeline.db.execute('SELECT * FROM jobs WHERE id=?',(receipt['job_id'],)).fetchone(),current,lambda _:None)
+
+
+@pytest.mark.parametrize('support',[
+    {'source_ref':'m_other','evidence':'Это аккумуляторы ААА'},
+    {'source_ref':'m_prior','evidence':'Это батарейки AA'},
+])
+def test_contextual_fact_rejects_fabricated_or_foreign_support(support):
+    item=fact('Они в машинках стоят сейчас.',key='aaa.location')
+    item['context_evidence']=[support]
+    with pytest.raises(ValueError):
+        FactOutbox.validate_facts({'facts':[item]},item['evidence'],context=[{'source_ref':'m_prior','text':'Это аккумуляторы ААА.'}])
+
+
+def test_context_selection_is_sealed_and_stable_after_late_arrival(pipeline):
+    pipeline.enqueue(evidence(context('m_first'),'Аккумуляторы ААА.',at=100))
+    current=evidence(context('m_current'),'Они стоят в машинках.',at=200)
+    receipt=pipeline.enqueue(current)
+    def row():return pipeline.db.execute('SELECT * FROM jobs WHERE id=?',(receipt['job_id'],)).fetchone()
+    from plugins.memory.mempalace.fact_context import ContextArchive
+    archive=ContextArchive(pipeline,row(),current,lambda _:None)
+    archive.lookup({'kind':'history_search','query':'ААА'})
+    first=pipeline.conversation_context(row(),current,lambda _:None)
+    assert first
+    pipeline.enqueue(evidence(context('m_late'),'Неподходящий новый контекст.',at=150))
+    assert pipeline.conversation_context(row(),current,lambda _:None) == first
+    with pipeline.db:pipeline.db.execute('UPDATE jobs SET context_jobs=? WHERE id=?',('[]',receipt['job_id']))
+    with pytest.raises(ValueError,match='tampered_context_selection'):
+        pipeline.conversation_context(row(),current,lambda _:None)

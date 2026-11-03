@@ -662,6 +662,9 @@ class MemPalaceCapabilityClient:
         *,
         operation: str,
     ) -> Any:
+        if remote_tool in {'query','mempalace_search'} and isinstance(arguments.get('query'),str):
+            from .query_text import normalize_identifiers
+            arguments={**arguments,'query':normalize_identifiers(arguments['query'])}
         rpc_id = self._rpc_id_factory()
         body = canonical_json_bytes(
             {
