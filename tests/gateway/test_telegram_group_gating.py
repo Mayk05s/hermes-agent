@@ -607,6 +607,52 @@ def test_observed_group_context_preserves_media_paths():
     )
 
 
+def test_passive_photo_enters_durable_sources_without_starting_agent(tmp_path, monkeypatch):
+    import dataclasses
+    import sqlite3
+    from gateway.durable_jobs import DurableJobStore
+    class Runner:
+        def __init__(self):
+            self._durable_job_store = DurableJobStore(tmp_path / "jobs.sqlite3")
+        def _source_with_profile_scope(self, source):
+            return dataclasses.replace(source, profile_name="family-chat", scope_name="english")
+        async def _handle_message(self, event):
+            raise AssertionError("Passive observation must not dispatch an agent")
+    runner = Runner()
+    adapter = _make_adapter(require_mention=True, observe_unmentioned_group_messages=True)
+    adapter._message_handler = runner._handle_message
+    store = _FakeSessionStore()
+    adapter._session_store = store
+    event = adapter._build_message_event(_group_message("Screenshot caption", chat_id=-1003966683704, thread_id=796), MessageType.PHOTO, update_id=1005)
+    event.media_urls = [str(tmp_path / "image.jpg")]
+    event.media_types = ["image/jpeg"]
+    adapter._observe_unmentioned_group_event(event)
+    adapter._observe_unmentioned_group_event(event)
+    with sqlite3.connect(tmp_path / "jobs.sqlite3") as db:
+        rows = db.execute("SELECT source_json,request_message_id,request_text,media_json,status FROM gateway_inbox_events").fetchall()
+        assert len(rows) == 1
+        source, mid, text, media, status = rows[0]
+        origin = json.loads(source)
+        assert origin["profile_name"] == "family-chat"
+        assert str(origin["chat_id"]) == "-1003966683704"
+        assert str(origin["thread_id"]) == "796"
+        assert mid == str(event.message_id) and text == "Screenshot caption"
+        assert json.loads(media) == [{"path": event.media_urls[0], "type": "image/jpeg"}]
+        assert status == "context_only"
+        assert db.execute("SELECT count(*) FROM gateway_jobs").fetchone()[0] == 0
+    assert len(store.messages) == 2
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import github_issue_intake_tool as intake
+    monkeypatch.setattr(intake, "_db_path", lambda: tmp_path / "jobs.sqlite3")
+    tokens = set_session_vars(platform="telegram", profile_name="family-chat", chat_id="-1003966683704", thread_id="796")
+    try:
+        result = json.loads(intake.github_issue_intake({"project": "lessonpilot", "action": "sources", "message_ids": [str(event.message_id)]}))
+        assert result["success"]
+        assert result["messages"][0]["media"] == [{"path": event.media_urls[0], "type": "image/jpeg"}]
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_unmentioned_group_photo_is_observed_once_without_dispatch(monkeypatch):
     async def _run():
         adapter = _make_adapter(
@@ -660,6 +706,7 @@ def test_unmentioned_group_photo_is_observed_once_without_dispatch(monkeypatch):
 
 class _FakeSessionEntry:
     session_id = "telegram-group-session"
+    session_key = "telegram-group-session-key"
 
 
 class _FakeSessionStore:

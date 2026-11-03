@@ -6895,6 +6895,30 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             shared_source = self._telegram_group_observe_shared_source(event.source)
             session_entry = store.get_or_create_session(shared_source)
+            # Passive photos never enter handle_message(), but issue intake
+            # needs their original IDs and structured media, not paths parsed
+            # out of model-visible transcript text. Persist context only: no
+            # agent job, response or memory action is triggered here.
+            inbox_store = getattr(runner, "_durable_job_store", None)
+            if inbox_store is not None and event.message_id:
+                media_urls = list(getattr(event, "media_urls", None) or [])
+                media_types = list(getattr(event, "media_types", None) or [])
+                try:
+                    inbox_store.ingest_event(
+                        thread_key=session_entry.session_key,
+                        platform="telegram",
+                        source=dataclasses.replace(shared_source, user_id=event.source.user_id, user_name=event.source.user_name),
+                        request_text=event.text or "",
+                        message_id=str(event.message_id),
+                        platform_update_id=getattr(event, "platform_update_id", None),
+                        reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                        message_type=str(getattr(event.message_type, "value", "text")),
+                        media=[{"path": str(path), "type": str(media_types[index] if index < len(media_types) else "")} for index, path in enumerate(media_urls)],
+                        event_metadata={"observed_only": True},
+                        context_only=True,
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] Passive Telegram inbox persistence failed: %s", getattr(self, "name", "telegram"), type(exc).__name__)
             entry = {
                 "role": "user",
                 "content": self._telegram_group_observe_attributed_text(event),
