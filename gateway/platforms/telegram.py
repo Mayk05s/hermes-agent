@@ -104,8 +104,10 @@ from gateway.platforms.telegram_network import (
 )
 from utils import atomic_replace, is_truthy_value
 
-_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
+    "image/heic": ".heic",
+    "image/heif": ".heif",
     "image/png": ".png",
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
@@ -113,6 +115,8 @@ _TELEGRAM_IMAGE_MIME_TO_EXT = {
     "image/gif": ".gif",
 }
 _TELEGRAM_IMAGE_EXT_TO_MIME = {
+    ".heic": "image/heic",
+    ".heif": "image/heif",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -7629,6 +7633,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     mime = _TELEGRAM_IMAGE_EXT_TO_MIME.get(candidate, mime)
                     break
             cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+            if cached_path.lower().endswith(".jpg"):
+                mime = "image/jpeg"
         except Exception as exc:
             logger.warning(
                 "[Telegram] Failed to cache replied-to image: %s",
@@ -8214,7 +8220,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     event.message_type = MessageType.PHOTO
                     event.media_urls = [cached_path]
-                    event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
+                    event.media_types = ["image/jpeg" if image_ext in {".heic", ".heif"} else doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
                     if not should_process:

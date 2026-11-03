@@ -71,6 +71,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# iPhone photo decoder for gateway attachments and vision.
+heif = ["pillow-heif==1.8.1"]
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.86.0"]

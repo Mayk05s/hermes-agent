@@ -735,6 +735,9 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
         ValueError: If *data* does not look like a valid image (e.g. an HTML
             error page returned by the upstream server).
     """
+    # iPhone originals are HEIF containers; normalize pixels before provider use.
+    from tools.image_formats import normalize_heif
+    data, ext = normalize_heif(data, ext)
     if not _looks_like_image(data):
         snippet = data[:80].decode("utf-8", errors="replace")
         raise ValueError(

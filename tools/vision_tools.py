@@ -298,6 +298,10 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
     """
     # Read the image as bytes
     data = image_path.read_bytes()
+    from tools.image_formats import normalize_heif
+    data, normalized_ext = normalize_heif(data, image_path.suffix.lower())
+    if normalized_ext == ".jpg" and image_path.suffix.lower() in {".heic", ".heif"}:
+        mime_type = "image/jpeg"
     
     # Encode to base64
     encoded = base64.b64encode(data).decode("ascii")
