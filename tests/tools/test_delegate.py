@@ -3145,3 +3145,17 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_nutrition_delegation_refreshes_late_attached_request(tmp_path):
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools.delegate_tool import _current_participant_nutrition_request
+    (tmp_path / "gateway_jobs.sqlite3").touch()
+    tokens = set_session_vars(platform="telegram", chat_id="-5526305849", requester_user_id="5482704149", profile_name="hudeem-tripio", job_id="current-job", participant_request_context="Рецепт")
+    try:
+        with patch("hermes_constants.get_default_hermes_root", return_value=tmp_path), patch("gateway.durable_jobs.DurableJobStore") as Store:
+            Store.return_value.trusted_participant_request_context.return_value = "Рецепт; перекус 130 г"
+            assert "130 г" in _current_participant_nutrition_request()
+            assert Store.return_value.trusted_participant_request_context.call_args.kwargs == dict(job_id="current-job", platform="telegram", chat_id="-5526305849", user_id="5482704149", profile_name="hudeem-tripio")
+    finally:
+        clear_session_vars(tokens)

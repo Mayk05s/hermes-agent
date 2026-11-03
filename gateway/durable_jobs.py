@@ -610,7 +610,7 @@ class DurableJobStore:
                    AND COALESCE(json_extract(source_json, '$.chat_id'), '') = ?
                    AND COALESCE(json_extract(source_json, '$.user_id'), '') = ?
                    AND COALESCE(json_extract(source_json, '$.profile_name'), '') = ?
-                   AND created_at <= ?
+                   AND (created_at <= ? OR job_id = ?)
                    AND created_at >= ?
                  ORDER BY created_at DESC
                  LIMIT ?
@@ -621,6 +621,7 @@ class DurableJobStore:
                     resolved_user_id,
                     resolved_profile,
                     current_created_at,
+                    resolved_job_id,
                     current_created_at - max(0.0, float(window_seconds)),
                     max(1, min(int(limit), 20)),
                 ),

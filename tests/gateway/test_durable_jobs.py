@@ -1321,3 +1321,25 @@ async def test_stop_cancels_all_parallel_jobs_in_public_thread(tmp_path):
     assert all(store.get(job["job_id"])["status"] == "cancelled" for job in jobs)
     assert all(job["session_key"] not in runner._running_agents for job in jobs)
     assert all(agent.interrupt.called for agent in agents)
+
+
+def test_participant_context_includes_later_attached_input_but_not_other_jobs_or_people(tmp_path):
+    import json
+    store = DurableJobStore(tmp_path / "gateway_jobs.sqlite3")
+    job, _ = _new_job(store)
+    created = job["created_at"]
+    with store._connect() as conn:
+        for i, (text, user, target, offset) in enumerate([
+            ("Рецепт пирога", "5482704149", job["job_id"], -1),
+            ("Перекус 130 г", "5482704149", job["job_id"], 60),
+            ("Чужая еда", "5103932194", job["job_id"], 61),
+            ("Следующая независимая задача", "5482704149", "other-job", 62),
+        ]):
+            source = json.dumps({"chat_id": "-5526305849", "user_id": user, "profile_name": "hudeem-tripio"})
+            conn.execute("INSERT INTO gateway_inbox_events (event_id,thread_key,platform,source_json,request_text,job_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                         (str(i), "thread", "telegram", source, text, target, created + offset, created + offset))
+    context = store.trusted_participant_request_context(job_id=job["job_id"], platform="telegram", chat_id="-5526305849", user_id="5482704149", profile_name="hudeem-tripio")
+    assert "Рецепт пирога" in context
+    assert "Перекус 130 г" in context
+    assert "Чужая еда" not in context
+    assert "Следующая независимая задача" not in context

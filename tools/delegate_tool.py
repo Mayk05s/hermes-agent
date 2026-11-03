@@ -736,6 +736,26 @@ def _current_participant_nutrition_request() -> Optional[str]:
         from gateway.session_context import get_session_env
     except Exception:
         return None
+    # Steering can attach another participant message after the turn's context
+    # snapshot. Re-read only gateway-attributed inputs for this exact job/user.
+    job_id = get_session_env("HERMES_JOB_ID", "")
+    if job_id:
+        try:
+            from gateway.durable_jobs import DurableJobStore
+            from hermes_constants import get_default_hermes_root
+            db_path = get_default_hermes_root() / "gateway_jobs.sqlite3"
+            if db_path.is_file():
+                fresh = DurableJobStore(db_path).trusted_participant_request_context(
+                    job_id=job_id,
+                    platform=get_session_env("HERMES_SESSION_PLATFORM", ""),
+                    chat_id=get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                    user_id=get_session_env("HERMES_SESSION_REQUESTER_USER_ID", ""),
+                    profile_name=get_session_env("HERMES_SESSION_PROFILE_NAME", ""),
+                )
+                if fresh:
+                    return fresh
+        except Exception:
+            logger.debug("Could not refresh trusted nutrition request", exc_info=True)
     request = (
         get_session_env("HERMES_SESSION_PARTICIPANT_REQUEST_CONTEXT", "")
         or get_session_env("HERMES_SESSION_USER_REQUEST", "")
@@ -911,9 +931,11 @@ def _apply_specialist_contract(
                 "history and the food journal independently; an already saved meal does "
                 "not prove the accompanying weight was saved. Report any unfinished "
                 "part explicitly instead of returning overall success. "
-                "After dinner or a day review, include a brief "
-                "whole-day interpretation and one useful next step grounded in verified "
-                "data and preferences. A correction or thanks does not need another tip. "
+                "For ordinary food, weight or activity logging (including dinner), "
+                "only confirm verified saves with details inside one expandable Telegram "
+                "blockquote; no unsolicited advice or wellbeing question. Daily advice "
+                "is delivered separately. For an explicit advice or day-review request, "
+                "give one concrete step in at most three short sentences. "
                 "Read participant coaching state and scoped memory before personal advice; "
                 "respect unanswered questions and activity opt-outs."
             )
