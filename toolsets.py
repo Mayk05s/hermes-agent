@@ -220,6 +220,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "station-intercom": {
+        "description": "Family Telegram questions and replies through Alice",
+        "tools": ["station_intercom"],
+        "includes": []
+    },
+
     "credential-vault": {
         "description": "Encrypted account storage scoped to verified users and destinations",
         "tools": ["credential_vault"],

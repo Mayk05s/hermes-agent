@@ -4373,6 +4373,28 @@ class GatewayRunner:
             )
             return True  # handled (silently dropped); do not fall through
 
+        if not getattr(event, 'internal', False) and not event.is_command():
+            from gateway.station_intercom import handle_telegram
+            _intercom_reply = await handle_telegram(event)
+            if _intercom_reply is not None:
+                adapter = self.adapters.get(event.source.platform)
+                if adapter:
+                    await adapter.send(event.source.chat_id, _intercom_reply,
+                                       reply_to=event.message_id,
+                                       metadata=self._thread_metadata_for_source(event.source, event.message_id))
+                return True
+
+        # Engineering replies also bypass a currently busy general-purpose agent.
+        if not getattr(event, 'internal', False) and not event.is_command():
+            from gateway.station_engineering_reply import forward_reply, EngineeringReplyError
+            try:
+                if await asyncio.to_thread(forward_reply, event):
+                    logger.info("Station engineering reply forwarded on busy path: message=%s", event.message_id)
+                    return True
+            except EngineeringReplyError:
+                logger.exception("Engineering reply retained; general-agent fallback blocked")
+                return True
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             routed_source = self._source_with_profile_scope(event.source)
@@ -10396,6 +10418,25 @@ class GatewayRunner:
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # Explicit family intercom requests bypass the general-purpose agent.
+        if not is_internal and not event.is_command():
+            from gateway.station_intercom import handle_telegram
+            _intercom_reply = await handle_telegram(event)
+            if _intercom_reply is not None:
+                return _intercom_reply
+
+        # Authenticated replies to engineering questions resume their durable job.
+        # They must never create a general-purpose agent allowed to edit production.
+        if not is_internal and not event.is_command():
+            from gateway.station_engineering_reply import forward_reply, EngineeringReplyError
+            try:
+                if await asyncio.to_thread(forward_reply, event):
+                    logger.info("Station engineering reply forwarded: message=%s", event.message_id)
+                    return None
+            except EngineeringReplyError:
+                logger.exception("Station engineering reply delivery failed; refusing general-agent fallback")
+                return "Не удалось передать ответ инженеру. Обычный агент не запущен; ответ сохранён в Telegram."
+
         # A configured notification-only Telegram topic can hand substantial
         # work to a dedicated work topic before we choose the session key.
         # Routing this early keeps the durable job, running-agent lock,
