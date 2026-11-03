@@ -1,0 +1,5 @@
+name: antigravity
+version: 1.0.0
+description: "Native Antigravity image generation and reference editing via an authenticated local agy-image helper."
+author: Hermes local
+kind: backend

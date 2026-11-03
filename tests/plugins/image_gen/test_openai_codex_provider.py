@@ -35,6 +35,7 @@ def _b64_png() -> str:
 @pytest.fixture(autouse=True)
 def _tmp_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("model:\n  default: gpt-6.1-sol\n")
     yield tmp_path
 
 
@@ -66,6 +67,31 @@ class TestMetadata:
         schema = provider.get_setup_schema()
         assert schema["env_vars"] == []
         assert schema["badge"] == "free"
+
+
+@pytest.mark.parametrize("model", [{"default": "gpt-6.1-sol"}, "gpt-6-sol"])
+def test_host_model_comes_from_active_config(monkeypatch, model):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"model": model})
+    payload = codex_plugin._build_responses_payload(prompt="a cat", size="1024x1024", quality="low")
+    assert payload["model"] == (model["default"] if isinstance(model, dict) else model)
+
+
+def test_host_model_tracks_profile_and_config_changes(tmp_path, monkeypatch):
+    for name, model in [("first", "gpt-6.1-sol"), ("second", "gpt-6-sol")]:
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(f"model:\n  default: {model}\n")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert codex_plugin._resolve_chat_model() == model
+    (home / "config.yaml").write_text("model:\n  default: gpt-6.1-sol\n")
+    assert codex_plugin._resolve_chat_model() == "gpt-6.1-sol"
+
+
+@pytest.mark.parametrize("model", [None, {}, {"default": " "}])
+def test_missing_host_model_fails_without_hidden_fallback(monkeypatch, model):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"model": model})
+    with pytest.raises(ValueError, match="model.default"):
+        codex_plugin._resolve_chat_model()
 
 
 # ── Availability ────────────────────────────────────────────────────────────
@@ -126,6 +152,9 @@ class TestGenerate:
 
     def test_codex_stream_request_shape(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+            "model": {"default": "gpt-6.1-sol"},
+        })
 
         captured = {}
 
@@ -142,9 +171,7 @@ class TestGenerate:
         result = provider.generate("a cat", aspect_ratio="portrait")
         assert result["success"] is True
 
-        # Regression: gpt-5.4 is rejected by the Codex ChatGPT-account
-        # endpoint before the image_generation tool can run.
-        assert captured["model"] == "gpt-5.5"
+        assert captured["model"] == "gpt-6.1-sol"
         assert captured["store"] is False
         assert captured["input"][0]["type"] == "message"
         assert captured["input"][0]["role"] == "user"

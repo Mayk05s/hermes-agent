@@ -77,7 +77,17 @@ _SIZES = {
 # Codex Responses surface used for the request. The chat model itself is only
 # the host that calls the ``image_generation`` tool; the actual image work is
 # done by ``API_MODEL``.
-_CODEX_CHAT_MODEL = "gpt-5.5"
+def _resolve_chat_model() -> str:
+    """Use the active Hermes profile's configured model for the tool host."""
+    from hermes_cli.config import load_config_readonly
+
+    model = load_config_readonly().get("model")
+    value = model.get("default") if isinstance(model, dict) else model
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Configure model.default in Hermes before generating images")
+    return value.strip()
+
+
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _CODEX_INSTRUCTIONS = (
     "You are an assistant that must fulfill image generation requests by "
@@ -279,7 +289,7 @@ def _build_responses_payload(
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     content.extend(reference_image_parts or [])
     return {
-        "model": _CODEX_CHAT_MODEL,
+        "model": _resolve_chat_model(),
         "store": False,
         "instructions": _CODEX_INSTRUCTIONS,
         "input": [{
@@ -491,13 +501,27 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         return "OpenAI (Codex auth)"
 
     def is_available(self) -> bool:
-        if not _read_codex_access_token():
-            return False
-        try:
-            import httpx  # noqa: F401
-        except ImportError:
-            return False
-        return True
+        if _read_codex_access_token():
+            try:
+                import httpx  # noqa: F401
+                return True
+            except ImportError:
+                pass
+        # Keep the tool callable when GPT credentials are unavailable but
+        # an explicitly configured fallback can handle the request.
+        from agent.image_gen_registry import get_provider
+        configured = _load_image_gen_config().get("fallback_providers", [])
+        if isinstance(configured, list):
+            for name in configured:
+                if not isinstance(name, str) or name == self.name:
+                    continue
+                try:
+                    fallback = get_provider(name)
+                    if fallback is not None and fallback.is_available():
+                        return True
+                except Exception:
+                    logger.debug("Image fallback availability check failed", exc_info=True)
+        return False
 
     def list_models(self) -> List[Dict[str, Any]]:
         return [
@@ -527,6 +551,63 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         }
 
     def generate(
+        self,
+        prompt: str,
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Try GPT first, then explicitly configured fallback image providers."""
+        try:
+            primary = self._generate_primary(prompt, aspect_ratio, **kwargs)
+        except Exception:
+            logger.warning("OpenAI image provider raised unexpectedly", exc_info=True)
+            primary = error_response(
+                error="OpenAI image generation failed unexpectedly",
+                error_type="provider_exception", provider=self.name,
+                prompt=prompt, aspect_ratio=resolve_aspect_ratio(aspect_ratio),
+            )
+        if primary.get("success") or primary.get("error_type") in {
+            "invalid_argument", "invalid_reference_image",
+        }:
+            return primary
+        configured = _load_image_gen_config().get("fallback_providers", [])
+        if not isinstance(configured, list):
+            return primary
+        from agent.image_gen_registry import get_provider
+
+        attempts = []
+        seen = {self.name}
+        for name in configured:
+            if not isinstance(name, str) or name in seen:
+                continue
+            seen.add(name)
+            fallback = get_provider(name)
+            if fallback is None:
+                attempts.append({"provider": name, "error_type": "provider_not_registered"})
+                continue
+            logger.info("Image generation fallback: %s -> %s (%s)",
+                        self.name, name, primary.get("error_type"))
+            try:
+                # Forward original references and prompt, but let each backend
+                # choose its own model instead of inheriting a GPT tier ID.
+                fallback_kwargs = {key: value for key, value in kwargs.items() if key != "model"}
+                result = fallback.generate(prompt, aspect_ratio=aspect_ratio, **fallback_kwargs)
+            except Exception:
+                logger.warning("Image fallback provider %s raised", name, exc_info=True)
+                attempts.append({"provider": name, "error_type": "provider_exception"})
+                continue
+            if isinstance(result, dict) and result.get("success") and result.get("image"):
+                return {**result, "fallback_used": True, "fallback_from": self.name,
+                        "primary_error_type": primary.get("error_type"),
+                        "primary_error": primary.get("error")}
+            attempts.append({"provider": name, "error_type": (
+                result.get("error_type", "provider_error") if isinstance(result, dict)
+                else "provider_contract")})
+        if attempts:
+            primary = {**primary, "fallback_attempts": attempts}
+        return primary
+
+    def _generate_primary(
         self,
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
