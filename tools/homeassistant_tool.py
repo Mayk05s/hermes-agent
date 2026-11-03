@@ -473,15 +473,18 @@ HA_LIST_SERVICES_SCHEMA = {
 HA_CALL_SERVICE_SCHEMA = {
     "name": "ha_call_service",
     "description": (
-        "Call a Home Assistant service to control a device. Use ha_list_services "
-        "to discover available services and their parameters for each domain. "
-        "To change a device, go through HA's own command path: call home_tools.template_match "
-        "with data {text}; if coverage is full, call home_tools.submit with data {request: "
-        "{request_id, idempotency_key, inventory_revision, source: 'telegram', steps}} using the "
-        "returned steps and inventory_revision; otherwise take them from home_tools.inventory. "
-        "state=accepted means queued, not done; read home_tools.queue_status for the outcome. "
-        "Call light, cover or switch services directly only for diagnostics or when home_tools "
-        "does not cover the device."
+        "Call HA through its shared source-authorized contract. Use Hermes' home_template_match "
+        "for existing fast rules. On missing/failed routes, start with home_tools.describe "
+        "{kind:'all'}, then a domain/device query; follow next_offset. Named modes are "
+        "complete choices, not requests for numeric speed. Explore further published HA "
+        "tools, registries or documentation if necessary; a missing item is a discovery gap, "
+        "not automatically an impossible task. Execute the complete intent through HA "
+        "submit/delivery/recovery with the original request_id and receipt. The submit payload is "
+        "{request:{request_id,idempotency_key,inventory_revision,source:'telegram',steps:[{step_id,tool,schema_version,args,depends_on:[]}]}}. "
+        "Every listed field is required; preserve the full step graph. Preserve source "
+        "permissions and protected device policy. Never resend an uncertain action under a "
+        "fresh identity. After confirmed full execution save or repair a flexible Hermes "
+        "rule with home_template_learn; accepted is not execution evidence."
     ),
     "parameters": {
         "type": "object",
@@ -564,3 +567,29 @@ registry.register(
     check_fn=_check_ha_available,
     emoji="🏠",
 )
+
+
+def _shared_home_call(name, data):
+    return _async_call_service("home_tools", name, data=data)
+
+def _handle_home_template_match(args, **kw):
+    from tools.home_templates import match
+    try:return json.dumps(_run_async(match(args["text"], _shared_home_call)), ensure_ascii=False)
+    except Exception as exc:return tool_error("Shared home template lookup failed: " + type(exc).__name__)
+
+def _handle_home_template_learn(args, **kw):
+    from tools.home_templates import learn
+    from gateway.session_context import get_session_env
+    request_id=get_session_env("HERMES_JOB_ID", "")
+    text=get_session_env("HERMES_SESSION_USER_REQUEST", "")
+    from gateway.shared_home_fast import original_command
+    text=original_command(text,get_session_env("HERMES_SESSION_REQUESTER_USER_ID", "") or get_session_env("HERMES_SESSION_USER_ID", "")) or ""
+    try:
+        value=_run_async(learn(args["proposal"],text,request_id,args.get("expected_revision",0),_shared_home_call))
+        return json.dumps({"learned":True,"result":value},ensure_ascii=False)
+    except Exception as exc:return tool_error("Shared home template not saved: " + str(exc))
+
+HOME_TEMPLATE_MATCH_SCHEMA={"name":"home_template_match","description":"Read the existing Hermes shared fast-template registry for the entire current home command. Full coverage provides an HA plan; partial or ambiguous coverage requires the agent to understand the entire request. This does not execute anything.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":False}}
+HOME_TEMPLATE_LEARN_SCHEMA={"name":"home_template_learn","description":"After confirmed COMPLETE execution, create or repair a flexible rule in the same Hermes registry used by voice. Receipt and original request identity are obtained from trusted turn context. Never learn from accepted, failed, uncertain or partial receipts. Use expected_revision when repairing an existing rule; preserve exclusions and negative examples.","parameters":{"type":"object","properties":{"proposal":{"type":"object"},"expected_revision":{"type":"integer","minimum":0}},"required":["proposal"],"additionalProperties":False}}
+for _name,_schema,_handler in [("home_template_match",HOME_TEMPLATE_MATCH_SCHEMA,_handle_home_template_match),("home_template_learn",HOME_TEMPLATE_LEARN_SCHEMA,_handle_home_template_learn)]:
+    registry.register(name=_name,toolset="homeassistant",schema=_schema,handler=_handler,check_fn=_check_ha_available,emoji="🏠")

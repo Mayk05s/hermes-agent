@@ -154,6 +154,25 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "google_calendar" in agent.valid_tool_names:
         stable_parts.append(GOOGLE_CALENDAR_TOOL_GUIDANCE)
 
+    if "ha_call_service" in agent.valid_tool_names:
+        stable_parts.append(
+            "<home_control_contract>Use Hermes' existing flexible shared templates first. "
+            "For ordinary commands home_template_match reads the SAME registry used by voice. "
+            "If a full route succeeds, do not rediscover it. If it is missing or fails, "
+            "understand the complete original intent and find an authorized solution; "
+            "absence from one description is not proof the capability does not exist. "
+            "Start with the bounded home_tools.describe contract. You may inspect tools, "
+            "registries, documentation and local configuration when needed; exploration "
+            "is allowed, not mandatory on the normal path. All device execution remains "
+            "HA-owned with the same rights, original request identity and receipts. "
+            "Do not bypass protected device policy or retry an uncertain write with a new ID. "
+            "After confirmed complete execution use home_template_learn to create or repair "
+            "a flexible rule in the existing Hermes registry. Never learn from accepted, "
+            "failed, uncertain or partial execution. An explicit advertised named mode "
+            "does not require a numeric speed clarification. Ask only for a genuine missing "
+            "choice or authorization. No second template store in HA. </home_control_contract>"
+        )
+
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
     if "memory" in agent.valid_tool_names:

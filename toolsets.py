@@ -63,7 +63,7 @@ _HERMES_CORE_TOOLS = [
     # External Google Workspace agent provider (dev/staging only, gated)
     "workspace_external_provider",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
-    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service", "home_template_match", "home_template_learn",
     # Kanban multi-agent coordination — only in schema when the agent is
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
     # profile explicitly enables the kanban toolset. Gated via check_fn in
@@ -290,7 +290,7 @@ TOOLSETS = {
 
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
-        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service", "home_template_match", "home_template_learn"],
         "includes": []
     },
 
@@ -429,7 +429,7 @@ TOOLSETS = {
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
-            "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+            "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service", "home_template_match", "home_template_learn",
 
         ],
         "includes": []
