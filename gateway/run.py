@@ -13166,7 +13166,7 @@ class GatewayRunner:
                 _miniapp_records = agent_result.get("miniapp_records")
                 if _miniapp_records is None:
                     _miniapp_records = miniapp_reply_records(agent_messages, _miniapp_offset)
-                response, _miniapp_params = apply_miniapp_reply_contract(response, _miniapp_records)
+                response, _miniapp_params = apply_miniapp_reply_contract(response, _miniapp_records, chat_id=str(source.chat_id))
                 _shopping_projected = False
                 if not agent_result.get("failed") and not agent_result.get("partial") and not agent_result.get("interrupted"):
                     try:
@@ -23883,7 +23883,7 @@ class GatewayRunner:
                     if source.platform == Platform.TELEGRAM:
                         from gateway.miniapp_reply_contract import apply_miniapp_reply_contract
                         first_response, _first_params = apply_miniapp_reply_contract(
-                            first_response, result.get("miniapp_records") or [],
+                            first_response, result.get("miniapp_records") or [], chat_id=str(source.chat_id),
                         )
                         try:
                             from gateway.shopping_message_projection import project_shopping_message

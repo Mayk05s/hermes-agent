@@ -179,7 +179,7 @@ def miniapp_reply_records(messages, history_offset: int = 0) -> list[dict]:
     return collector.snapshot()
 
 
-def miniapp_reply_params(records: list[dict]) -> list[str]:
+def miniapp_reply_params(records: list[dict], *, chat_id: str = "") -> list[str]:
     params = []
     shopping_writes = []
     shopping_read = []
@@ -195,10 +195,17 @@ def miniapp_reply_params(records: list[dict]) -> list[str]:
     shopping = shopping_writes or shopping_read
     exact = [p for p in shopping if re.fullmatch(r"shopping_(buy|take)_.+", p)]
     params.extend(exact or shopping)
+    if str(chat_id) == "-1003966683704" and any(
+        record.get("success") and record.get("section") in {"menu", "shopping"} for record in records
+    ):
+        if not any(p in {"menu", "dishes"} or p.startswith(("menu_", "dishes_")) for p in params):
+            params.append("menu_c1003966683704")
+        if not any(p == "shopping" or p.startswith("shopping_") for p in params):
+            params.append("shopping_buy_c1003966683704")
     return list(dict.fromkeys(params))
 
 
-def apply_miniapp_reply_contract(response: str, records: list[dict]) -> tuple[str, list[str]]:
+def apply_miniapp_reply_contract(response: str, records: list[dict], *, chat_id: str = "") -> tuple[str, list[str]]:
     """Return prose and mandatory destinations as separate transport values."""
     if not records:
         return response, []
@@ -217,4 +224,4 @@ def apply_miniapp_reply_contract(response: str, records: list[dict]) -> tuple[st
     text = re.sub(r"\[[^\]]*\]\(" + _URL.pattern + r"\)", keep_link, str(response or ""), flags=re.I)
     text = _URL.sub(keep_link, text)
     text = re.sub(r"[ \t]+\n", "\n", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip(), miniapp_reply_params(records)
+    return re.sub(r"\n{3,}", "\n\n", text).strip(), miniapp_reply_params(records, chat_id=chat_id)
